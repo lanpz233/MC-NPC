@@ -1,0 +1,82 @@
+# 伪玩家 spike 配置
+# 开启后服务器启动完成会自动跑一遍 生成 -> 行走 -> 挖矿 -> 拾取 -> 攻击 -> 退出 的验证流程。
+auto-spike: false
+# 服务器启动后等待多少 tick 再开始（默认 60，即 3 秒）。
+auto-spike-delay-ticks: 60
+
+# 规模压力测试：一次生成 N 个伪玩家游走，采样服务端 tick 耗时。
+# 0 表示关闭。手动执行方式：/aivspike stress <数量> <秒数>
+auto-stress-count: 0
+# 压力测试开始前的等待 tick（默认 600，即 30 秒，通常放在 auto-spike 之后）。
+auto-stress-delay-ticks: 600
+# 压力测试观察时长（秒）。
+auto-stress-seconds: 30
+
+# 常驻 NPC（无人值守验证对话用）。生产环境可以关掉，改用自己的生成逻辑。
+auto-npc: false
+auto-npc-delay-ticks: 60
+# 启动后自动向最近的 NPC 问一句话，用于验证 LLM 全链路；留空表示不自动提问。
+auto-ask-text: ""
+auto-ask-delay-ticks: 140
+# 同一句话重复问几次（验证热启动延迟与多轮记忆），间隔必须大于单次推理耗时。
+auto-ask-repeat: 1
+auto-ask-interval-ticks: 240
+
+# 自主决策循环：没有玩家说话时，NPC 也会定期自省，用同一套 JSON 意图协议自己选动作。
+autonomy:
+  enabled: false
+  # 同一个 NPC 两次自省之间的最小间隔（秒）。
+  # 不能设大：目标往往 1-2 秒就做完，而本地模型推理要 10-25 秒，
+  # 间隔越大，NPC 在两次决策之间站着不动的时间就越长。并发上限会挡住刷屏。
+  interval-seconds: 3
+  # 全服同时进行的自省请求上限。本地 9B 一次约 6-10 秒，开大只会把 Ollama 堵死。
+  max-concurrent: 1
+
+# NPC 行为参数
+npc:
+  # 玩家聊天触发 NPC 回应的最大距离（格）。
+  chat-radius: 16.0
+  # 每个 NPC 保留的最近对话轮数（只存内存，重启即清空）。
+  memory-turns: 8
+
+# 生存层（Wurst KillAura / AutoEat / AutoArmor 的服务端直操版）。
+# 独立于大脑和技能层，每 0.5 秒检查一次，保证 NPC 没被指挥时也能活下来。
+survival:
+  enabled: true
+  # 饥饿值低于这个数就自动找食物吃（0-20，默认 14 = 鸡腿图标剩 3 格）。
+  eat-threshold: 14
+  # 敌对生物搜索半径（格）。太大会让 NPC 追怪跑到很远，太小会被远程怪白打。
+  defend-radius: 8.0
+
+# 发展层：不依赖 LLM 的确定性"玩家科技树"。
+# 启用后由它决定下一步（木头→工作台→木镐→石头→石镐→煤铁→钻石→护甲→食物→过夜），
+# 自主决策不再问模型；模型只保留玩家对话和聊天能力。
+# 关掉它会退回到"模型每次随机指挥一步"的旧行为。
+progression:
+  enabled: true
+
+# 模型路由：按 本地 -> 云端 的顺序尝试，前一个失败才切下一个。
+llm:
+  # 本地失败时是否允许切云端。false 表示本地失败就让 NPC 保持沉默。
+  fallback: true
+  temperature: 0.7
+  # 单次回复的 token 上限。思考型模型建议至少 256，否则 content 可能被截断为空。
+  max-tokens: 256
+
+  local:
+    enabled: true
+    base-url: "http://127.0.0.1:11434"
+    # 本机已有：qwen3.5-9b-uncensored-mc / qwen-mc-bigctx / qwen3-14b
+    model: "qwen3.5-9b-uncensored-mc"
+    timeout-seconds: 90
+    # 关键：Qwen3.x 等思考型模型必须关闭 think，否则 content 为空。
+    think: false
+
+  cloud:
+    enabled: false
+    id: "cloud"
+    # OpenAI 兼容地址（DeepSeek：https://api.deepseek.com）
+    base-url: "https://api.deepseek.com"
+    api-key: ""
+    model: "deepseek-chat"
+    timeout-seconds: 45

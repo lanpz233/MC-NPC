@@ -1,0 +1,14 @@
+name: AIVillager
+version: 0.1.0
+main: com.example.aivillager.AiVillagerPlugin
+api-version: '1.21'
+authors: [Howard]
+description: AI villager fake-player spike for Paper 1.21.11
+commands:
+  aivspike:
+    description: Fake player spike commands
+    usage: /aivspike <spawn|walk|mine|attack|status|despawn|act|say|brain|llm|run|stress|stop>
+    permission: aivillager.admin
+permissions:
+  aivillager.admin:
+    default: op

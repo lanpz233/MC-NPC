@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+*.iml
+.idea/
+*.ipr
+*.iws
+.vscode/
+
+# 服务器运行数据（地图、日志、paper jar 都是二进制/大文件，不进 git）
+server/
+run/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 本地临时文件
+*.log
+*.tmp
+
+# 缓存
+.cache/
+
