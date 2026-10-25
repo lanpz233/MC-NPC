@@ -53,6 +53,13 @@ public final class GoalExecutor {
 
     /** 玩家背包主背包槽位数（0-8 快捷栏 + 9-35 主背包）；护甲槽不参与材料统计。 */
     private static final int MAIN_SLOTS = 36;
+    /**
+     * "数家底"要扫的槽位总数：0-35 主背包 + 36-39 装备槽 + 40 副手。
+     * 只用于计数/判定（countItem/countPlanks/countItemsEndingWith/countItemFor）：
+     * 穿在身上的甲必须算"有"，否则合成目标会把已穿的头盔再做一遍（第三轮修复 B）。
+     * 真正动手存取的循环（consume/give/裁剪）仍只走 MAIN_SLOTS，绝不扣穿着的装备。
+     */
+    private static final int COUNT_SLOTS = 41;
     /** 采集时单次搜索半径；技能层内部还会再限制到 8 格。 */
     private static final int GATHER_RADIUS = 8;
     /** 连续多少次采集没有进度就判定这个目标做不到。 */
@@ -61,6 +68,21 @@ public final class GoalExecutor {
     private static final int MAX_GATHER_FAILS = 6;
     /** 盖一个 3x3 小屋需要的方块数：两层墙 16 + 屋顶 9。 */
     private static final int SHELTER_BLOCKS = 25;
+
+    // ---- 目标总超时看门狗（第四轮修复 A）----
+    // 第三轮长跑实测：挖铁目标被游泳层反复顶掉技能后既不完成也不放弃，
+    // 规划器被冻结 31 分钟。这里给每个目标装两个上限：无进展超时（主判据）
+    // 与总时长硬顶（兜底）。阈值按 tick（20/秒），进展判据见 observeGoalProgress。
+    /** 无进展超时·默认：5 分钟没有任何目标相关进展就放弃。 */
+    private static final int GOAL_NO_PROGRESS_TICKS_DEFAULT = 6_000;
+    /** 无进展超时·挖矿：6 分钟。挖矿单步慢，但位置和产出应该持续变化。 */
+    private static final int GOAL_NO_PROGRESS_TICKS_DIG = 7_200;
+    /** 无进展超时·长目标：8 分钟。熔炼等待、长距离行进/屠龙用。 */
+    private static final int GOAL_NO_PROGRESS_TICKS_LONG = 9_600;
+    /** 总时长硬顶·默认：30 分钟。哪怕一直有零星进展也不许无限占着大脑。 */
+    private static final int GOAL_HARD_CAP_TICKS_DEFAULT = 36_000;
+    /** 总时长硬顶·挖矿：45 分钟。大批量挖矿（如钻石甲 24 颗料）合法耗时更长。 */
+    private static final int GOAL_HARD_CAP_TICKS_DIG = 54_000;
 
     private static final String OK = "ok";
 
@@ -89,6 +111,14 @@ public final class GoalExecutor {
      */
     private int baselineCount;
     private int staleChecks;
+    // 找资源扩围的方向惯性（fix18）：跨目标保留的航向/档位/锚点，故意不随
+    // 目标重下而重置——旧逻辑每个新目标 attempts 归零、距离永远从 8 格起步，
+    // 且每次都重挑"地表最低方向"，会在盆地里绕圈打转（长跑 #5 实测：
+    // 无树平原开局 25 分钟、采集放弃 7 次、净位移个位数格，零原木）。
+    // 改为：一个方向走得通就保持航向逐档走远；走不通（位移 <8 格）转 45°。
+    private double gatherSearchAngle = -1;
+    private int gatherSearchTier = 0;
+    private BlockPos gatherSearchAnchor;
     /** dryland 连续失败次数：失败 3 次后跳过，避免无限重试泡在水里 20 秒又 20 秒。 */
     private int drylandFailures;
     private boolean exploreStarted;
@@ -100,6 +130,13 @@ public final class GoalExecutor {
     private boolean relocateBeforeStrip;
     /** 已经处理过的 strip 结果：同一个结果字符串不要每 tick 重复触发"换点"。 */
     private String handledStripOutcome = "-";
+    /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
+    private int oreScanCooldown;
+    /** 上次探矿扫描选中的目标格：单格复核（方块还在、仍然裸露）通过就直接复用，省掉重复全扫。 */
+    private BlockPos oreScanCachePos;
+    private String oreScanCacheBlock = "";
+    /** 上次探矿扫描发现的裸露候选矿总数（统计口径：ore-scan 日志里的 found）。 */
+    private int lastOreScanFound;
     private String status = "无目标";
     private String lastOutcome = "-";
     /** 挖掘类目标的资源定义（方块 ID、掉落物、目标深度）；其他目标为 null。 */
@@ -125,6 +162,13 @@ public final class GoalExecutor {
     /** 末地屠龙：0 拆水晶、1 打龙。 */
     private int dragonPhase;
     private int dragonAttempts;
+    /** 目标总超时看门狗状态（第四轮修复 A）：目标开始 tick、最后一次有进展的 tick。 */
+    private long goalStartTick;
+    private long lastProgressTick;
+    /** 上次观察到的"目标相关产出计数"，变化即算进展（见 goalMetric）。 */
+    private int progressMetric;
+    /** 上次有进展时的位置锚点：离开锚点 6 格以上也算进展（长距离移动/下矿途中）。 */
+    private BlockPos progressAnchor;
     /** 传送门选址结果：origin 是框架左下角，alongX 表示门面横向沿 X 轴。 */
     private BlockPos portalOrigin;
     private boolean portalAlongX = true;
@@ -340,6 +384,11 @@ public final class GoalExecutor {
         enterAttempts = 0;
         exploreStarted = false;
         active = true;
+        // 目标总超时看门狗从新目标开始重新计时（第四轮修复 A）。
+        goalStartTick = npc.tickCount;
+        lastProgressTick = npc.tickCount;
+        progressMetric = goalMetric();
+        progressAnchor = npc.blockPosition();
         goalDimension = npc.level().dimension().identifier().toString();
         status = describeStart();
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 接受目标 | " + status);
@@ -383,6 +432,8 @@ public final class GoalExecutor {
             return;
         }
         if (!npc.isAlive()) {
+            // 死亡等复活的几秒不算"无进展"：把进展时钟顶到当前，免得复活后被误杀。
+            lastProgressTick = npc.tickCount;
             return;
         }
         // 维度变了（穿过传送门）：旧目标里的坐标、资源层高度全部作废，立即结束。
@@ -390,6 +441,23 @@ public final class GoalExecutor {
                 && !goalDimension.equals(npc.level().dimension().identifier().toString())) {
             finish("维度切换 " + goalDimension + " → " + npc.level().dimension().identifier()
                     + "，旧目标中止");
+            return;
+        }
+        // 目标总超时看门狗（第四轮修复 A）：必须赶在下面"技能忙就等"的早退之前——
+        // 旧结构里各 tick* 的放弃计数只在技能 idle 的间隙累加，技能被生存层游泳
+        // 反复顶掉/重发时永远轮不到计数，目标就无限期挂死（长跑实测冻结 31 分钟）。
+        // 这里以"目标相关产出变化 / 位置有效移动 / 熔炉正在烧"为进展信号，
+        // 无进展超限或总时长超硬顶就停技能、放弃目标，把大脑还给规划器。
+        observeGoalProgress();
+        long noProgressTicks = npc.tickCount - lastProgressTick;
+        long totalTicks = npc.tickCount - goalStartTick;
+        if (noProgressTicks > noProgressLimitTicks() || totalTicks > hardCapTicks()) {
+            String reason = "goal-timeout type=" + type + " target=" + targetId
+                    + " noProgressSec=" + (noProgressTicks / 20)
+                    + " totalSec=" + (totalTicks / 20);
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " " + reason);
+            skills.stop();
+            finish(reason + " 目标超时放弃，交回规划器");
             return;
         }
         // 技能还在执行（走路/挖矿）就等它结束，目标层只负责“下一步做什么”。
@@ -407,6 +475,13 @@ public final class GoalExecutor {
         // 用 survival.isEngaged() 而不是自己数怪：它会把"打不到的怪"排除掉，
         // 避免一只卡在墙后的僵尸把目标层永久暂停。
         if (survival != null ? survival.isEngaged() : hostileNearby(5)) {
+            return;
+        }
+        // 惜命：血量低（≤35%）且包里有吃的时先停目标回血——生存层会吃东西触发原版回血，
+        // 血没恢复前不推进任何目标，更不会推进猎杀类目标去送死（口径与规划器一致）。
+        // 没吃的时不拦：找吃的本身就是当前目标（hunt/gather），拦了反而回不了血。
+        if (survival != null && survival.isLowHealth() && survival.hasEdibleFood()) {
+            status = "血量过低，先吃东西回血";
             return;
         }
         // 先收掉落物再推进目标：原版拾取要求碰撞箱相交，
@@ -504,6 +579,10 @@ public final class GoalExecutor {
         params.addProperty("radius", GATHER_RADIUS);
         boolean started = skills.run(new Intent("", "mine", params), "目标");
         if (started) {
+            // 资源已经进探测范围：扩围航行结束，清掉航向状态，下次从头挑方向。
+            gatherSearchAngle = -1;
+            gatherSearchTier = 0;
+            gatherSearchAnchor = null;
             attempts = 0;
             return;
         }
@@ -519,11 +598,180 @@ public final class GoalExecutor {
             attempts = 0;
             return;
         }
-        // 附近找不到目标方块：先随机换个位置再试，而不是原地反复失败。
+        // 附近找不到目标方块：逐步扩大搜索并往低处走，而不是原地小范围打转。
         attempts++;
         if (attempts >= MAX_GATHER_FAILS) {
             finish("采集放弃：附近找不到 " + targetId);
             return;
+        }
+        // 长距离找树（第六轮修复）：沙漠/海岸这类无树地形里，朝最低处扩围只会
+        // 沿海岸线/沙漠边缘打转（fix6 长跑实测 17 分钟零原木、徒步 140 格没出沙漠）。
+        // 先"远眺"一圈：只读已加载区块的地表高度图，顶格是原木/树叶的列就是
+        // 肉眼看得见的树，朝它跋涉（goto 单次最远 48 格，多轮接力）。
+        // 这不是透视：只看地表、只限已加载区块；地下找矿的 isExposed 规矩不受影响。
+        if (anyLog && trekToVisibleTree()) {
+            return;
+        }
+        escalateSearch();
+    }
+
+    /**
+     * 朝远处看得见的树跋涉一步（第六轮修复）。成功下发 goto 返回 true。
+     * 地下不远眺（高度图看到的是头顶地表，跋涉无从走起），交给 ascend/扩围处理。
+     */
+    private boolean trekToVisibleTree() {
+        BlockPos me = npc.blockPosition();
+        int groundAtMe = npc.level().getHeight(
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                me.getX(), me.getZ());
+        if (me.getY() < groundAtMe - 8) {
+            return false;
+        }
+        BlockPos tree = findVisibleTreeColumn(80);
+        if (tree == null) {
+            return false;
+        }
+        // 太近的树 mine 技能自己会处理，跋涉只管 8 格半径之外的。
+        if (me.distSqr(tree) <= 100.0D) {
+            return false;
+        }
+        // 瞄准点别选树干列本身（整列没有落脚格，goto 的终点解析必失败）：
+        // 朝 NPC 方向回退 3 格，落在树旁的开阔地上。
+        double dx = me.getX() - tree.getX();
+        double dz = me.getZ() - tree.getZ();
+        double len = Math.max(1.0D, Math.sqrt(dx * dx + dz * dz));
+        double aimX = tree.getX() + 0.5D + dx / len * 3.0D;
+        double aimZ = tree.getZ() + 0.5D + dz / len * 3.0D;
+        JsonObject params = new JsonObject();
+        params.addProperty("x", aimX);
+        params.addProperty("z", aimZ);
+        if (skills.run(new Intent("", "goto", params), "目标")) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " trek-to-tree | tree="
+                    + tree.toShortString() + " dist="
+                    + String.format(Locale.ROOT, "%.0f", Math.sqrt(me.distSqr(tree))));
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 在已加载区块里找最近的"地表有树"列：高度图（WORLD_SURFACE，含树冠）
+     * 顶格是原木或树叶即是。采样步长 3 格、半径上限由参数给；
+     * 未加载区块一律跳过——绝不为了找树去加载/生成新区块。
+     */
+    private BlockPos findVisibleTreeColumn(int maxRadius) {
+        if (!(npc.level() instanceof ServerLevel serverLevel)) {
+            return null;
+        }
+        BlockPos center = npc.blockPosition();
+        BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (int dx = -maxRadius; dx <= maxRadius; dx += 3) {
+            for (int dz = -maxRadius; dz <= maxRadius; dz += 3) {
+                int x = center.getX() + dx;
+                int z = center.getZ() + dz;
+                if (serverLevel.getChunkIfLoaded(x >> 4, z >> 4) == null) {
+                    continue;
+                }
+                int topY = serverLevel.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, x, z);
+                if (topY <= serverLevel.getMinY() + 4) {
+                    continue;
+                }
+                net.minecraft.world.level.block.state.BlockState top =
+                        serverLevel.getBlockState(new BlockPos(x, topY - 1, z));
+                if (!top.is(net.minecraft.tags.BlockTags.LOGS)
+                        && !top.is(net.minecraft.tags.BlockTags.LEAVES)) {
+                    continue;
+                }
+                BlockPos cand = new BlockPos(x, topY, z);
+                double sq = center.distSqr(cand);
+                if (sq < bestSq) {
+                    bestSq = sq;
+                    best = cand;
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 找资源失败时的扩围移动（第三轮修复 E 后半）：第 n 次失败就走得更远，
+     * 并且优先挑比当前位置更低的方向——长跑实测 NPC 在没树的山顶上方圆 8 格
+     * 反复打转、采集放弃 19 次；树一般长在山坡和谷地，下山找树才是玩家的直觉。
+     *
+     * <p>8 个方向各采样一次目标列的地表高度（MOTION_BLOCKING_NO_LEAVES，
+     * 和规划器判"在不在地下"用的是同一张高度图），选最低的方向下 goto；
+     * 所有方向都走不通时退回原来的小范围 wander()。
+     */
+    private void escalateSearch() {
+        int[] distances = {8, 16, 24, 32, 48};
+        BlockPos me = npc.blockPosition();
+        int currentY = me.getY();
+        // 未加载/未生成区块的高度图会返回世界底线值（-64）：不排除的话它永远"最低"，
+        // NPC 会一路朝没生成的地形狂奔（短验实测 10 分钟跑出 100 多格还没找到树）。
+        int invalidY = npc.level().getMinY() + 4;
+        // 方向惯性（fix18）：先结算上一跳的实际水平位移——走够 8 格说明这个
+        // 方向可行，保持航向并升一档走更远；没走动（路径中断/目标不可站立）
+        // 就把航向转 45° 换方向。玩家找树就是这么干的：认准一个方向走到底，
+        // 而不是每分钟重挑一次"最低处"在盆地里兜圈。
+        if (gatherSearchAnchor != null && gatherSearchAngle >= 0) {
+            double movedX = me.getX() - gatherSearchAnchor.getX();
+            double movedZ = me.getZ() - gatherSearchAnchor.getZ();
+            if (Math.sqrt(movedX * movedX + movedZ * movedZ) >= 8) {
+                gatherSearchTier = Math.min(gatherSearchTier + 1, distances.length - 1);
+            } else {
+                gatherSearchAngle += Math.PI / 4.0D;
+            }
+        }
+        if (gatherSearchAngle < 0) {
+            // 首次扩围没有航向：沿用旧规矩，8 个方向采样地表、挑最低的起步。
+            int probe = distances[gatherSearchTier];
+            int bestSurfaceY = Integer.MAX_VALUE;
+            for (int i = 0; i < 8; i++) {
+                double angle = i * Math.PI / 4.0D;
+                int tx = (int) Math.floor(npc.getX() + Math.cos(angle) * probe);
+                int tz = (int) Math.floor(npc.getZ() + Math.sin(angle) * probe);
+                int surfaceY = npc.level().getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, tx, tz);
+                if (surfaceY <= invalidY) {
+                    continue;
+                }
+                if (surfaceY < bestSurfaceY) {
+                    bestSurfaceY = surfaceY;
+                    gatherSearchAngle = angle;
+                }
+            }
+            if (gatherSearchAngle < 0) {
+                wander();
+                return;
+            }
+        }
+        // 沿航向前进：正前方目标列未生成（高度图无效）时依次转 45° 找可用方向，
+        // 采纳的方向成为新航向（不然下一步的位移结算会把航向搅乱）。
+        int distance = distances[gatherSearchTier];
+        for (int tries = 0; tries < 8; tries++) {
+            double angle = gatherSearchAngle + tries * Math.PI / 4.0D;
+            int tx = (int) Math.floor(npc.getX() + Math.cos(angle) * distance);
+            int tz = (int) Math.floor(npc.getZ() + Math.sin(angle) * distance);
+            int surfaceY = npc.level().getHeight(
+                    net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, tx, tz);
+            if (surfaceY <= invalidY) {
+                continue;
+            }
+            gatherSearchAngle = angle;
+            gatherSearchAnchor = me;
+            JsonObject params = new JsonObject();
+            params.addProperty("x", npc.getX() + Math.cos(angle) * distance);
+            params.addProperty("z", npc.getZ() + Math.sin(angle) * distance);
+            if (skills.run(new Intent("", "goto", params), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 找不到 " + targetId
+                        + "，扩围找资源 | 第" + attempts + "次 距离=" + distance
+                        + " 航向=" + Math.round(Math.toDegrees(angle)) + "° 档位=" + gatherSearchTier
+                        + " 当前Y=" + currentY + " 目标方向地表Y=" + surfaceY);
+                return;
+            }
+            break;
         }
         wander();
     }
@@ -730,18 +978,36 @@ public final class GoalExecutor {
             for (org.bukkit.inventory.RecipeChoice choice : recipe.slots()) {
                 required.merge(choice, 1, Integer::sum);
             }
-            for (java.util.Map.Entry<org.bukkit.inventory.RecipeChoice, Integer> entry : required.entrySet()) {
-                int need = entry.getValue();
-                LOG.info("[AIV][GOAL-DEBUG] craftFromRecipe item=" + itemPath + " depth=" + depth
-                        + " 需要 " + need + "×" + describeChoice(entry.getKey())
-                        + " 现有=" + countMatching(entry.getKey()));
-                while (countMatching(entry.getKey()) < need) {
-                    String error = craftMissing(entry.getKey(), depth + 1, visiting);
-                    if (error != null) {
-                        LOG.info("[AIV][GOAL-DEBUG] craftFromRecipe item=" + itemPath + " depth=" + depth
-                                + " craftMissing 返回 " + error);
-                        return error;
+            // 材料之间会互相消耗：补木棍要吃掉木板，补完回头看木板又不够了。
+            // 只按顺序对一遍就扣料，木镐这种"3 木板+2 木棍"的配方永远差一块木板，
+            // 再被 craftOne 的失败回滚还原成 1 根原木，规划器只能无限重试（实测连续失败 7+ 次）。
+            // 改为整表复核：任何一次补料后都从头再对，直到一整轮都不用补，才算同时够数。
+            for (int pass = 0; pass < 8; pass++) {
+                boolean craftedAny = false;
+                for (java.util.Map.Entry<org.bukkit.inventory.RecipeChoice, Integer> entry : required.entrySet()) {
+                    int need = entry.getValue();
+                    LOG.info("[AIV][GOAL-DEBUG] craftFromRecipe item=" + itemPath + " depth=" + depth
+                            + " 需要 " + need + "×" + describeChoice(entry.getKey())
+                            + " 现有=" + countMatching(entry.getKey()));
+                    int guard = 0;
+                    while (countMatching(entry.getKey()) < need) {
+                        if (++guard > 16) {
+                            return "补料多次仍凑不齐：" + describeChoice(entry.getKey());
+                        }
+                        String error = craftMissing(entry.getKey(), depth + 1, visiting);
+                        if (error != null) {
+                            LOG.info("[AIV][GOAL-DEBUG] craftFromRecipe item=" + itemPath + " depth=" + depth
+                                    + " craftMissing 返回 " + error);
+                            return error;
+                        }
+                        craftedAny = true;
                     }
+                }
+                if (!craftedAny) {
+                    break;
+                }
+                if (pass == 7) {
+                    return "材料互相消耗，凑不齐：" + itemPath;
                 }
             }
             for (java.util.Map.Entry<org.bukkit.inventory.RecipeChoice, Integer> entry : required.entrySet()) {
@@ -1020,12 +1286,15 @@ public final class GoalExecutor {
             }
         }
 
-        // 1) 附近（±8 格）有暴露的目标方块就先直接挖：地表石头、洞穴煤矿都能这样拿到。
-        BlockPos exposed = nearbyBlockPosAny(oreTarget.block(), 8);
+        // 1) 半径 16 格内有裸露的目标矿就先去挖（Fong 02:53 探矿规格）：
+        //    探测范围 8 → 16；仍然只认裸露矿（isExposed），全埋矿不入选、不透视。
+        //    够不着的矿（洞顶/墙后/低处）由 mine 技能内部的够矿求解接手，
+        //    这里只负责"看见并下单"。扫描节流与缓存见 exposedOreTarget()。
+        BlockPos exposed = exposedOreTarget();
         if (exposed != null) {
             JsonObject params = new JsonObject();
             params.addProperty("block", oreTarget.block());
-            params.addProperty("radius", 8);
+            params.addProperty("radius", 16);
             if (skills.run(new Intent("", "mine", params), "目标")) {
                 return;
             }
@@ -1069,10 +1338,25 @@ public final class GoalExecutor {
             drylandFailures = 0;
         }
 
+        // 资源层钳制（fix17，超平坦场景实测教训）：oreTarget 的层位是按正常世界
+        // 地表（≈Y60）定的绝对值。石头写的是 Y=50——在地表 Y=-30 的超平坦世界里，
+        // 挖石头会先 ascend 爬到 Y=51，在空中一路搭柱、最后栖在柱顶，
+        // descend/strip 全部挖不动，目标层只能靠看门狗收场；铁层 Y=16 同理
+        // 会爬到 Y=17。正常世界里这条也会把洞里挖石头的人拽上三十多层。
+        // 修法：①石头到处都是，层位就取当前深度，永不为它赶路；
+        // ②其余资源的层位钳到本地地表以下（min(层位, 地表-1)），
+        // 层位高于地表时就在当前深度掘进，裸露矿由步骤 1 先行接手。
+        int surfaceY = npc.level().getHeight(
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                npc.blockPosition().getX(), npc.blockPosition().getZ());
+        int layerY = "stone".equals(oreTarget.block())
+                ? npc.blockPosition().getY()
+                : Math.min(oreTarget.y(), surfaceY - 1);
+
         // 2) 深度不够：阶梯下挖到资源层。挖矿途中会顺手捡到路上暴露的煤/铁。
-        if (npc.blockPosition().getY() > oreTarget.y() + 3) {
+        if (npc.blockPosition().getY() > layerY + 3) {
             JsonObject params = new JsonObject();
-            params.addProperty("y", oreTarget.y());
+            params.addProperty("y", layerY);
             if (skills.run(new Intent("", "descend", params), "目标")) {
                 attempts = 0;
                 return;
@@ -1081,9 +1365,9 @@ public final class GoalExecutor {
 
         // 2b) 资源层在头顶（例如刚在 Y=16 挖完铁，现在要去 Y=48 挖煤）：
         // 旧逻辑只会往下挖，会一直在 Y=16 水平掘进找煤，一整个目标周期什么都挖不到。
-        if (npc.blockPosition().getY() < oreTarget.y() - 3) {
+        if (npc.blockPosition().getY() < layerY - 3) {
             JsonObject params = new JsonObject();
-            params.addProperty("y", oreTarget.y() + 1);
+            params.addProperty("y", layerY + 1);
             if (skills.run(new Intent("", "ascend", params), "目标")) {
                 attempts = 0;
                 return;
@@ -1165,6 +1449,75 @@ public final class GoalExecutor {
                 best = pos.immutable();
             }
         }
+        return best;
+    }
+
+    /**
+     * 探矿入口（Fong 02:53 规格）：返回半径 16 内最近的裸露目标矿，没有返回 null。
+     *
+     * <p>节流：全扫一次要看 33×33×13 ≈ 1.4 万格，只允许在技能空闲的决策点、
+     * 且距上次全扫至少 4 次决策时执行；间隔内先用缓存——目标格做单格复核
+     * （方块还是目标矿变种、仍然裸露、仍在 17 格内），两次 getBlockState 就能判。
+     * 缓存失效又赶上节流期就返回 null，本轮走 descend/strip 老路，几秒后再扫，
+     * 不会因为等扫描把挖矿目标拖超时（goal-timeout 口径不变）。
+     */
+    private BlockPos exposedOreTarget() {
+        if (oreScanCachePos != null && oreTarget.block().equals(oreScanCacheBlock)) {
+            String path = BuiltInRegistries.BLOCK.getKey(
+                    npc.level().getBlockState(oreScanCachePos).getBlock()).getPath();
+            boolean variantOk = path.equals(oreTarget.block())
+                    || path.equals("deepslate_" + oreTarget.block());
+            if (variantOk && isExposed(oreScanCachePos)
+                    && npc.blockPosition().distSqr(oreScanCachePos) <= 17.0D * 17.0D) {
+                return oreScanCachePos;
+            }
+            oreScanCachePos = null;
+        }
+        if (oreScanCooldown > 0) {
+            oreScanCooldown--;
+            return null;
+        }
+        oreScanCooldown = 4;
+        BlockPos found = scanExposedOre(oreTarget.block(), 16);
+        oreScanCacheBlock = oreTarget.block();
+        oreScanCachePos = found;
+        if (found != null) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " ore-scan | found=" + lastOreScanFound
+                    + " radius=16 best=" + found.toShortString() + " block=" + oreTarget.block());
+        }
+        return found;
+    }
+
+    /** 全扫半径内的裸露目标矿（含深板岩变种）：返回最近的，并把发现总数记进 lastOreScanFound。 */
+    private BlockPos scanExposedOre(String expectedPath, int radius) {
+        BlockPos center = npc.blockPosition();
+        Set<String> variants = new java.util.HashSet<>();
+        variants.add(expectedPath);
+        if (expectedPath.endsWith("_ore") && !expectedPath.startsWith("deepslate_")) {
+            variants.add("deepslate_" + expectedPath);
+        }
+        BlockPos best = null;
+        double bestDistanceSq = Double.MAX_VALUE;
+        int found = 0;
+        for (BlockPos pos : BlockPos.betweenClosed(
+                center.offset(-radius, -6, -radius),
+                center.offset(radius, 6, radius))) {
+            String path = BuiltInRegistries.BLOCK.getKey(npc.level().getBlockState(pos).getBlock()).getPath();
+            if (!variants.contains(path)) {
+                continue;
+            }
+            // 不透视口径不变：全埋矿（六面无空气）不入选，哪怕它就在墙后一格。
+            if (!isExposed(pos)) {
+                continue;
+            }
+            found++;
+            double distanceSq = center.distSqr(pos);
+            if (distanceSq < bestDistanceSq) {
+                bestDistanceSq = distanceSq;
+                best = pos.immutable();
+            }
+        }
+        lastOreScanFound = found;
         return best;
     }
 
@@ -2358,6 +2711,65 @@ public final class GoalExecutor {
 
     // ---------------------------------------------------------------- 背包工具
 
+    // ---------------------------------------------------------------- 目标总超时看门狗（第四轮修复 A）
+
+    /**
+     * 观察一次目标进展，有进展就刷新 lastProgressTick。
+     *
+     * <p>进展信号（任一成立）：①目标相关产出计数变化（见 {@link #goalMetric()}，
+     * 只认与目标直接相关的物品——在水洼里蹭挖到的圆石不算挖铁的进展）；
+     * ②位置离开锚点 6 格以上（长距离移动、下矿/上浮途中物品还没产出时靠它续命）；
+     * ③熔炼目标且熔炉正点着（等烧炼是合法等待，产物每约 10 秒一变本也会触发①，
+     * 这里把"火还着"也算上，免得大批量慢烧被误判）。
+     */
+    private void observeGoalProgress() {
+        int metric = goalMetric();
+        BlockPos pos = npc.blockPosition();
+        boolean moved = progressAnchor == null || pos.distSqr(progressAnchor) >= 36.0D;
+        boolean smeltBurning = false;
+        if ("smelt".equals(type) && furnacePos != null) {
+            net.minecraft.world.level.block.state.BlockState furnaceState =
+                    npc.level().getBlockState(furnacePos);
+            smeltBurning = furnaceState.hasProperty(
+                            net.minecraft.world.level.block.state.properties.BlockStateProperties.LIT)
+                    && furnaceState.getValue(
+                            net.minecraft.world.level.block.state.properties.BlockStateProperties.LIT);
+        }
+        if (metric != progressMetric || moved || smeltBurning) {
+            progressMetric = metric;
+            progressAnchor = pos;
+            lastProgressTick = npc.tickCount;
+        }
+    }
+
+    /** 目标相关的产出计数：与目标无关的物品进出背包不算进展。 */
+    private int goalMetric() {
+        return switch (type) {
+            case "gather" -> gatherCount();
+            case "dig" -> oreTarget != null ? countItem(oreTarget.drop()) : 0;
+            case "smelt", "craft" -> countItem(targetId);
+            case "hunt" -> countHuntLoot();
+            case "slay" -> countItem(slayDrop);
+            case "flint" -> countItem("flint");
+            case "obsidian" -> countItem("obsidian");
+            default -> 0;
+        };
+    }
+
+    /** 无进展超时阈值（tick）：按目标类型放宽，但都有上限。 */
+    private int noProgressLimitTicks() {
+        return switch (type) {
+            case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
+            case "smelt", "travel", "endportal", "dragon" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
+        };
+    }
+
+    /** 总时长硬顶（tick）：进展再零星也不许超过。 */
+    private int hardCapTicks() {
+        return "dig".equals(type) ? GOAL_HARD_CAP_TICKS_DIG : GOAL_HARD_CAP_TICKS_DEFAULT;
+    }
+
     private void finish(String reason) {
         active = false;
         lastOutcome = reason;
@@ -2422,7 +2834,7 @@ public final class GoalExecutor {
 
     private int countItem(String itemPath) {
         int total = 0;
-        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (!stack.isEmpty() && itemPath.equals(pathOf(stack))) {
                 total += stack.getCount();
@@ -2433,7 +2845,7 @@ public final class GoalExecutor {
 
     private int countPlanks() {
         int total = 0;
-        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (!stack.isEmpty() && pathOf(stack).endsWith("_planks")) {
                 total += stack.getCount();
@@ -2444,7 +2856,7 @@ public final class GoalExecutor {
 
     private int countItemsEndingWith(String suffix) {
         int total = 0;
-        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (!stack.isEmpty() && pathOf(stack).endsWith(suffix)) {
                 total += stack.getCount();
@@ -2482,7 +2894,7 @@ public final class GoalExecutor {
             return countPlanks();
         }
         int total = 0;
-        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (stack.isEmpty() || !counted.equals(pathOf(stack))) {
                 continue;
@@ -2573,6 +2985,70 @@ public final class GoalExecutor {
         return freed;
     }
 
+    /** 镐的等级：数值越大越高级。木/金同为 0（金镐挖得快但挖不动铁以上，不比木镐强）。 */
+    private static int pickaxeTier(String path) {
+        return switch (path) {
+            case "netherite_pickaxe" -> 4;
+            case "diamond_pickaxe" -> 3;
+            case "iron_pickaxe" -> 2;
+            case "stone_pickaxe" -> 1;
+            default -> 0;
+        };
+    }
+
+    /** 这把工具还算不算"能用"：按全系统约定，耐久只剩最后 1 点的不算能用。 */
+    private static boolean isUsableStack(ItemStack stack) {
+        return !stack.isDamageableItem() || stack.getDamageValue() < stack.getMaxDamage() - 1;
+    }
+
+    /**
+     * 受保护的镐是哪一槽（第三轮修复 D 的保底，全丢弃路径共用）：
+     *
+     * <ul>
+     *   <li>有能用的镐时：最高等级里只有一把能用的 → 就是它（扔了就掉档/断档）；</li>
+     *   <li>最高等级有多把能用的 → 不用特别保护（丢一把还剩同级可用的）；</li>
+     *   <li>一把能用的都没有 → 保护最高等级的那把残镐，身体层兜底还会用它挖最后一格。</li>
+     * </ul>
+     *
+     * @return 受保护的槽位；背包里根本没有镐时返回 -1
+     */
+    private int protectedPickaxeSlot() {
+        int bestTier = -1;
+        int bestSlot = -1;
+        int usableAtBest = 0;
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !pathOf(stack).endsWith("_pickaxe") || !isUsableStack(stack)) {
+                continue;
+            }
+            int tier = pickaxeTier(pathOf(stack));
+            if (tier > bestTier) {
+                bestTier = tier;
+                bestSlot = slot;
+                usableAtBest = 1;
+            } else if (tier == bestTier) {
+                usableAtBest++;
+            }
+        }
+        if (bestSlot >= 0) {
+            return usableAtBest == 1 ? bestSlot : -1;
+        }
+        // 没有能用的镐：保护最高等级的残镐（最后稻草）。
+        bestTier = -1;
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !pathOf(stack).endsWith("_pickaxe")) {
+                continue;
+            }
+            int tier = pickaxeTier(pathOf(stack));
+            if (tier > bestTier) {
+                bestTier = tier;
+                bestSlot = slot;
+            }
+        }
+        return bestSlot;
+    }
+
     /**
      * 按"每种物品总量"裁剪背包，返回真正腾空的槽数。
      *
@@ -2583,6 +3059,11 @@ public final class GoalExecutor {
     private int trimOverflow() {
         java.util.Map<String, Integer> quota = new java.util.HashMap<>();
         int freed = 0;
+        // 镐保底（第三轮修复 D）：先算出"受保护的镐"是哪一槽，裁剪时整槽跳过。
+        // 长跑实测背包满时石镐被裁掉 8 把以上、全程重造 16 把——裁剪规则互相叠加时
+        // 没有一条全局底线。这里钉死：当前能用的最好的一把镐永远不扔；
+        // 一把能用的都没有时，最高等级的那把（哪怕只剩 1 耐久）也留着当最后稻草。
+        int protectedPickaxe = protectedPickaxeSlot();
         // 先统计每个"工具家族"里还有多少把真能用的镐/剑/护甲，
         // 防止 trimOverflow 把所有剩 1 耐久的都丢光，最后变成真没工具。
         // 但注意：只能把"同等级或更好的"算进可用池——石镐能挖石头但挖不动深板岩，
@@ -2602,6 +3083,9 @@ public final class GoalExecutor {
         for (int slot = MAIN_SLOTS - 1; slot >= 0; slot--) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (stack.isEmpty()) {
+                continue;
+            }
+            if (slot == protectedPickaxe) {
                 continue;
             }
             String path = pathOf(stack);
@@ -2721,8 +3205,11 @@ public final class GoalExecutor {
                  "leather_helmet", "leather_chestplate", "leather_leggings", "leather_boots",
                  "golden_helmet", "golden_chestplate", "golden_leggings", "golden_boots",
                  "chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots" -> {
-                return countItem("stone_pickaxe") > 0 || countItem("iron_pickaxe") > 0
-                        || countItem("diamond_pickaxe") > 0 ? 0 : 1;
+                // 用"可用口径"（countItemFor，滤掉只剩 1 耐久的）判断有没有更好的镐：
+                // 以前用 countItem，一把只剩 1 耐久的石镐也会让木镐保留量变 0，
+                // 等于把唯一还能用的木镐扔了（第一轮遗留问题）。
+                return countItemFor("stone_pickaxe") > 0 || countItemFor("iron_pickaxe") > 0
+                        || countItemFor("diamond_pickaxe") > 0 ? 0 : 1;
             }
             default -> {
             }
@@ -2824,12 +3311,17 @@ public final class GoalExecutor {
      */
     private int dropLeastValuable(int needed) {
         int freed = 0;
+        // 兜底路径同样受镐保底约束（第三轮修复 D）：再满也不能把最好的一把可用镐扔了。
+        int protectedPickaxe = protectedPickaxeSlot();
         for (int round = 0; round < needed; round++) {
             int worstSlot = -1;
             int worstCount = Integer.MAX_VALUE;
             for (int slot = 0; slot < MAIN_SLOTS; slot++) {
                 ItemStack stack = npc.getInventory().getItem(slot);
                 if (stack.isEmpty()) {
+                    continue;
+                }
+                if (slot == protectedPickaxe) {
                     continue;
                 }
                 if (isEssential(stack)) {

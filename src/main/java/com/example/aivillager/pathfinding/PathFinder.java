@@ -49,10 +49,20 @@ public final class PathFinder {
      */
     private static final double HEURISTIC_WEIGHT = 1.35D;
     /**
-     * 默认节点预算。48 格内的绕障路径通常远低于这个值；
-     * 丛林里偶尔需要更多，代价约 2-3 微秒/节点，12000 约 30ms，单次可接受。
+     * 默认节点预算。48 格内的绕障路径通常远低于这个值，丛林里偶尔需要更多。
+     *
+     * <p>注意节点单价并不恒定：原先按"约 2-3 微秒/节点"估算，实测一次失败的
+     * mine-approach 搜索展开 12001 个节点花了 8541 毫秒（约 700 微秒/节点，
+     * 树冠/洞穴里碰撞形状查询远比平地贵），主线程全程冻结、看门狗都报了
+     * "server has not responded for 10 seconds"。所以节点上限之外必须再加时间预算。
      */
     public static final int DEFAULT_MAX_NODES = 12000;
+    /**
+     * 单次搜索的时间预算（毫秒）。搜索跑在主线程上，超时就当没找到路：
+     * 让上层换候选/换目标，而不是把整个服务器冻住。100ms 约等于 2 个 tick，
+     * 正常短距离搜索（实测 0-6ms）完全不受影响。
+     */
+    private static final long MAX_SEARCH_MILLIS = 100L;
 
     private PathFinder() {
     }
@@ -82,7 +92,13 @@ public final class PathFinder {
     public static Result find(BlockGetter level, BlockPos start, BlockPos goal, int maxNodes) {
         long begin = System.nanoTime();
 
-        BlockPos safeStart = nearestStandable(level, start, 2);
+        // 起点解析放宽（第五轮修复）：NPC 可能正站在树冠/细雪这类
+        // "旧判定算数、新判定不算"的表面上，只找同列 ±2 格会让所有寻路瞬间失败、
+        // 身体连"走下树冠"都规划不出来。先同列上下 ±6 找真地面；同列没有
+        // （正站树干列上：整列不是树叶就是树干）再横向 ±2 列兜底，取三维距离
+        // 最近的可站立格作起点——身体朝第一个路点走时靠物理走下/落下树冠，
+        // 全程不传送。终点不享有这个兜底：目标点无路可走就该如实失败让上层换目标。
+        BlockPos safeStart = nearestStandableWide(level, start, 6, 2);
         if (safeStart == null) {
             return new Result(List.of(), 0, elapsedMillis(begin), "起点不可站立 " + start.toShortString());
         }
@@ -120,6 +136,11 @@ public final class PathFinder {
             if (++visited > maxNodes) {
                 return new Result(List.of(), visited, elapsedMillis(begin), "超出节点上限 " + maxNodes);
             }
+            // 时间预算：每展开 256 个节点查一次钟，避免 nanoTime 调用本身拖慢搜索。
+            if ((visited & 0xFF) == 0 && elapsedMillis(begin) > MAX_SEARCH_MILLIS) {
+                return new Result(List.of(), visited, elapsedMillis(begin),
+                        "超出时间预算 " + MAX_SEARCH_MILLIS + "ms");
+            }
 
             for (int[] direction : DIRECTIONS) {
                 boolean diagonal = direction[0] != 0 && direction[1] != 0;
@@ -134,6 +155,9 @@ public final class PathFinder {
                 }
 
                 double stepCost = (diagonal ? DIAGONAL_COST : 1.0D) + verticalCost(next.getY() - current.pos().getY());
+                if (isPowderSnow(level, next)) {
+                    stepCost += POWDER_SNOW_COST;
+                }
                 double tentative = current.g() + stepCost;
                 Double known = gScore.get(nextKey);
                 if (known != null && known <= tentative) {
@@ -166,11 +190,64 @@ public final class PathFinder {
         return null;
     }
 
-    /** 脚/头可通行且脚下有支撑，才算一个能站人的格子。 */
+    /** 四正方向（找岸判据用：只有正方向贴着的水面才算能爬上去的岸边）。 */
+    private static final int[][] CARDINAL_DIRECTIONS = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1}
+    };
+
+    /**
+     * 这一格是不是"能从水里爬上去的岸"（第四轮修复 B）。
+     *
+     * <p>{@link #isStandable} 只看格子本身能不能站，不管它和水面的相对高度：
+     * 第三轮长跑实测里崖顶格、崖壁半腰的格子都被选成上岸点，NPC 游到墙根后
+     * 既爬不上去（陡岸约 4 格高）也收不到"到达"，只能原地浮沉到目标层被挂死。
+     *
+     * <p>判据：本身可站立（已含脚/头可通行、干燥、脚下有支撑）；并且至少一个
+     * 正方向邻格是"表面流体"（该列最上面一格流体），落脚面比该流体所在格
+     * 高 0~1 格——这正是真人玩家在水里能扒着爬上去的高度，2 格以上爬不上去。
+     */
+    public static boolean isShoreCell(BlockGetter level, BlockPos cand) {
+        if (!isStandable(level, cand)) {
+            return false;
+        }
+        for (int[] dir : CARDINAL_DIRECTIONS) {
+            for (int dy = 0; dy >= -1; dy--) {
+                BlockPos fluidPos = cand.offset(dir[0], dy, dir[1]);
+                if (level.getBlockState(fluidPos).getFluidState().isEmpty()) {
+                    continue;
+                }
+                // 必须是该列的表面流体（上面一格不再是流体）：深水柱中段贴着的
+                // 干格是水下洞壁，游过去也站不住（头还在水里），不算岸。
+                if (!level.getBlockState(fluidPos.above()).getFluidState().isEmpty()) {
+                    continue;
+                }
+                int rise = cand.getY() - fluidPos.getY();
+                if (rise >= 0 && rise <= 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 脚/头可通行且脚下有支撑，才算一个能站人的格子。
+     *
+     * <p>支撑不能是树叶（第五轮修复）：树叶有碰撞盒，旧判定把树冠表面当成地面，
+     * A* 会先爬上树冠、再计划"跳下 3 格到树干旁"，但身体被树叶柱挡住根本走不下去，
+     * 卡在树冠上反复 rescue/giveup/重发同一棵树（实测位置 4 分钟纹丝不动）。
+     * 真人也不会把树冠当路走。站在树叶上不算落脚点后，路径只走真正的地面，
+     * 砍树的落脚点自然回到树干旁的地面上。
+     */
     public static boolean isStandable(BlockGetter level, BlockPos feet) {
-        return isPassable(level, feet)
-                && isPassable(level, feet.above())
-                && !level.getBlockState(feet.below()).getCollisionShape(level, feet.below()).isEmpty();
+        if (!isPassable(level, feet) || !isPassable(level, feet.above())) {
+            return false;
+        }
+        BlockState support = level.getBlockState(feet.below());
+        if (support.is(net.minecraft.tags.BlockTags.LEAVES)) {
+            return false;
+        }
+        return !support.getCollisionShape(level, feet.below()).isEmpty();
     }
 
     /**
@@ -199,9 +276,24 @@ public final class PathFinder {
                 || state.is(Blocks.SOUL_FIRE)
                 || state.is(Blocks.CACTUS)
                 || state.is(Blocks.MAGMA_BLOCK)
-                || state.is(Blocks.SWEET_BERRY_BUSH)
-                || state.is(Blocks.POWDER_SNOW);
+                || state.is(Blocks.SWEET_BERRY_BUSH);
     }
+
+    /**
+     * 细雪（powder snow）单独处理，不再算"不可通行"（第三轮长跑短验实测）：
+     * 出生点落在雪原时，NPC 脚格就是细雪——旧判定让 A* 连起点都拒绝（0 节点），
+     * 所有计划瞬间失败，身体层脱困又只在行走中触发，于是永久卡死、零位移。
+     * 真人玩家陷在细雪里是可以趟出来的（只是慢），所以这里改成"可通行但贵"：
+     * 踩进细雪格加一大笔代价（见 find 里的 POWDER_SNOW_COST），寻路会优先绕开，
+     * 只有没别的路时才趟雪脱困。细雪本身没有碰撞体积，isPassable 天然放行；
+     * 脚下支撑仍要求实心地面，悬空的细雪不会被当成落脚点。
+     */
+    private static boolean isPowderSnow(BlockGetter level, BlockPos pos) {
+        return level.getBlockState(pos).is(Blocks.POWDER_SNOW);
+    }
+
+    /** 趟细雪一步的额外代价：约等于多走 8 格，足够让 A* 优先选裸地。 */
+    private static final double POWDER_SNOW_COST = 8.0D;
 
     /**
      * 把一个水平邻格修正到"能站的那一层"：先试同层，再逐层向下，最后试上 1 格。
@@ -269,6 +361,45 @@ public final class PathFinder {
         double dy = Math.abs(from.getY() - to.getY());
         double horizontal = Math.max(dx, dz) + Math.min(dx, dz) * (DIAGONAL_COST - 1.0D);
         return (horizontal + dy * 1.5D) * HEURISTIC_WEIGHT;
+    }
+
+    /**
+     * 起点专用落脚解析：先同列上下找，再横向扩列兜底（见 find 里的说明）。
+     * 返回三维距离最近的可站立格；都找不到返回 null。
+     */
+    private static BlockPos nearestStandableWide(BlockGetter level, BlockPos pos,
+                                                 int verticalRange, int horizontalRange) {
+        BlockPos best = nearestStandable(level, pos, verticalRange);
+        if (best != null) {
+            return best;
+        }
+        double bestSq = Double.MAX_VALUE;
+        for (int dx = -horizontalRange; dx <= horizontalRange; dx++) {
+            for (int dz = -horizontalRange; dz <= horizontalRange; dz++) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                BlockPos cand = nearestStandable(level, pos.offset(dx, 0, dz), verticalRange);
+                if (cand == null) {
+                    continue;
+                }
+                // 横向锚点不得比起点低 3 格以上（fix7 长跑实测）：NPC 站在 5 格高的
+                // 树冠上、目标格就在正下方地面时，旧逻辑锚到地面格生成"1 节点幻影
+                // 路径"——起点与目标重合、A* 秒成，但身体与地面之间隔着树干树冠，
+                // 水平方向已经"到达"、垂直方向永远下不去，原地卡死。
+                // 超过合法下落高度（MAX_DROP=3）的横向格对身体就是不可达的，
+                // 宁可判无路让上层换目标，下树交给生存层的挖树叶脱困。
+                if (cand.getY() < pos.getY() - MAX_DROP) {
+                    continue;
+                }
+                double sq = pos.distSqr(cand);
+                if (sq < bestSq) {
+                    bestSq = sq;
+                    best = cand;
+                }
+            }
+        }
+        return best;
     }
 
     private static BlockPos nearestStandable(BlockGetter level, BlockPos pos, int range) {

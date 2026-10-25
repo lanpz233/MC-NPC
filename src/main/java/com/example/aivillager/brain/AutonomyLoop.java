@@ -73,6 +73,17 @@ public final class AutonomyLoop {
     }
 
     private void poll() {
+        // 包装层：项目里其他周期任务都有 safeTick 兜底，唯独这里原先裸奔。
+        // poll 里要读每个 NPC 的背包/附近实体，任何一次异常抛出都会中断本轮
+        // 后面所有 NPC 的处理；若异常恰好发生在配额借出之后，还会泄漏配额（见下方 think 保护）。
+        try {
+            pollInner();
+        } catch (Throwable throwable) {
+            LOG.log(java.util.logging.Level.WARNING, "[AIV][AUTO] 自主循环单轮异常（已兜住，循环继续）", throwable);
+        }
+    }
+
+    private void pollInner() {
         long now = System.currentTimeMillis();
         // 第一遍：先争取让 NPC 问模型。
         // 顺序很重要：如果先空闲走动，skills 会被 goto 一直占着，
@@ -107,7 +118,18 @@ public final class AutonomyLoop {
 
                 lastThinkAt.put(body.npcName(), now);
                 active++;
-                boolean started = brain.think(() -> active = Math.max(0, active - 1));
+                boolean started;
+                try {
+                    started = brain.think(() -> active = Math.max(0, active - 1));
+                } catch (Throwable throwable) {
+                    // think() 会先在主线程同步组提示词（读背包/附近方块/实体），可能直接抛异常，
+                    // 那样回调和 !started 分支都走不到，配额就永久泄漏了
+                    // （默认 maxConcurrent=1，泄漏一次 = 全服 NPC 从此不再自省）。
+                    active = Math.max(0, active - 1);
+                    LOG.log(java.util.logging.Level.WARNING,
+                            "[AIV][AUTO] " + body.npcName() + " think 同步异常，配额已归还", throwable);
+                    continue;
+                }
                 if (!started) {
                     // 理论上 isBusy() 已经挡住，这里只是保证配额不会泄漏。
                     active = Math.max(0, active - 1);

@@ -62,6 +62,15 @@ public final class VillagerBrain {
     private final Deque<LlmMessage> history = new ArrayDeque<>();
 
     private boolean inFlight;
+    /** inFlight 置位时间；供 isBusy() 做超时强制复位（见 INFLIGHT_TIMEOUT_MILLIS）。 */
+    private long inFlightSinceMillis;
+    /**
+     * 推理在飞的最长容忍时间。下层 provider 有 90 秒 HTTP 超时，正常不会超过；
+     * 但 inFlight 原先只有异步回调一条复位路径，Future 不回来/回调调度失败
+     * 就会永久卡死（NPC 从此不思考、不接话、自主配额也被占住）。
+     * 3 分钟还没回来就当这次推理死了：作废回合号并强制复位，迟到的结果会被丢弃。
+     */
+    private static final long INFLIGHT_TIMEOUT_MILLIS = 180_000L;
     /** 当前这次推理是自主自省，而不是玩家对话。玩家开口时可以抢占它。 */
     private boolean autoInFlight;
     /** 回合号：被抢占的旧推理结果回来时直接丢弃，避免执行过时动作。 */
@@ -106,6 +115,7 @@ public final class VillagerBrain {
         }
         int myTurn = ++turnId;
         inFlight = true;
+        inFlightSinceMillis = System.currentTimeMillis();
         autoInFlight = false;
 
         List<LlmMessage> messages = new ArrayList<>();
@@ -149,6 +159,7 @@ public final class VillagerBrain {
         }
         int myTurn = ++turnId;
         inFlight = true;
+        inFlightSinceMillis = System.currentTimeMillis();
         autoInFlight = true;
 
         List<LlmMessage> messages = new ArrayList<>();
@@ -478,6 +489,15 @@ public final class VillagerBrain {
 
     /** 是否正在推理（玩家对话或自主自省），供自主调度器跳过忙碌的 NPC。 */
     public boolean isBusy() {
+        if (inFlight && System.currentTimeMillis() - inFlightSinceMillis > INFLIGHT_TIMEOUT_MILLIS) {
+            // 推理超时未归：强制复位并作废回合号，迟到的回调会按"已被取代"丢弃，
+            // 不会重复执行动作。自主配额由 AutonomyLoop 侧的 max(0) 兜底防重复释放。
+            LOG.warning("[AIV][BRAIN] " + body.npcName() + " 推理超过 "
+                    + (INFLIGHT_TIMEOUT_MILLIS / 1000L) + " 秒未返回，强制复位 inFlight");
+            inFlight = false;
+            autoInFlight = false;
+            turnId++;
+        }
         return inFlight;
     }
 

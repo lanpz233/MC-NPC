@@ -57,6 +57,17 @@ public final class SurvivalController {
     private static final int REVIVE_DELAY_TICKS = 4;
     /** 进入攻击距离（3 格）的平方。 */
     private static final double ATTACK_RANGE_SQ = 9.0D;
+    /**
+     * 惜命线（Fong 定：把生命放在第一位）：血量 ≤7（满血 20 的 35%）就是低血，
+     * 不管有没有装备都必须先脱离战斗、拉开距离回血，不许恋战。
+     * 旧口径是 8 点（40%）且和"有没有武器"混在一个条件里，现拆成独立的明确阈值。
+     */
+    private static final float LOW_HEALTH_THRESHOLD = 7.0F;
+    /**
+     * 空手接战线：没武器也没装备时，只有血量 >14（70%，足够健康）才许空手打敌对生物；
+     * 低于这条线又没装备，就按低血处理先跑。有武器或有装备则不受这条线限制（只受惜命线）。
+     */
+    private static final float BARE_HAND_MIN_HEALTH = 14.0F;
     /** 贴脸判定：5 格内会强制中断当前技能来自卫。 */
     private static final double FORCE_DEFEND_RANGE_SQ = 25.0D;
     /**
@@ -96,6 +107,23 @@ public final class SurvivalController {
     private int armorCheckTimer;
     /** 卡方块自救的计时器，与装备检查分开计数（两者节奏不同）。 */
     private int unstuckTimer;
+    /** 连续泡在流体里的自救检查次数（约 1 秒一次）：用于"泡久了挖开头顶"的升级脱困。 */
+    private int fluidStuckChecks;
+    /** 上次下发游泳脱困的时间：技能的行走目标会把游泳模式顶掉，短期内不重复下发，避免互相抢输入刷日志。 */
+    private long lastSwimIssueMillis;
+    /**
+     * 挖岸脱困的方向（第四轮修复 B）：泡够约 12 秒还没上岸时选定——朝最近旱地的
+     * 单位偏移（BlockPos 只用 x/z 分量）。null 表示还没选或附近 10 格内没有旱地
+     * （全淹洞穴），此时挖岸无从下手，只挖头顶开气腔。离开流体即清零。
+     */
+    private net.minecraft.core.BlockPos fluidEscapeDir;
+    /**
+     * "原地不动"锚点与计数（第六轮补充·树干顶脱困）：水平离开锚点 2 格以上清零，
+     * 垂直下落不算移动（逐层挖树干时每挖一层只落 1 格，不能被误判成"在动")。
+     * 约 10 次检查（约 10 秒）不动且脚下是原木，才判定困在树干顶上。
+     */
+    private net.minecraft.core.BlockPos stillAnchor;
+    private int stillChecks;
     private boolean chasing;
     private int deadTicks;
     private boolean deathLogged;
@@ -186,7 +214,7 @@ public final class SurvivalController {
         // 自埋自救：爬坡垫脚、从矿道破土而出时偶尔会把自己卡进一个实心方块里
         // （实测脚部格是圆石）。这时身体位置不可站立，A* 起点非法，所有寻路
         // （砍树/走路/找矿）都会瞬间失败，NPC 外表上就是站在原地反复报"不可达"。
-        // 玩家遇到这种情况会被原版自动顶出方块，这里用同样的修正方式自救。
+        // 脱困办法见 unstuck()：挖开困住自己的方块（玩家手段），不再做位置修正。
         if (++unstuckTimer >= UNSTUCK_CHECK_INTERVAL) {
             unstuckTimer = 0;
             unstuck();
@@ -218,7 +246,8 @@ public final class SurvivalController {
 
     /**
      * 自埋/落水自救：每 1 秒检查一次。
-     * 两件事：卡进实心方块 → 顶出；站在流体里 → 跳出。
+     * 两件事：卡进实心方块 → 挖开困住自己的方块走出来；站在流体里 → 游泳上岸。
+     * 两件都只许真玩家手段，不许传送（Fong 定：让他完全靠自己）。
      *
      * <p>只看脚部这一格：头被卡住时原版通常还能把身体挤出去，
      * 而脚部被占/被淹意味着"这一格站不了"，身体会被持续顶/冲、A* 起点永远非法。
@@ -226,66 +255,139 @@ public final class SurvivalController {
     private void unstuck() {
         net.minecraft.core.BlockPos feet = npc.blockPosition();
         net.minecraft.world.level.block.state.BlockState state = npc.level().getBlockState(feet);
-        if (state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK)) {
+        // 原地不动计时（树干顶脱困的门控）：只看水平位移，逐层下挖的 1 格下落不算动。
+        if (stillAnchor == null
+                || (feet.getX() - stillAnchor.getX()) * (feet.getX() - stillAnchor.getX())
+                        + (feet.getZ() - stillAnchor.getZ()) * (feet.getZ() - stillAnchor.getZ()) >= 4) {
+            stillAnchor = feet;
+            stillChecks = 0;
+        } else {
+            stillChecks++;
+        }
+        // 站在树叶上（出生/掉落到树冠，fix7 长跑实测）：脚格是空气、脚下是树叶时，
+        // 身体被树冠托在半空——寻路要么起点悬空、要么锚到正下方地面生成幻影路径，
+        // 朝哪都走不了。玩家式下树：把脚下树叶逐层挖掉、靠物理逐层落下去
+        // （树冠一般 2-4 层，最后一落也不超过 3 格）。全程只挖不传送。
+        if (state.getFluidState().isEmpty()
+                && (state.isAir() || state.getCollisionShape(npc.level(), feet).isEmpty())
+                && npc.level().getBlockState(feet.below())
+                        .is(net.minecraft.tags.BlockTags.LEAVES)) {
+            if (npc.mineWithBestTool(feet.below()) || npc.mine(feet.below())) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " canopy-descent | pos="
+                        + feet.toShortString());
+            }
+            fluidStuckChecks = 0;
+            fluidEscapeDir = null;
             return;
         }
-        // === 流体自救 ===
-        // 站在水/岩浆里会被流体推动、卡住跳不上岸：直接传送出流体。
+        // 困在树干顶（第六轮补充，fix8 长跑实测）：挖叶下树时落在 1 格宽的树干顶上，
+        // 离地 7+ 格、四周无任何可站立邻格，A* 展开几个节点就耗尽，同样原地卡死。
+        // 判定加门控：原地不动约 10 秒且脚下是原木——正常站在木头上干活的人不会
+        // 10 秒水平纹丝不动（合成是瞬时的、冶炼站的是地面），困住了才挖脚下原木
+        // 逐层落下去。和挖树叶一样只挖不传送；挖掉的是野生树干顶，不是玩家建筑
+        // （NPC 自己也不会站在自己盖的木头上发呆 10 秒）。
+        if (stillChecks >= 10
+                && state.getFluidState().isEmpty()
+                && (state.isAir() || state.getCollisionShape(npc.level(), feet).isEmpty())
+                && npc.level().getBlockState(feet.below())
+                        .is(net.minecraft.tags.BlockTags.LOGS)) {
+            if (npc.mineWithBestTool(feet.below()) || npc.mine(feet.below())) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " trunk-descent | pos="
+                        + feet.toShortString() + " stillSec=" + stillChecks);
+            }
+            fluidStuckChecks = 0;
+            fluidEscapeDir = null;
+            return;
+        }
+        if (state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK)) {
+            fluidStuckChecks = 0;
+            fluidEscapeDir = null;
+            return;
+        }
+        // === 流体自救：游泳上岸 ===
+        // 站在水/岩浆里会被流体推动、沉底上不了岸。旧做法是传送到岸上，已拆除：
+        // 改为让身体进入游泳模式，朝最近的岸边格游过去、上浮、扒岸上岸，全程流体物理。
+        // 岩浆里游得慢、会持续烧伤，游不出去就可能死——那是真玩家掉进岩浆的正常下场，
+        // 按正常死亡处理（死亡不掉落是本服规则，见 revive 一节），不许用瞬移作弊脱身。
         if (!state.getFluidState().isEmpty()) {
             boolean isWater = state.is(net.minecraft.world.level.block.Blocks.WATER);
             String fluidName = isWater ? "water" : (state.is(net.minecraft.world.level.block.Blocks.LAVA) ? "lava" : "fluid");
-            // 先看正上方 1~4 格：如果上方是空气（头顶没遮），且下方有支撑，就跳上去。
-            // 1.21 里流体高度不到 1 格，Y+2 基本能站在水面上。
-            for (int up = 1; up <= 4; up++) {
-                net.minecraft.core.BlockPos above = feet.above(up);
-                net.minecraft.world.level.block.state.BlockState aboveState = npc.level().getBlockState(above);
-                if (!aboveState.isAir() || !aboveState.getCollisionShape(npc.level(), above).isEmpty()) {
-                    continue; // 上方是实心/有碰撞 → 不能站
-                }
-                // 再下一格应该是实心支撑：避免"跳到悬空空气里"。
-                net.minecraft.core.BlockPos support = above.below();
-                net.minecraft.world.level.block.state.BlockState supportState = npc.level().getBlockState(support);
-                if (supportState.getCollisionShape(npc.level(), support).isEmpty()
-                        && supportState.getFluidState().isEmpty()) {
-                    continue; // 支撑也是空气 → 不稳，继续往上
-                }
-                npc.teleportTo(npc.level(), npc.getX(), above.getY() + 0.1D, npc.getZ(), java.util.Set.of(),
-                        npc.getYRot(), npc.getXRot(), true);
-                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 从流体里跳出 | fluid="
-                        + fluidName + " pos=" + feet.toShortString() + " → Y=" + above.getY());
+            // 浅水涉水不算被困：脚踩着地、眼睛不在水里时，玩家就是蹚水走过去的，
+            // 行走/技能自己能处理；反复下发游泳只会在池塘边"游一步→上岸"4 秒一轮
+            // 地刷屏打转（实测）。只有真泡在深水里（眼睛入水或离地沉浮）才游泳脱困。
+            boolean eyeInFluid = !npc.level().getBlockState(
+                    net.minecraft.core.BlockPos.containing(npc.getEyePosition()))
+                    .getFluidState().isEmpty();
+            if (!eyeInFluid && npc.onGround()) {
+                fluidStuckChecks = 0;
+                fluidEscapeDir = null;
                 return;
             }
-            // 上方不行：找 6 个相邻格里离自己最近的"实心可站立"格，传送过去。
-            // 这会让 NPC 从水池中心跳到池边。
-            net.minecraft.core.BlockPos best = null;
-            double bestSq = Double.MAX_VALUE;
-            for (int[] d : new int[][]{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}) {
-                for (int dy : new int[]{0, 1, -1}) {
-                    net.minecraft.core.BlockPos cand = feet.offset(d[0], d[1] + dy, d[2]);
-                    net.minecraft.world.level.block.state.BlockState candState = npc.level().getBlockState(cand);
-                    net.minecraft.world.level.block.state.BlockState belowState = npc.level().getBlockState(cand.below());
-                    // 候选格是空气 + 下方是实心 → 可站立
-                    if (candState.isAir()
-                            && !belowState.getCollisionShape(npc.level(), cand.below()).isEmpty()) {
-                        double sq = feet.distSqr(cand);
-                        if (sq < bestSq) {
-                            bestSq = sq;
-                            best = cand.immutable();
-                        }
-                    }
+            fluidStuckChecks++;
+            // 挖岸脱困的方向在进入升级阶段时选定一次（第四轮修复 B）：
+            // 朝最近的旱地方向贴墙挖台阶；10 格内没有旱地（全淹洞穴）就保持 null。
+            if (fluidStuckChecks == 12) {
+                fluidEscapeDir = pickFluidEscapeDir(feet);
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dig start | fluid="
+                        + fluidName + " pos=" + feet.toShortString()
+                        + " dir=" + (fluidEscapeDir == null ? "none(全淹)"
+                                : fluidEscapeDir.toShortString()));
+            }
+            // 下发游泳脱困，但要避开两个内耗：
+            // ① dryland 技能正在接管时它自己就是上岸技能（带上浮+寻岸），生存层再下发
+            //    游泳会互相顶掉对方的行走目标，两边都走不成——此时只帮忙挖顶（见下）。
+            // ② 刚下发过游泳（4 秒内）就别重发：别的技能把游泳顶掉后，给它一个观察窗。
+            boolean drylandActive = "dryland".equals(skills.currentSkill());
+            long now = System.currentTimeMillis();
+            if (!drylandActive && !npc.isSwimmingEscape()
+                    && now - lastSwimIssueMillis >= 4_000L) {
+                lastSwimIssueMillis = now;
+                // 找岸按被困时长逐步扩围（第四轮修复 B）：旧版只找 ±3 格且不看岸高，
+                // 陡岸水塘边明明 5 格外就有缓坡（长跑1 实测）却永远够不着；
+                // 现在候选必须是"贴水面、最多高 1 格"的真岸（PathFinder.isShoreCell），
+                // 找不到就沿岸横向扩围找缓坡，而不是对着崖壁干游。
+                int shoreRadius = fluidStuckChecks <= 3 ? 4 : fluidStuckChecks <= 8 ? 7 : 11;
+                net.minecraft.core.BlockPos shore = findShoreCell(feet, shoreRadius);
+                if (shore != null) {
+                    npc.swimTo(shore);
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，游泳上岸 | fluid="
+                            + fluidName + " pos=" + feet.toShortString() + " 岸边=" + shore.toShortString());
+                } else if (fluidStuckChecks >= 12 && fluidEscapeDir != null) {
+                    // 没有能爬的岸：朝岸壁方向贴过去，配合下面的挖岸台阶脱困。
+                    npc.swimTo(feet.offset(fluidEscapeDir.getX() * 3, 0, fluidEscapeDir.getZ() * 3));
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-press | fluid="
+                            + fluidName + " pos=" + feet.toShortString()
+                            + " dir=" + fluidEscapeDir.toShortString());
+                } else {
+                    // 附近没找到岸：先原地上浮到水面，别沉底，之后由技能层想办法靠岸。
+                    npc.swimUp();
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，附近无岸，先上浮 | fluid="
+                            + fluidName + " pos=" + feet.toShortString());
                 }
             }
-            if (best != null) {
-                npc.teleportTo(npc.level(), best.getX() + 0.5D, best.getY() + 0.1D, best.getZ() + 0.5D,
-                        java.util.Set.of(), npc.getYRot(), npc.getXRot(), true);
-                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 从流体里传送 | fluid="
-                        + fluidName + " pos=" + feet.toShortString() + " → " + best.toShortString());
-                return;
+            // 升级脱困（第四轮修复 B）：泡够约 12 秒还没上岸，说明附近没有能爬的岸
+            // （陡岸/崖壁水洼/全淹洞穴），光游永远出不去——改走玩家式物理脱困：
+            // 有岸壁方向就贴墙把水面以上两格挖成台阶口，挖通后那一格自然成为合格的岸，
+            // 上面的找岸逻辑会把 NPC 领进去站稳；全淹洞穴没有岸壁方向时挖头顶开气腔。
+            // 只挖和走，全程无传送。挖岸节奏约 2 秒一次，给身体留出贴墙/上浮的时间。
+            if (fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0) {
+                boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
+                if (dug) {
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
+                            + fluidName + " pos=" + feet.toShortString()
+                            + " dir=" + (fluidEscapeDir == null ? "above"
+                                    : fluidEscapeDir.toShortString()));
+                }
+            } else if (fluidStuckChecks >= 3 && fluidStuckChecks % 5 == 3 && npc.digOutAbove()) {
+                // 未进入挖岸阶段前的旧升级：泡约 3 秒先试挖头顶（被水洞顶盖住时凿开继续上浮）。
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 流体脱困：挖开头顶 | fluid="
+                        + fluidName + " pos=" + feet.toShortString());
             }
-            // 池底也没有可跳的地方：放弃，让 descend/ascend 自己处理。
             return;
         }
-        // === 实心方块自救 ===
+        fluidStuckChecks = 0;
+        fluidEscapeDir = null;
+        // === 实心方块自救：挖开脱困 ===
         // 草、花、火把、告示牌这类方块不是空气，但碰撞盒是空的：站在上面是正常站位。
         // 注意 VoxelShape.bounds() 对空形状会直接抛异常（实测站在草丛里每 0.5 秒抛一次），
         // 必须先判 isEmpty() 再取 bounds()。
@@ -294,20 +396,136 @@ public final class SurvivalController {
         if (shape.isEmpty() || shape.bounds().maxY < 0.9D) {
             return;
         }
-        // 优先把身体顶到方块上方，而不是把方块挖掉：
-        // 实测这是 ascend 垒台阶时身体被挤进垫脚石造成的，挖掉等于把刚垒好的台阶毁掉，
-        // 爬一级毁一级，NPC 会卡在原地反复挖。原版对卡进方块的玩家也是往上修正位置。
-        double topY = feet.getY() + shape.bounds().maxY + 0.001D;
-        npc.teleportTo(npc.level(), npc.getX(), topY, npc.getZ(), java.util.Set.of(),
-                npc.getYRot(), npc.getXRot(), true);
-        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 卡在方块里，顶出自救 | block="
-                + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock())
-                + " pos=" + feet.toShortString() + " → Y=" + String.format(java.util.Locale.ROOT, "%.2f", topY));
+        // 旧做法是把身体"顶出"到方块上方（位置瞬移），已按 Fong 的决定拆除。
+        // 改为挖开困住自己的方块：先用最合适的工具挖脚部格，挖不动再素手挖
+        // （本插件所有挖掘都是 destroyBlock 一次成型，素手挖只是没有掉落，脱困够用），
+        // 脚部实在挖不开（基岩级硬度）就试头顶格。挖开后身体自然落回/走出空格。
+        // 代价：若困住他的是 ascend 刚垫的台阶石，挖掉会毁一级台阶——但玩家被方块
+        // 卡住时也会挖开它，诚实脱困优先于保台阶，ascend 之后会自己重新垫。
+        boolean dug = npc.mineWithBestTool(feet) || npc.mine(feet);
+        net.minecraft.core.BlockPos used = feet;
+        if (!dug) {
+            net.minecraft.core.BlockPos head = feet.above();
+            dug = npc.mineWithBestTool(head) || npc.mine(head);
+            used = head;
+        }
+        if (dug) {
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 卡在方块里，挖开脱困 | block="
+                    + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock())
+                    + " pos=" + used.toShortString());
+        } else {
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 卡在方块里且挖不开（基岩等），等待上层收场 | block="
+                    + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock())
+                    + " pos=" + feet.toShortString());
+        }
+    }
+
+    /**
+     * 在脚部周围找最近的"能从水里爬上去的岸"作为游泳上岸目标（第四轮修复 B）。
+     *
+     * <p>旧版 nearestShoreCell 只要求"可站立且干燥"，崖顶格照样入选，NPC 游到
+     * 崖壁根部永远爬不上去（第三轮两轮长跑都死于此）。现在候选必须通过
+     * {@link PathFinder#isShoreCell}：紧贴水面、落脚面不高于水面 1 格。
+     * 半径由调用方按被困时长放大（4→7→11），相当于沿岸横向找缓坡。
+     */
+    private net.minecraft.core.BlockPos findShoreCell(net.minecraft.core.BlockPos feet, int radius) {
+        net.minecraft.core.BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                for (int dy = -3; dy <= 3; dy++) {
+                    net.minecraft.core.BlockPos cand = feet.offset(dx, dy, dz);
+                    if (cand.equals(feet)) {
+                        continue;
+                    }
+                    if (!PathFinder.isShoreCell(npc.level(), cand)) {
+                        continue;
+                    }
+                    double sq = feet.distSqr(cand);
+                    if (sq < bestSq) {
+                        bestSq = sq;
+                        best = cand.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 选挖岸脱困的方向（第四轮修复 B）：8 个水平方向逐格外探 10 格，
+     * 哪边先碰到"可站立的旱地列"（任意高度，是岸壁就行）就朝哪边挖。
+     * 10 格内全是水/虚空（全淹洞穴、湖心）返回 null，改走挖头顶路线。
+     */
+    private net.minecraft.core.BlockPos pickFluidEscapeDir(net.minecraft.core.BlockPos feet) {
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        net.minecraft.core.BlockPos bestDir = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int[] d : dirs) {
+            for (int step = 1; step <= 10; step++) {
+                net.minecraft.core.BlockPos col = feet.offset(d[0] * step, 0, d[1] * step);
+                boolean land = false;
+                for (int dy = -2; dy <= 6 && !land; dy++) {
+                    net.minecraft.core.BlockPos cand = col.offset(0, dy, 0);
+                    if (PathFinder.isStandable(npc.level(), cand)
+                            && npc.level().getBlockState(cand).getFluidState().isEmpty()) {
+                        land = true;
+                    }
+                }
+                if (land) {
+                    if (step < bestDist) {
+                        bestDist = step;
+                        bestDir = new net.minecraft.core.BlockPos(d[0], 0, d[1]);
+                    }
+                    break;
+                }
+            }
+        }
+        return bestDir;
+    }
+
+    /** NPC 所在列的水面高度（最上面一格流体的 Y）；脚格不是流体时就用脚格 Y 兜底。 */
+    private int fluidSurfaceY(net.minecraft.core.BlockPos feet) {
+        int y = feet.getY();
+        for (int dy = 0; dy <= 6; dy++) {
+            net.minecraft.core.BlockPos pos = feet.offset(0, dy, 0);
+            if (npc.level().getBlockState(pos).getFluidState().isEmpty()) {
+                break;
+            }
+            y = pos.getY();
+        }
+        return y;
+    }
+
+    /**
+     * 挖岸台阶（第四轮修复 B）：朝脱困方向的那一列，把水面以上 1、2 格挖空，
+     * 形成一个"脚落在水面+1、头有空"的台阶口——挖完后该格正好通过 isShoreCell，
+     * 游泳逻辑会自己爬进去。挖的是岸壁本身（玩家镐子活），不是传送也不是垫方块。
+     *
+     * @return 是否挖开了至少一块
+     */
+    private boolean digBankStep(net.minecraft.core.BlockPos feet) {
+        int surfaceY = fluidSurfaceY(feet);
+        net.minecraft.core.BlockPos lower = new net.minecraft.core.BlockPos(
+                feet.getX() + fluidEscapeDir.getX(), surfaceY + 1,
+                feet.getZ() + fluidEscapeDir.getZ());
+        net.minecraft.core.BlockPos upper = lower.above();
+        boolean dug = npc.mineWithBestTool(lower) || npc.mine(lower);
+        dug |= npc.mineWithBestTool(upper) || npc.mine(upper);
+        return dug;
     }
 
     /** 原地复活：不替换实体对象，保证技能层/大脑层手里的引用一直有效。 */
     private void revive() {
         deadTicks = 0;
+        // 复活必须把死前的执行状态一并清掉：只搬身体不清状态的话，
+        // 死前正在跑的技能会因为路径回调被 stopWalking() 静默丢弃而永远挂着
+        // （上层全看它"在忙"而集体等待，只能等技能看门狗 40 秒~10 分钟后才醒），
+        // fleeing/chasing 也会把目标层继续堵在复活点。
+        skills.stop();
+        fleeing = false;
+        chasing = false;
+        fleeCooldown = 0;
         npc.stopWalking();
         // 死亡后 ServerPlayer 会被摘出实体表。先清 removed 标记再重新挂回去，
         // 否则后面的传送、物理、拾取都不会生效（实体不在 level 的 tick 列表里）。
@@ -420,12 +638,15 @@ public final class SurvivalController {
             if (fleeCooldown <= 0) {
                 // 一秒后才能再规划一次逃跑路径，避免每 0.5 秒跑一次 A*。
                 fleeCooldown = 20;
+                // 顺序不能反：必须先停技能再铺逃跑路径。
+                // skills.stop() 会清掉身体当前路径，反过来先 flee() 后 stop()，
+                // 刚算好的逃跑路会被自己当场清掉，NPC 对着苦力怕原地冻住（实测过）。
+                if (!"idle".equals(skills.currentSkill())) {
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能躲避苦力怕 | skill="
+                            + skills.currentSkill() + " hp=" + npc.getHealth());
+                    skills.stop();
+                }
                 if (flee(threat)) {
-                    if (!"idle".equals(skills.currentSkill())) {
-                        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能躲避苦力怕 | skill="
-                                + skills.currentSkill() + " hp=" + npc.getHealth());
-                        skills.stop();
-                    }
                     fleeing = true;
                     return true;
                 }
@@ -435,23 +656,39 @@ public final class SurvivalController {
             }
         }
 
-        // 打不过就跑：赤手（评分 0）或残血时和僵尸硬拼必死，死了还会丢光进度。
+        // 惜命判定（Fong 定：生命第一）：不满足接战条件就先跑，不许恋战。
+        // 接战条件收敛在 canEngage()：低血（≤35%）谁都不许打；有武器或有装备可以打；
+        // 没武器没装备但血量健康（>70%）可以空手打。旧口径是"赤手或残血就跑"——
+        // 健康空手也被迫逃跑，不符合"健康时可以空手 A 野怪"的新规矩，现已拆开。
         // 逃跑期间目标层必须暂停，否则它会在下一 tick 立刻开始挖矿，把逃跑路径冲掉。
-        if (cachedWeaponScore <= 0 || npc.getHealth() <= 8.0F) {
+        boolean desperateDefense = false;
+        if (!canEngage(npc.getHealth(), hasWeaponOrArmor())) {
             if (!"idle".equals(skills.currentSkill())) {
-                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能逃跑 | threat=" + threat.getType()
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能逃跑（惜命） | threat=" + threat.getType()
                         + " skill=" + skills.currentSkill() + " hp=" + npc.getHealth());
                 skills.stop();
             }
             if (npc.isUsingItem()) {
                 npc.stopUsingItem();
             }
-            fleeing = true;
             if (fleeCooldown <= 0) {
-                flee(threat);
                 fleeCooldown = 40;
+                if (flee(threat)) {
+                    fleeing = true;
+                    return true;
+                }
+                // 跑不掉（墙后/坑下/无可站立点）：绝不能把 fleeing 留在 true 干等——
+                // 目标层、发展层、空闲走动都看 isFleeing() 暂停，fleeing 不清就是永久站桩。
+                // 拉黑这只威胁让上层恢复干活，并置 desperateDefense：下面只许在被贴脸
+                // 时还手自卫，绝不主动追击——低血恋战正是 Fong 要禁的。
+                fleeing = false;
+                desperateDefense = true;
+                ignoreThreat(threat, "逃跑失败（无路径/无可站立点），低血只自卫不追击");
+            } else if (fleeing) {
+                return true;
+            } else {
+                desperateDefense = true;
             }
-            return true;
         }
 
         // 没有被打、也不贴脸时，不打断正在执行的技能（挖矿挖到一半看到远处僵尸不用跑）。
@@ -469,6 +706,10 @@ public final class SurvivalController {
         }
 
         if (distanceSq > ATTACK_RANGE_SQ) {
+            // 惜命逃跑没跑掉时只许贴脸还手，绝不追击（追击=恋战，低血必死）。
+            if (desperateDefense) {
+                return true;
+            }
             // 超出攻击距离：走 A* 接近，正在走就不要每 0.5 秒重建路径。
             if (!npc.isFollowingPath()) {
                 BlockPos goal = PathFinder.standableGoal(npc.level(), threat.blockPosition(), 3);
@@ -512,6 +753,45 @@ public final class SurvivalController {
     }
 
     /**
+     * 惜命接战判定（全插件唯一口径，技能层的 attack/slay 入口也用它把关）：
+     * <ul>
+     *   <li>血量 ≤ {@link #LOW_HEALTH_THRESHOLD}（35%）：不许接战，必须先跑、回血；</li>
+     *   <li>有武器或身上有装备：可以打敌对生物；</li>
+     *   <li>没武器没装备：只有血量 > {@link #BARE_HAND_MIN_HEALTH}（70%，足够健康）才许空手打。</li>
+     * </ul>
+     */
+    public static boolean canEngage(float health, boolean equipped) {
+        if (health <= LOW_HEALTH_THRESHOLD) {
+            return false;
+        }
+        if (equipped) {
+            return true;
+        }
+        return health > BARE_HAND_MIN_HEALTH;
+    }
+
+    /** 当前是否有武器可用（主手评分>0；生存层每 1.5 秒会把最好的武器换到主手）或身上有护甲。 */
+    private boolean hasWeaponOrArmor() {
+        return cachedWeaponScore > 0 || npc.getArmorValue() > 0;
+    }
+
+    /** 是否低血（≤35%）：规划器/目标层据此在恢复前不派战斗与危险目标。 */
+    public boolean isLowHealth() {
+        return npc.getHealth() <= LOW_HEALTH_THRESHOLD;
+    }
+
+    /** 背包里有没有能吃的（非黑名单）食物：低血暂停干活回血的前提是真有东西可吃。 */
+    public boolean hasEdibleFood() {
+        Inventory inventory = npc.getInventory();
+        for (int slot = 0; slot < 36; slot++) {
+            if (foodScore(inventory.getItem(slot)) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 朝威胁的反方向跑 16 格。
      * 走 A* 而不是直线：出生点附近有树和坡，直线会被挡住，站着被咬更亏。
      *
@@ -527,25 +807,47 @@ public final class SurvivalController {
             dz = 0.0D;
             length = 1.0D;
         }
-        double targetX = npc.getX() + dx / length * 16.0D;
-        double targetZ = npc.getZ() + dz / length * 16.0D;
-        BlockPos desired = BlockPos.containing(targetX, npc.getY(), targetZ);
-        BlockPos goal = PathFinder.standableGoal(npc.level(), desired, 8);
-        if (goal == null) {
-            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：反方向没有可站立位置");
-            return false;
+        // 由远到近多档试：16 格反方向在矿道/水洞里常常没有可站位或没有路
+        // （实测低血逃跑因此直接失败、被迫贴脸战死），退到 10 格、6 格再试——
+        // 先跑开几格脱离攻击距离，也比原地恋战强，这正是惜命要的。
+        for (int distance : new int[]{16, 10, 6}) {
+            double targetX = npc.getX() + dx / length * distance;
+            double targetZ = npc.getZ() + dz / length * distance;
+            BlockPos desired = BlockPos.containing(targetX, npc.getY(), targetZ);
+            // standableGoal 只在目标那一列上下找：矿道里逃跑方向那一列多半是实心石，
+            // 纵向翻遍也找不到能站的格（实测三档全灭）。补一圈横向搜索：
+            // 以目标列为中心、半径 3 内逐列试，矿道横截面就这么宽，总有一列是通道。
+            BlockPos goal = null;
+            outer:
+            for (int r = 0; r <= 3; r++) {
+                for (int ox = -r; ox <= r; ox++) {
+                    for (int oz = -r; oz <= r; oz++) {
+                        if (Math.max(Math.abs(ox), Math.abs(oz)) != r) {
+                            continue;
+                        }
+                        goal = PathFinder.standableGoal(npc.level(), desired.offset(ox, 0, oz), 4);
+                        if (goal != null) {
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (goal == null) {
+                continue;
+            }
+            PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000);
+            if (!result.found()) {
+                continue;
+            }
+            npc.followPath(result.path(), true, null, null);
+            chasing = true;
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑 | threat=" + threat.getType()
+                    + " hp=" + String.format(Locale.ROOT, "%.1f", npc.getHealth())
+                    + " 距离档=" + distance + " 路径=" + result.path().size() + " 终点=" + goal.toShortString());
+            return true;
         }
-        PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000);
-        if (!result.found()) {
-            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：无路径 " + result.detail());
-            return false;
-        }
-        npc.followPath(result.path(), true, null, null);
-        chasing = true;
-        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑 | threat=" + threat.getType()
-                + " hp=" + String.format(Locale.ROOT, "%.1f", npc.getHealth())
-                + " 路径=" + result.path().size() + " 终点=" + goal.toShortString());
-        return true;
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：16/10/6 格各档都没有可站立位置或路径");
+        return false;
     }
 
     private LivingEntity findThreat() {
@@ -609,7 +911,11 @@ public final class SurvivalController {
      * @param onlyWhenSafe true 表示只在没有贴身威胁时进食（战斗间隙补一口）
      */
     private void eat(boolean onlyWhenSafe) {
-        if (npc.getFoodData().getFoodLevel() >= eatThreshold) {
+        // 回血优先（惜命）：原版要食物值 ≥18 才回血，只按平时的 eatThreshold（14）
+        // 吃两口就停，血永远回不上来。所以只要血没满且包里有吃的，就吃到 19 再停，
+        // 让原版回血真正转起来；血满后回到日常阈值，不浪费食物。
+        int threshold = npc.getHealth() < npc.getMaxHealth() ? 19 : eatThreshold;
+        if (npc.getFoodData().getFoodLevel() >= threshold) {
             return;
         }
         if (onlyWhenSafe && hasEnemyWithin(FORCE_DEFEND_RANGE_SQ)) {

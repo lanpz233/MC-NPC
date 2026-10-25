@@ -3,11 +3,13 @@ package com.example.aivillager.skills;
 import com.example.aivillager.intent.Intent;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.pathfinding.PathFinder;
+import com.example.aivillager.survival.SurvivalController;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.animal.Animal;
@@ -129,6 +131,11 @@ public final class SkillRunner {
                 BlockPos desired = BlockPos.containing(x, npc.getY(), z);
                 BlockPos goal = PathFinder.standableGoal(npc.level(), desired, 6);
                 if (goal == null) {
+                    // 短距离兜底（第六轮补充3）：终点列没有落脚格（水中树岛的树干列等），
+                    // 且距离 ≤16 格时直接朝目标点直线走——见 walkStraightTo 的说明。
+                    if (horizontalDistanceTo(desired) <= 16.0D && walkStraightTo(id, desired)) {
+                        return true;
+                    }
                     lastOutcome = "goto 目标附近没有可站立位置 x=" + Math.round(x) + " z=" + Math.round(z);
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " goto 目标不可站立 | x=" + x + " z=" + z);
                     return false;
@@ -137,6 +144,15 @@ public final class SkillRunner {
                 PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal);
                 logPath("goto", goal, result);
                 if (!result.found()) {
+                    // 短距离兜底（第六轮补充3）：A* 把流体判不可通行，沼泽/河口地形里
+                    // 出生在一小块干岛上时四周全是水，A* 只展开几个节点就无路可走，
+                    // 十几格外水中的树永远够不着（fix8/fix9 长跑实测，背包全空卡死）。
+                    // ≤16 格改直线走：身体会自己蹚浅水/游泳（生存层游泳脱困接管），
+                    // 撞墙有 stuck-rescue 挖路，80 tick 无进展自动放弃、技能看门狗兜底，
+                    // 不会无限硬走；长距离 goto 行为不变，仍只认 A*。
+                    if (horizontalDistanceTo(goal) <= 16.0D && walkStraightTo(id, goal)) {
+                        return true;
+                    }
                     lastOutcome = "goto 找不到路径 " + result.detail();
                     return false;
                 }
@@ -200,10 +216,8 @@ public final class SkillRunner {
                 LOG.info("[AIV][SKILL] " + npc.npcName() + " idle | 无动作");
                 return true;
             }
-            // 死局自救：被困在地底且没有任何工具/木料时，按玩家方式重生于出生点。
-            case "respawn" -> {
-                return runRespawn(id);
-            }
+            // 注意：不再有 "respawn" 主动重生技能（Fong 定：不许故意自杀逃回出生点）。
+            // 被困死局靠挖/垫/游脱困，挖不动就失败收场让规划层换活，绝不许拿死亡当传送用。
             default -> {
                 LOG.warning("[AIV][SKILL] " + npc.npcName() + " 不支持的技能: " + action);
                 return false;
@@ -219,23 +233,30 @@ public final class SkillRunner {
         npc.stopWalking();
     }
 
-    // ---------------------------------------------------------------- 具体技能
+    /** NPC 到目标格的水平距离（格）。 */
+    private double horizontalDistanceTo(BlockPos target) {
+        double dx = target.getX() + 0.5D - npc.getX();
+        double dz = target.getZ() + 0.5D - npc.getZ();
+        return Math.sqrt(dx * dx + dz * dz);
+    }
 
     /**
-     * 主动重生：只用于"镐子全部耗尽 + 地下没有木头"这种真正无法自救的死局。
-     *
-     * <p>为什么这么做：伪玩家没有客户端，不能自己走回地表；没有镐又挖不开石头。
-     * 原版玩家遇到这种情况会主动送死回出生点，生存层复活时会恢复背包并把 NPC 放回地表，
-     * 等于给它一次重新发育的机会，而不是永远卡在矿道里刷日志。
+     * 直线走兜底（第六轮补充3）：A* 无路但目标就在十几格内时（多半隔着浅水/沼泽），
+     * 让身体朝目标点直线走——蹚水、游泳、撞墙挖路都由身体层/生存层现有机制接管，
+     * 这里只负责下发和收尾（到达回调或技能看门狗超时）。玩家在这种地形里也是
+     * 直接走过去的，不会因为"寻路算法说无路"就站在干岛上发呆。
      */
-    private boolean runRespawn(int id) {
-        current = "respawn";
-        LOG.info("[AIV][SKILL] " + npc.npcName() + " respawn 主动重生 | " + npc.describe());
-        npc.hurtServer((net.minecraft.server.level.ServerLevel) npc.level(),
-                npc.damageSources().genericKill(), 1000.0F);
-        finish(id, "respawn", "已触发死亡，等待生存层复活");
+    private boolean walkStraightTo(int id, BlockPos goal) {
+        current = "goto";
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " goto-straight | goal=" + goal.toShortString()
+                + " dist=" + String.format(Locale.ROOT, "%.1f", horizontalDistanceTo(goal)));
+        npc.walkTo(new Vec3(goal.getX() + 0.5D, goal.getY(), goal.getZ() + 0.5D), false,
+                () -> finish(id, "goto", "直线到达 " + goal.toShortString()));
+        armWatchdog(id, "goto");
         return true;
     }
+
+    // ---------------------------------------------------------------- 具体技能
 
     /**
      * 找到最近的指定方块，走到它旁边再挖。
@@ -256,8 +277,23 @@ public final class SkillRunner {
             }
             block = CraftMagicNumbers.getBlock(material);
         }
-        int radius = Math.max(2, Math.min(8, intent.intParam("radius", 8)));
+        int radius = Math.max(2, Math.min(16, intent.intParam("radius", 8)));
+        // 是不是矿石（够矿求解只对矿石启用；砍树等其他 mine 不走求解，别把垫柱用在树上）。
+        boolean oreBlock = !anyLog && block != null
+                && BuiltInRegistries.BLOCK.getKey(block).getPath().endsWith("_ore");
         List<BlockPos> targets = findNearestBlocks(block, anyLog, radius);
+        if (oreBlock) {
+            // 矿石带深板岩变种：目标层的 16 格探测把变种也算数，这里必须同口径，
+            // 否则探测说"有矿"、技能却只找普通矿，对深板岩矿永远扑空。
+            Block twin = deepslateTwin(block);
+            if (twin != null) {
+                List<BlockPos> merged = new ArrayList<>(targets);
+                merged.addAll(findNearestBlocks(twin, false, radius));
+                BlockPos centerPos = npc.blockPosition();
+                merged.sort(Comparator.comparingDouble(centerPos::distSqr));
+                targets = new ArrayList<>(merged.subList(0, Math.min(6, merged.size())));
+            }
+        }
         if (targets.isEmpty()) {
             lastOutcome = "mine 找不到方块 block=" + blockName + " radius=" + radius;
             LOG.info("[AIV][SKILL] " + npc.npcName() + " mine 找不到方块 | block=" + blockName + " radius=" + radius);
@@ -295,10 +331,28 @@ public final class SkillRunner {
             }
         }
         if (chosen == null) {
+            // 够矿求解（Fong 02:53 规格）：矿石有裸露面、位置已知，但周边没有现成
+            // 落脚点（洞顶矿/墙后矿/低处矿）时不直接放弃——按情形选跳搭或挖通接近。
+            // 只对矿石启用，且候选必须仍是裸露的（探测口径不变，不透视）。
+            if (oreBlock) {
+                for (BlockPos candidateTarget : targets) {
+                    if (!isExposed(candidateTarget)) {
+                        continue;
+                    }
+                    String reachMode = oreReachMode(candidateTarget);
+                    if (reachMode != null) {
+                        return runOreReach(intent, id, candidateTarget, reachMode);
+                    }
+                }
+            }
             lastOutcome = "mine 没有可到达的站立点 候选=" + tried;
             LOG.info("[AIV][SKILL] " + npc.npcName() + " mine 候选全部不可达 | block=" + blockName
                     + " 候选=" + tried);
             return false;
+        }
+        if (oreBlock) {
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach | mode=direct target="
+                    + target.toShortString() + " block=" + blockName);
         }
 
         // lambda 里要用，先落成 final 局部变量。
@@ -329,8 +383,510 @@ public final class SkillRunner {
         return true;
     }
 
+    // ---------------------------------------------------------------- 够矿求解
+
+    /** 垫脚/搭桥可用的方块全集（与 pickBuildingBlock 同口径，含木板；垫柱预检时单独排除木板）。 */
+    private static final java.util.Set<String> BUILDING_BLOCK_PATHS = java.util.Set.of(
+            "cobblestone", "netherrack", "blackstone", "basalt", "cobbled_deepslate",
+            "stone", "andesite", "diorite", "granite",
+            "oak_planks", "spruce_planks", "birch_planks", "jungle_planks",
+            "acacia_planks", "dark_oak_planks", "mangrove_planks", "cherry_planks",
+            "bamboo_planks", "pale_oak_planks");
+
+    /** 矿石的深板岩互变种（普通 ↔ 深板岩）；没有对应变种返回 null。 */
+    private Block deepslateTwin(Block block) {
+        String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
+        String twinPath = path.startsWith("deepslate_")
+                ? path.substring("deepslate_".length()) : "deepslate_" + path;
+        Material material = Material.matchMaterial(twinPath);
+        return material != null && material.isBlock() ? CraftMagicNumbers.getBlock(material) : null;
+    }
+
+    /**
+     * 给一块够不着的裸露矿分类够法（Fong 02:53 规格）：
+     * 头顶 +3~+6 → 跳搭垫柱（pillar；水平再远也先由接近阶段走到柱位）；
+     * 16 格内、高差 -3~+2 → 挖通接近（dig）；同列/邻列的低处矿（高差 -6~-1）→
+     * dig 里的挖脚下逐格落（digStepDown）。都不沾边返回 null（老实放弃，
+     * 交给目标层走 descend/strip 老路）。更低的矿（< -6）不硬够：目标层会
+     * descend 到矿层再重新探到它，那时高差归零、直接挖——组合手段，不死磕。
+     * 跳搭有材料预检：石系建筑块（不含木板，护住木料经济）不够垫到高度就别起跳。
+     */
+    private String oreReachMode(BlockPos target) {
+        BlockPos feet = npc.blockPosition();
+        int dy = target.getY() - feet.getY();
+        double horiz = horizontalDistanceTo(target);
+        if (dy >= 3 && dy <= 6 && horiz <= 16.0D) {
+            return countBuildingBlocks() >= dy - 1 ? "pillar" : null;
+        }
+        if (horiz <= 16.0D && dy >= -3 && dy <= 2) {
+            return "dig";
+        }
+        if (horiz <= 1.5D && dy >= -6 && dy < 0) {
+            return "dig";
+        }
+        return null;
+    }
+
+    /** 石系建筑块总数（pickBuildingBlock 优先级表的前段，不含木板）。 */
+    private int countBuildingBlocks() {
+        int total = 0;
+        for (String candidate : List.of("cobblestone", "netherrack", "blackstone", "basalt",
+                "cobbled_deepslate", "stone", "andesite", "diorite", "granite")) {
+            total += countItem(candidate);
+        }
+        return total;
+    }
+
+    /** 眼睛到方块中心 ≤4.5 格：原版生存挖掘的够取范围，超出时 mineWithBestTool 也会失败。 */
+    private boolean withinMineReach(BlockPos target) {
+        return npc.getEyePosition().distanceToSqr(Vec3.atCenterOf(target)) <= 4.5D * 4.5D;
+    }
+
+    private boolean collisionEmpty(BlockPos pos) {
+        return npc.level().getBlockState(pos).getCollisionShape(npc.level(), pos).isEmpty();
+    }
+
+    private boolean fluidAt(BlockPos pos) {
+        return !npc.level().getBlockState(pos).getFluidState().isEmpty();
+    }
+
+    /** 目标格六邻里有岩浆：挖开它等于把岩浆放进来，惜命口径下不挖。 */
+    private boolean touchesLava(BlockPos pos) {
+        for (Direction dir : Direction.values()) {
+            if (npc.level().getBlockState(pos.relative(dir)).getFluidState().is(FluidTags.LAVA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isBuildingBlock(BlockPos pos) {
+        String path = BuiltInRegistries.BLOCK.getKey(npc.level().getBlockState(pos).getBlock()).getPath();
+        return BUILDING_BLOCK_PATHS.contains(path);
+    }
+
+    /**
+     * 挖通接近一步：朝目标方向掘进一格（挖开脚位/头位两格通道，必要时落下 ≤3 格到固体干地）。
+     * 方向只由"已探到的裸露矿"位置决定（朝着洞壁上看得见的矿挖过去是正常采矿），
+     * 不存在透视问题；中途遇流体格、岩浆邻接就换方向，绝不挖穿液体层。
+     *
+     * @return 是否产生了有效动作（挖了方块或开始移动）
+     */
+    private boolean digStepToward(BlockPos target) {
+        BlockPos feet = npc.blockPosition();
+        int dx = target.getX() - feet.getX();
+        int dz = target.getZ() - feet.getZ();
+        if (dx == 0 && dz == 0) {
+            // 同一列只处理矿在正下方（逐格挖脚下落）；正上方是跳搭的活，这里不接。
+            return target.getY() < feet.getY() && digStepDown(feet);
+        }
+        int sx = Integer.signum(dx);
+        int sz = Integer.signum(dz);
+        int[][] dirs = Math.abs(dx) >= Math.abs(dz)
+                ? new int[][]{{sx, 0}, {0, sz}} : new int[][]{{0, sz}, {sx, 0}};
+        for (int[] d : dirs) {
+            if (d[0] == 0 && d[1] == 0) {
+                continue;
+            }
+            if (tryDigStep(feet, d[0], d[1])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean tryDigStep(BlockPos feet, int sx, int sz) {
+        BlockPos front = feet.offset(sx, 0, sz);
+        if (fluidAt(front) || fluidAt(front.above())) {
+            return false;
+        }
+        // 矿道标准断面：先清出脚位与头位两格。
+        for (BlockPos cell : List.of(front, front.above())) {
+            if (!collisionEmpty(cell)) {
+                if (touchesLava(cell)) {
+                    return false;
+                }
+                if (!npc.mineWithBestTool(cell) || !collisionEmpty(cell)) {
+                    return false;
+                }
+            }
+        }
+        // 落脚点：从 front 起向下最多探 3 格，第一个有碰撞的格子顶面就是落点。
+        // 中间每一格都查流体： shaft 里有水/岩浆就不往下跳（惜命）。
+        for (int i = 0; i <= 3; i++) {
+            BlockPos floor = front.below(i);
+            if (fluidAt(floor)) {
+                return false;
+            }
+            if (!collisionEmpty(floor)) {
+                // i=0/1 是平步或落 1 格；i 越大落差越大，封顶 3 格（原版 3 格内无摔伤）。
+                npc.walkTo(new Vec3(front.getX() + 0.5D, floor.getY() + 1, front.getZ() + 0.5D),
+                        false, null);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 同列下挖一格：挖掉脚下，落到 ≤3 格内的固体干地；落点不明或有流体就不挖（惜命）。 */
+    private boolean digStepDown(BlockPos feet) {
+        BlockPos below = feet.below();
+        if (fluidAt(below) || touchesLava(below) || collisionEmpty(below)) {
+            return false;
+        }
+        boolean landingOk = false;
+        for (int i = 1; i <= 3; i++) {
+            BlockPos c = below.below(i);
+            if (fluidAt(c)) {
+                return false;
+            }
+            if (!collisionEmpty(c)) {
+                landingOk = true;
+                break;
+            }
+        }
+        if (!landingOk) {
+            return false;
+        }
+        return npc.mineWithBestTool(below);
+    }
+
+    /**
+     * 够矿求解主状态机（Fong 02:53 规格）：目标矿已探到（裸露、位置确定）但没有
+     * 现成落脚点。pillar = 跳搭垫柱够洞顶矿，挖完逐块拆柱安全下来；
+     * dig = 挖通接近（隔墙掘进/台阶向下）。全程走身体层原版物理：跳、走、挖、放块，
+     * 零传送；总轮数与单步等待都有死线，卡住放弃回报目标层（goal-timeout 再兜底）。
+     */
+    private boolean runOreReach(Intent intent, int id, BlockPos targetPos, String mode) {
+        final BlockPos target = targetPos.immutable();
+        final String orePath = BuiltInRegistries.BLOCK.getKey(
+                npc.level().getBlockState(target).getBlock()).getPath();
+        current = "mine";
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach 开始 | mode=" + mode
+                + " target=" + target.toShortString() + " block=" + orePath
+                + " pos=" + npc.blockPosition().toShortString());
+        final int maxRounds = "pillar".equals(mode) ? 900 : 1500;
+        tasks.add(Bukkit.getScheduler().runTaskTimer(plugin, new Runnable() {
+            private int rounds;
+            private int waitRounds;
+            private int stepFails;
+            private int minedCount;
+            private List<BlockPos> bonus = List.of();
+            private int bonusIndex;
+            /** 阶段：0=接近（dig 全程在此；pillar 先接近柱位） 1=垫柱上升 2=挖主矿/顺手矿 3=拆柱下降。 */
+            private int phase;
+            /** pillar 出发点（拆柱下降的目标高度与位置）。 */
+            private BlockPos startPos;
+            private int startFeetY = Integer.MIN_VALUE;
+            private final List<BlockPos> placed = new ArrayList<>();
+            /** 上升子状态：0=起跳 1=等腾空放块 2=等落地。 */
+            private int sub;
+            private BlockPos levelCell;
+            private double jumpBaseY;
+            private int subWait;
+
+            @Override
+            public void run() {
+                if (runId != id) {
+                    return;
+                }
+                if (++rounds > maxRounds) {
+                    failReach("总轮数超限");
+                    return;
+                }
+                String nowPath = BuiltInRegistries.BLOCK.getKey(
+                        npc.level().getBlockState(target).getBlock()).getPath();
+                if (!nowPath.equals(orePath) && minedCount == 0 && phase < 2) {
+                    failReach("目标已消失（被顺手挖掉或方块变化）");
+                    return;
+                }
+                // 惜命：够矿途中落水/落岩浆立刻停手，生存层会先带它脱困，不为一块矿冒险。
+                if (npc.isInWater() || npc.isInLava()) {
+                    failReach("落入流体，中断够矿");
+                    return;
+                }
+                try {
+                    switch (phase) {
+                        case 0 -> phaseApproach();
+                        case 1 -> phasePillarUp();
+                        case 2 -> phaseMineBonus();
+                        case 3 -> phasePillarDown();
+                        default -> failReach("未知阶段 " + phase);
+                    }
+                } catch (Throwable throwable) {
+                    // 兜底（fix15 场景实测教训）：状态机里一个未预料的空指针会让
+                    // Bukkit 任务每轮抛异常空转、把技能拖到总轮数上限才收场，
+                    // 中间 90 秒全是异常刷屏。抓到就立刻按失败收尾并留痕。
+                    LOG.log(java.util.logging.Level.WARNING,
+                            "[AIV][SKILL] " + npc.npcName() + " ore-reach 内部异常", throwable);
+                    failReach("内部异常 " + throwable.getClass().getSimpleName());
+                }
+            }
+
+            /** 等身体落定（在走或在空中）。等待超 120 轮（约 12 秒）按一步失败处理，不干等。 */
+            private boolean waitingBody() {
+                if (!npc.isWalking() && npc.onGround) {
+                    waitRounds = 0;
+                    return false;
+                }
+                if (++waitRounds > 120) {
+                    waitRounds = 0;
+                    npc.stopWalking();
+                    stepFails++;
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach 等待落定超时 | mode=" + mode
+                            + " 连续失败=" + stepFails);
+                    if (stepFails >= 6) {
+                        failReach("多次等待落定超时");
+                    }
+                }
+                return true;
+            }
+
+            private void phaseApproach() {
+                if (waitingBody()) {
+                    return;
+                }
+                if (withinMineReach(target) && mineTargetNow()) {
+                    phase = 2;
+                    return;
+                }
+                if ("pillar".equals(mode) && horizontalDistanceTo(target) <= 2.2D) {
+                    startPos = npc.blockPosition();
+                    startFeetY = startPos.getY();
+                    phase = 1;
+                    sub = 0;
+                    subWait = 0;
+                    return;
+                }
+                if (!digStepToward(target)) {
+                    stepFails++;
+                    if (stepFails >= 6) {
+                        failReach("挖通接近连续无路");
+                    }
+                } else {
+                    stepFails = 0;
+                }
+            }
+
+            private void phasePillarUp() {
+                BlockPos feet = npc.blockPosition();
+                if (sub == 0) {
+                    if (withinMineReach(target)) {
+                        // 已经够高了（矿比预估低，或垫一两块就够）：直接挖，转入挖矿阶段；
+                        // 够得着却挖不动（工具问题）也别再垫了，下柱收尾。
+                        phase = mineTargetNow() ? 2 : 3;
+                        if (phase == 3 && minedCount == 0) {
+                            startPos = startPos == null ? feet : startPos;
+                            startFeetY = startFeetY == Integer.MIN_VALUE ? feet.getY() : startFeetY;
+                        }
+                        return;
+                    }
+                    if (feet.getY() >= target.getY()) {
+                        failReach("垫柱高度异常（已高于矿）");
+                        return;
+                    }
+                    if (!npc.onGround) {
+                        if (++subWait > 40) {
+                            failReach("上升中长时间未落地");
+                        }
+                        return;
+                    }
+                    subWait = 0;
+                    levelCell = feet;
+                    jumpBaseY = npc.getY();
+                    npc.jumpNow();
+                    sub = 1;
+                    return;
+                }
+                if (sub == 1) {
+                    // 腾空到 0.55 格以上就往脚下放块：放早了会和身体碰撞箱重叠失败，
+                    // 放晚了身体已经开始下落、块会垫不到正下方。
+                    if (npc.getY() - jumpBaseY >= 0.55D) {
+                        if (!placeBuildingBlockAt(levelCell)) {
+                            failReach("垫脚方块不足");
+                            return;
+                        }
+                        placed.add(levelCell);
+                        sub = 2;
+                        subWait = 0;
+                        return;
+                    }
+                    if (++subWait > 20) {
+                        sub = 0;
+                        stepFails++;
+                        if (stepFails >= 4) {
+                            failReach("起跳失败多次（头顶遮挡？）");
+                        }
+                    }
+                    return;
+                }
+                // sub == 2：等落到刚垫的块上。
+                if (npc.onGround) {
+                    sub = 0;
+                    subWait = 0;
+                    return;
+                }
+                if (++subWait > 40) {
+                    failReach("垫柱后未落地");
+                }
+            }
+
+            private void phaseMineBonus() {
+                if (waitingBody()) {
+                    return;
+                }
+                if (mineBonusNow()) {
+                    return;
+                }
+                // 只有真的垫过柱（startPos 已记、且人还在柱顶上方）才需要拆柱下降；
+                // 接近阶段顺手就挖到的（没垫柱）直接收尾——fix15 实测：startPos 为 null
+                // 时进下柱阶段会对 null 调 digStepToward，每轮 NPE 空转到总轮数超限。
+                if ("pillar".equals(mode) && startPos != null
+                        && npc.blockPosition().getY() > startFeetY) {
+                    phase = 3;
+                } else {
+                    finishReach("已挖 " + minedCount + " 块");
+                }
+            }
+
+            private void phasePillarDown() {
+                if (waitingBody()) {
+                    return;
+                }
+                if (startPos == null) {
+                    // 没垫过柱就进了下柱阶段（状态异常）：按已挖数量收尾，别对 null 寻路。
+                    if (minedCount > 0) {
+                        finishReach("已挖 " + minedCount + " 块");
+                    } else {
+                        failReach("下柱阶段缺少出发点记录");
+                    }
+                    return;
+                }
+                BlockPos feet = npc.blockPosition();
+                if (feet.getY() <= startFeetY) {
+                    if (minedCount > 0) {
+                        finishReach("已挖 " + minedCount + " 块并安全下柱");
+                    } else {
+                        failReach("回到地面但一块矿都没挖到");
+                    }
+                    return;
+                }
+                BlockPos below = feet.below();
+                if (placed.contains(below) || isBuildingBlock(below)) {
+                    // 逐块拆脚下垫柱：每拆一块只落 1 格，全程无摔伤（惜命口径）。
+                    if (npc.mineWithBestTool(below)) {
+                        return;
+                    }
+                    failReach("下柱时垫块挖不动");
+                    return;
+                }
+                // 站位漂移（被怪推开/滑落）：朝出发点横向挪回去再继续拆。
+                if (!digStepToward(startPos)) {
+                    stepFails++;
+                    if (stepFails >= 4) {
+                        if (minedCount > 0) {
+                            finishReach("已挖 " + minedCount + " 块（柱未完全回收，先离柱）");
+                        } else {
+                            failReach("下柱受阻且未挖到矿");
+                        }
+                    }
+                }
+            }
+
+            /** 挖主矿；成功后把相邻的同种裸露矿列入顺手清单（一窝矿别只挖一块）。 */
+            private boolean mineTargetNow() {
+                if (!withinMineReach(target)) {
+                    return false;
+                }
+                if (!npc.mineWithBestTool(target)) {
+                    return false;
+                }
+                minedCount++;
+                List<BlockPos> extra = new ArrayList<>();
+                for (Direction dir : Direction.values()) {
+                    BlockPos p = target.relative(dir);
+                    String pp = BuiltInRegistries.BLOCK.getKey(
+                            npc.level().getBlockState(p).getBlock()).getPath();
+                    if (pp.equals(orePath) && isExposed(p)) {
+                        extra.add(p.immutable());
+                    }
+                }
+                bonus = extra;
+                bonusIndex = 0;
+                return true;
+            }
+
+            /** 顺手清单里挖一块（够不着/已消失的逐个跳过）；挖到返回 true，清单耗尽返回 false。 */
+            private boolean mineBonusNow() {
+                while (bonusIndex < bonus.size()) {
+                    BlockPos p = bonus.get(bonusIndex++);
+                    String pp = BuiltInRegistries.BLOCK.getKey(
+                            npc.level().getBlockState(p).getBlock()).getPath();
+                    if (!pp.equals(orePath)) {
+                        continue;
+                    }
+                    if (withinMineReach(p) && npc.mineWithBestTool(p)) {
+                        minedCount++;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            private void failReach(String why) {
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach | mode=" + mode
+                        + " success=false target=" + target.toShortString() + " " + why);
+                finish(id, "mine", "ore-reach 放弃 mode=" + mode + " success=false " + why
+                        + " target=" + target.toShortString());
+            }
+
+            private void finishReach(String note) {
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach | mode=" + mode
+                        + " success=true target=" + target.toShortString() + " " + note);
+                finish(id, "mine", "ore-reach mode=" + mode + " success=true " + note);
+            }
+        }, 1L, 2L));
+        armWatchdog(id, "mine", 3600);
+        return true;
+    }
+
+    /**
+     * 惜命接战把关（Fong 定：生命第一）：主动打敌对生物的技能入口先过
+     * {@link SurvivalController#canEngage} 同一口径——低血不打、有武器/装备可打、
+     * 空手无装备只有血量健康才打。不满足就拒绝并写明原因，让规划层改派别的活；
+     * 战斗中血掉下去则由生存层 defend() 中断技能带它逃跑，两道闸口径一致。
+     *
+     * @return 拒绝原因；允许接战返回 null
+     */
+    private String combatRefusal(String action) {
+        float health = npc.getHealth();
+        boolean equipped = npc.getArmorValue() > 0 || isWeaponItem(npc.getMainHandItem());
+        if (SurvivalController.canEngage(health, equipped)) {
+            return null;
+        }
+        return action + " 惜命拒绝：hp=" + String.format(Locale.ROOT, "%.1f", health)
+                + " 有武器/装备=" + equipped + "（低血或空手无装备且不够健康，先保命不接战）";
+    }
+
+    /** 主手是不是武器类物品（剑/斧/弓弩/三叉戟/重锤）；生存层平时会把最好的武器换到主手。 */
+    private boolean isWeaponItem(ItemStack stack) {
+        if (stack.isEmpty()) {
+            return false;
+        }
+        String path = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+        return path.endsWith("_sword") || path.endsWith("_axe")
+                || path.equals("bow") || path.equals("crossbow")
+                || path.equals("trident") || path.equals("mace");
+    }
+
     /** 最近的敌对生物（排除玩家和 NPC 自己），走到 2 格内后按 1 秒一下连续攻击。 */
     private boolean runAttack(Intent intent, int id) {
+        String refusal = combatRefusal("attack");
+        if (refusal != null) {
+            lastOutcome = refusal;
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " " + refusal);
+            return false;
+        }
         double radius = Math.max(2.0D, Math.min(MAX_SEARCH_RADIUS, intent.doubleParam("radius", 10.0D)));
         int maxHits = Math.max(1, Math.min(5, intent.intParam("hits", 3)));
 
@@ -437,6 +993,14 @@ public final class SkillRunner {
         if (wanted.isEmpty()) {
             lastOutcome = "slay 缺少 entity 参数";
             LOG.info("[AIV][SKILL] " + npc.npcName() + " slay 缺少 entity 参数");
+            return false;
+        }
+        // 定点猎杀也是主动接战敌对生物（烈焰人/末影人等），同样过惜命把关：
+        // 低血时不许为了掉落去送死，先回血再来。
+        String refusal = combatRefusal("slay");
+        if (refusal != null) {
+            lastOutcome = refusal;
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " " + refusal);
             return false;
         }
         double radius = Math.max(6.0D, Math.min(MAX_SEARCH_RADIUS, intent.doubleParam("radius", 12.0D)));
@@ -812,27 +1376,91 @@ public final class SkillRunner {
              * 每转一次刷一条日志，NPC 却永远不落地。这里累计到整圈（4 次）后改成垂直下挖。
              */
             private int unsafeTurns;
+            /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
+            private int lastStepsSeen;
+            private int roundsWithoutProgress;
+            /** 诊断心跳轮数：每 200 轮（约 30 秒）打一行完整状态，定位静默卡死卡在哪条分支。 */
+            private int diagRounds;
+            /**
+             * 单级等待轮数：等身体降到上一级目标的轮数（每轮 3 tick）。
+             * 长跑实测：身体贴着坑壁磨蹭时 walkTo 的卡住判定被微小位移反复重置，
+             * isWalking 永远为真，descend 就在这一级干等满 3 分钟总看门狗——
+             * 一格死等 30 秒已经绰绰有余，到点按"走位中断"处理（转向重挖）。
+             */
+            private int stepWaitRounds;
+            /**
+             * 落地等待轮数：!onGround 且不在走时的连续轮数。
+             * fix13 心跳实测抓到的第三种卡法：身体卡在台阶边缘的小数高度
+             * （y=28.77），不走、不落地、lastTarget 就是自己脚下——在走死线和
+             * 挖不动计数都管不到，只有 3 分钟步数看门狗能收尾。同样给 30 秒死线。
+             */
+            private int landWaitRounds;
 
             @Override
             public void run() {
                 if (runId != id) {
                     return;
                 }
-                // 下落/走位过程中不重复挖：等身体真正站到上一格目标再挖下一级。
-                if (!npc.onGround) {
+                // 总进度看门狗：failedSteps 只在少数分支累加，四方向轮换/垂直下挖之间
+                // 存在步数永远不变、失败计数也永远不涨的空转组合（只能等 10 分钟技能看门狗）。
+                // 这里按"步数多久没变"一刀切：约 3 分钟（1200 轮×3 tick）无一步进展就收手，
+                // 让目标层的无进展处理接管。正常下挖每级约 2 秒，3 分钟足够宽容。
+                if (steps != lastStepsSeen) {
+                    lastStepsSeen = steps;
+                    roundsWithoutProgress = 0;
+                } else if (++roundsWithoutProgress > 1200) {
+                    finish(id, "descend", "长时间无进展（步数约3分钟未变） Y="
+                            + Math.round(npc.getY()) + " 步数=" + steps);
                     return;
                 }
+                // 诊断心跳（第八轮补充）：descend 曾出现"步数看门狗按时收手、但中间
+                // 3 分钟零日志零挖掘"的静默卡死，所有动作分支都会打日志，唯独等待类
+                // 分支全静默。这里每约 30 秒把完整状态打出来，卡在哪条分支一眼可见。
+                if (++diagRounds >= 200) {
+                    diagRounds = 0;
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " descend-diag | steps=" + steps
+                            + " y=" + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
+                            + " blockPos=" + npc.blockPosition().toShortString()
+                            + " onGround=" + npc.onGround
+                            + " walking=" + npc.isWalking()
+                            + " lastTarget=" + (lastTarget == null ? "null" : lastTarget.toShortString())
+                            + " stepStartY=" + stepStartY
+                            + " dir=" + dirIndex + " failed=" + failedSteps
+                            + " inWater=" + npc.isInWater() + " inLava=" + npc.isInLava());
+                }
+                // 下落/走位过程中不重复挖：等身体真正站到上一格目标再挖下一级。
+                if (!npc.onGround) {
+                    // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
+                    // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
+                    // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
+                    if (lastTarget != null && !npc.isWalking() && ++landWaitRounds > 200) {
+                        landWaitRounds = 0;
+                        lastTarget = null;
+                        dirIndex++;
+                        failedSteps++;
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 落地等待超时，转向"
+                                + " 连续失败=" + failedSteps + " Y=" + Math.round(npc.getY()));
+                        if (failedSteps >= 6) {
+                            finish(id, "descend", "连续 " + failedSteps + " 级落地等待超时 Y="
+                                    + Math.round(npc.getY()));
+                        }
+                    }
+                    return;
+                }
+                landWaitRounds = 0;
                 if (lastTarget != null) {
                     // 不能用 blockPosition().equals(lastTarget)：walkTo 允许在 0.6 格内停下，
                     // 常常停在原列而不是目标列的格心上，导致永远判不"到达"，每级都要等卡住超时。
                     if (npc.blockPosition().getY() < stepStartY) {
                         lastTarget = null;
+                        stepWaitRounds = 0;
                         steps++;
                         failedSteps = 0;
                     } else if (!npc.isWalking()) {
                         // 走位被身体层判超时放弃（掉坑、被方块卡住）：换方向重挖，
                         // 否则这里会一直等一个永远到不了的目标。
                         lastTarget = null;
+                        stepWaitRounds = 0;
                         dirIndex++;
                         failedSteps++;
                         LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 走位中断，转向"
@@ -845,6 +1473,22 @@ public final class SkillRunner {
                         }
                         return;
                     } else {
+                        // 身体还自称在走：给单级等待设死线（200 轮×3 tick ≈ 30 秒）。
+                        // 贴墙磨蹭的微小位移会反复重置 walkTo 自己的卡住计时，
+                        // 不设死线这一级能干等满 3 分钟总看门狗（fix10 长跑实测两连 stall）。
+                        if (++stepWaitRounds > 200) {
+                            stepWaitRounds = 0;
+                            lastTarget = null;
+                            npc.stopWalking();
+                            dirIndex++;
+                            failedSteps++;
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 单级等待超时，强制转向"
+                                    + " 连续失败=" + failedSteps + " Y=" + Math.round(npc.getY()));
+                            if (failedSteps >= 6) {
+                                finish(id, "descend", "连续 " + failedSteps + " 级等待超时 Y="
+                                        + Math.round(npc.getY()));
+                            }
+                        }
                         return;
                     }
                 }
@@ -965,7 +1609,8 @@ public final class SkillRunner {
      *
      * <p>每步挖三格：目标站位脚/头、以及当前头顶上方一格（起身时要过脑袋）。
      * 目标格下方必须是实心（作为台阶），遇到流体/基岩/悬空就转向。
-     * 连续 6 次挖不动（比如被基岩层封死）才传送到最近的地表，作为最后的自救手段。
+     * 没有工具时素手挖（无掉落，只为脱困）；连续 6 次挖不动（比如被基岩层封死）
+     * 就失败收场让规划层换方向——不许传送回地表（Fong 定）。
      */
     private boolean runAscend(Intent intent, int id) {
         current = "ascend";
@@ -992,10 +1637,24 @@ public final class SkillRunner {
              * 永远不累计失败，只能等 120 秒 watchdog。转满一圈记一次，两圈就收手。
              */
             private int unsafeTurns;
+            /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
+            private int lastStepsSeen;
+            private int roundsWithoutProgress;
 
             @Override
             public void run() {
                 if (runId != id) {
+                    return;
+                }
+                // 总进度看门狗（与 descend 同理）：ascend 的失败收场只挂在"挖不动"一条
+                // 分支后面，其余空转组合（转向/等走位/垫脚失败交替）永远走不到那里，
+                // 步数不变约 3 分钟（1200 轮×3 tick）就直接收手，交给目标层处理。
+                if (steps != lastStepsSeen) {
+                    lastStepsSeen = steps;
+                    roundsWithoutProgress = 0;
+                } else if (++roundsWithoutProgress > 1200) {
+                    finish(id, "ascend", "长时间无进展（步数约3分钟未变） Y="
+                            + Math.round(npc.getY()) + " 步数=" + steps);
                     return;
                 }
                 // 空中（起跳/下落）时不挖下一格，等站稳再说。
@@ -1103,6 +1762,18 @@ public final class SkillRunner {
                 npc.mineWithBestTool(currentCeiling);
                 npc.mineWithBestTool(targetFeet);
                 npc.mineWithBestTool(targetHead);
+                // 没有合适工具时素手挖：石头/泥土用手也能挖开（只是没有掉落），
+                // 这是"工具耗尽被困地下"时唯一的合法脱困办法（Fong 定：不许重生/传送逃逸）。
+                // 基岩这类素手也挖不动的，下面的碰撞验证会照常判失败，不会假成功。
+                if (!npc.level().getBlockState(targetFeet).getCollisionShape(npc.level(), targetFeet).isEmpty()) {
+                    npc.mine(targetFeet);
+                }
+                if (!npc.level().getBlockState(targetHead).getCollisionShape(npc.level(), targetHead).isEmpty()) {
+                    npc.mine(targetHead);
+                }
+                if (!npc.level().getBlockState(currentCeiling).getCollisionShape(npc.level(), currentCeiling).isEmpty()) {
+                    npc.mine(currentCeiling);
+                }
                 // 挖完立刻验证：目标脚部还有碰撞说明挖不动（基岩/保护区域），换方向。
                 if (!npc.level().getBlockState(targetFeet).getCollisionShape(npc.level(), targetFeet).isEmpty()) {
                     dirIndex++;
@@ -1110,16 +1781,10 @@ public final class SkillRunner {
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " ascend 挖不动 | 目标="
                             + npc.level().getBlockState(targetFeet).getBlock() + " 连续失败=" + failedSteps);
                     if (failedSteps >= 6) {
-                        // 被基岩/保护区域彻底封死：像卡住自救一样对齐到最近的地表，
-                        // 否则整条科技树会被困死在矿道里永远无法推进。
-                        BlockPos safe = surfaceStandNear(feet);
-                        if (safe != null) {
-                            npc.teleportTo(npc.level(), safe.getX() + 0.5D, safe.getY() + 0.001D,
-                                    safe.getZ() + 0.5D, Set.of(), npc.getYRot(), npc.getXRot(), true);
-                            finish(id, "ascend", "挖不动，传送到地表自救 " + safe.toShortString());
-                        } else {
-                            finish(id, "ascend", "挖不动且找不到地表落脚点 Y=" + feet.getY());
-                        }
+                        // 被基岩/保护区域彻底封死：老实失败收场，交给规划层换方向/换目标。
+                        // 旧做法是传送到最近的地表自救——已按 Fong 的决定拆除：
+                        // 假人只能靠自己，挖不动就是挖不动，宁可待命打日志也不许瞬移回地表。
+                        finish(id, "ascend", "挖不动（基岩/保护区封死），失败收场 Y=" + feet.getY());
                     }
                     return;
                 }
@@ -1148,15 +1813,22 @@ public final class SkillRunner {
         final int radius = Math.max(4, Math.min(24, intent.intParam("radius", 16)));
         current = "dryland";
         BlockPos from = npc.blockPosition();
+        // 人在水里时，落脚点还必须"能从水面爬上去"（第四轮修复 B）：只判 isStandable
+        // 会把崖顶格选成目标，NPC 贴着崖壁走/游都到不了，白白耗到超时
+        // （第三轮长跑实测）。判据与生存层找岸共用 PathFinder.isShoreCell。
+        boolean inFluidNow = isFluid(npc.level().getBlockState(from))
+                || isFluid(npc.level().getBlockState(from.above()));
         BlockPos best = null;
         double bestSq = Double.MAX_VALUE;
         // 先看上层再看下层：从水里出来一般要往上走，落在岸边而不是水底。
-        // 只接受 isStandable（脚下实心、脚/头可通过且非流体）的格子。
-        for (int dy = 2; dy >= -3; dy--) {
+        // 只接受 isStandable（脚下实心、脚/头可通过且非流体）的格子；
+        // 在水里时再叠一层 isShoreCell（贴水面、最多高 1 格）。
+        for (int dy = 3; dy >= -3; dy--) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos pos = from.offset(dx, dy, dz);
-                    if (!PathFinder.isStandable(npc.level(), pos)) {
+                    if (inFluidNow ? !PathFinder.isShoreCell(npc.level(), pos)
+                            : !PathFinder.isStandable(npc.level(), pos)) {
                         continue;
                     }
                     double distanceSq = from.distSqr(pos);
@@ -1244,26 +1916,6 @@ public final class SkillRunner {
             }
         }
         return false;
-    }
-
-    /** 在当前位置附近找一个地表可站立格，供彻底挖不动时自救。 */
-    private BlockPos surfaceStandNear(BlockPos around) {
-        for (int radius = 0; radius <= 4; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
-                        continue;
-                    }
-                    BlockPos candidate = new BlockPos(around.getX() + dx,
-                            surfaceHeightAt(around.getX() + dx, around.getZ() + dz),
-                            around.getZ() + dz);
-                    if (PathFinder.isStandable(npc.level(), candidate)) {
-                        return candidate;
-                    }
-                }
-            }
-        }
-        return null;
     }
 
     /**

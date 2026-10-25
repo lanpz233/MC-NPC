@@ -1,6 +1,5 @@
 package com.example.aivillager.npc;
 
-import com.example.aivillager.pathfinding.PathFinder;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
@@ -66,6 +65,15 @@ public final class FakePlayerBody extends ServerPlayer {
     private boolean walkSprint;
     private Runnable walkCallback;
 
+    /**
+     * 游泳目标（岸边格子）；非 null 时身体处于"游泳脱困"模式，优先于路径/直线行走。
+     * 真玩家掉水里靠游泳上岸，伪玩家不许传送脱身（Fong 定：不许任何不属于玩家的手段），
+     * 所以流体脱困只能走原版物理：朝岸边给前进输入 + 浮力上浮 + 到岸边跳上岸。
+     */
+    private BlockPos swimGoal;
+    /** 游泳模式剩余 tick（约 10 秒）；超时放弃，交给技能/规划层重新处理，不无限泡着。 */
+    private int swimTicksLeft;
+
     /** A* 路径；非 null 时优先级高于 walkTarget。 */
     private List<BlockPos> path;
     private int pathIndex;
@@ -79,8 +87,19 @@ public final class FakePlayerBody extends ServerPlayer {
     private int jumpCooldown;
     private double lastDistanceSq = Double.MAX_VALUE;
     private int noProgressTicks;
-    /** 连续卡住自救次数：真正朝目标移动一次才清零。 */
+    /** 连续卡住自救次数：只有路径真正走完、或离开上次卡住的区域，才清零。 */
     private int stuckRescues;
+    /**
+     * 上次自救时所在的格子（自救计数不清零的依据）。
+     * 两版旧逻辑都栽在"用距离变近判断有进展"上：先是自救后把基准重置成最大值、
+     * 下一 tick 任何距离都算进展；改成"近 0.5 格才算"后，身体在墙角/树冠边的
+     * 弹跳滑动仍会让距离信号反复抖过阈值。两次实测都是同一路径内自救 5~14 次、
+     * 次数恒为 1，兜底永远攒不满。改为按区域判断：人还卡在老地方，
+     * 计数就累加；真走完这条路、或挪到 4 格以外的新区域，才重新计数。
+     * 计数攒满后的兜底动作（2026-10-25 Fong 拍板后）：放弃当前路径让技能失败收场、
+     * 由规划层换路线换目标——不再有任何传送式脱困。
+     */
+    private BlockPos lastRescueCell;
 
     private FakePlayerBody(MinecraftServer server, ServerLevel level, GameProfile profile, ClientInformation information) {
         super(server, level, profile, information);
@@ -154,6 +173,13 @@ public final class FakePlayerBody extends ServerPlayer {
         this.xxa = 0.0F;
         this.zza = 0.0F;
 
+        // 游泳脱困优先于一切行走：泡在水/岩浆里时路径和直线走都只会贴着底沉，
+        // 必须先游到岸边上岸，技能层会在上岸后按新位置重新规划。
+        if (this.swimGoal != null) {
+            applySwimInput();
+            return;
+        }
+
         // A* 路径优先：技能层设置路径后，哪怕之前的 walkTo 还没结束也按路径走。
         if (this.path != null) {
             applyPathInput();
@@ -174,6 +200,8 @@ public final class FakePlayerBody extends ServerPlayer {
             Runnable callback = this.walkCallback;
             this.walkTarget = null;
             this.walkCallback = null;
+            this.stuckRescues = 0;
+            this.lastRescueCell = null;
             this.setSprinting(false);
             log(npcName, "walk-arrive", String.format(Locale.ROOT, "到达 (%.2f, %.2f, %.2f)", arrived.x, arrived.y, arrived.z));
             if (callback != null) {
@@ -198,10 +226,13 @@ public final class FakePlayerBody extends ServerPlayer {
         }
 
         // 卡住检测：持续没有靠近目标就放弃，避免 spike 无限等待。
-        if (distanceSq < this.lastDistanceSq - 1.0E-4D) {
+        // 进展门槛不能太小：贴墙磨蹭/碰撞挤压每 tick 都能蹭出 1e-4 级的距离变化，
+        // 旧门槛被这种假进展反复重置，身体对着墙"走"上几分钟也不判卡住
+        // （fix10 长跑 descend 单级干等 3 分钟的根源之一）。要求一次实打实的
+        // 接近（平方距离至少减小 0.02，约合贴近 0.01~0.07 格）才算进展。
+        if (distanceSq < this.lastDistanceSq - 0.02D) {
             this.lastDistanceSq = distanceSq;
             this.noProgressTicks = 0;
-            this.stuckRescues = 0;
         } else if (++this.noProgressTicks > STUCK_TICKS) {
             Vec3 goal = this.walkTarget;
             this.walkTarget = null;
@@ -209,11 +240,107 @@ public final class FakePlayerBody extends ServerPlayer {
             this.setSprinting(false);
             log(npcName, "walk-stuck", "80 tick 内没有靠近目标，放弃行走 " + this.describe());
             if (goal != null) {
-                // 直线行走没有路径可以绕，卡住时先做一次自救：挖开挡路的方块，
-                // 连续挖不开就把身体对齐到最近的可站立格，避免一直顶墙。
+                // 直线行走没有路径可以绕，卡住时先做一次自救：挖开挡路的方块脱困；
+                // 连续挖不开就放弃本次行走（上面已经清掉目标），由上层换路线。
                 rescueFromStuck("walk", goal.x, goal.z);
             }
         }
+    }
+
+    /**
+     * 游泳脱困：朝岸边格子游过去。只用真玩家在水里能做的事——
+     * 朝向目标前进、持续上浮（原版按住跳跃的上浮效果，与 dryland 技能给向上速度同一做法）、
+     * 贴到岸边且脚下有地时起跳上岸。全程走原版流体物理，碰撞照常生效，没有任何位置瞬移。
+     *
+     * <p>结束条件：离开流体并落地（上岸成功）、或约 10 秒超时（放弃，日志留痕，
+     * 由生存层/技能层按现状重新决策；岩浆里游不出去就可能烧死，按正常死亡处理）。
+     */
+    private void applySwimInput() {
+        double tx = this.swimGoal.getX() + 0.5D;
+        double tz = this.swimGoal.getZ() + 0.5D;
+        double dx = tx - this.getX();
+        double dz = tz - this.getZ();
+        double distanceSq = dx * dx + dz * dz;
+        boolean inFluid = this.isInWater() || this.isInLava();
+
+        if (!inFluid && (this.onGround() || distanceSq <= 0.25D)) {
+            log(npcName, "swim-arrive", "已上岸 " + this.describe());
+            this.swimGoal = null;
+            this.setSprinting(false);
+            return;
+        }
+        if (--this.swimTicksLeft <= 0) {
+            log(npcName, "swim-timeout", "游泳约 10 秒仍未上岸，放弃本次脱困 " + this.describe());
+            this.swimGoal = null;
+            this.setSprinting(false);
+            return;
+        }
+
+        if (distanceSq > 0.04D) {
+            float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
+            this.setYRot(yaw);
+            this.setYHeadRot(yaw);
+        }
+        // 已经浮到目标正上方/正下方时不用再往前蹭，只上浮。
+        this.zza = distanceSq > 0.09D ? 1.0F : 0.0F;
+        this.setSprinting(false);
+
+        if (inFluid) {
+            // 上浮：和原版玩家在水里按住跳跃键等价的持续向上速度；
+            // 与 SkillRunner.dryland 的上浮处理是同一个做法（给速度，不动位置）。
+            this.jumping = true;
+            Vec3 movement = this.getDeltaMovement();
+            this.setDeltaMovement(movement.x, Math.max(movement.y, 0.07D), movement.z);
+        }
+        // 贴着岸边且脚下踩到水底/浅滩时起跳，像玩家扒着岸沿爬上去。
+        if (this.jumpCooldown > 0) {
+            this.jumpCooldown--;
+        } else if (this.onGround() && this.horizontalCollision) {
+            this.jumpFromGround();
+            this.jumpCooldown = 5;
+        }
+    }
+
+    /**
+     * 进入游泳脱困模式，游向岸边格子（该格必须可站立且不在流体里，由调用方挑选）。
+     * 会清掉当前路径/直线行走：水里继续按原路径走只会沉底，上岸后技能层会重新规划。
+     */
+    public void swimTo(BlockPos shore) {
+        this.path = null;
+        this.pathIndex = 0;
+        this.pathArrive = null;
+        this.pathAbandon = null;
+        this.walkTarget = null;
+        this.walkCallback = null;
+        this.swimGoal = shore;
+        // 超时按距离放宽（第四轮修复 B）：沿岸找缓坡时岸可能在十几格外，
+        // 固定约 10 秒游不到就放弃、反复重发只会原地打转。上限 600 tick（约 30 秒），
+        // 再久就该由生存层的挖岸脱困接管，而不是继续干游。
+        double swimDist = Math.sqrt(this.blockPosition().distSqr(shore));
+        this.swimTicksLeft = (int) Math.min(600, 200 + 20 * Math.ceil(swimDist));
+        log(npcName, "swim-start", "游泳脱困 → 岸边 " + shore.toShortString() + " " + this.describe());
+    }
+
+    /** 附近没有岸边时原地上浮：先浮到水面，别沉在底下，之后再由技能层想办法靠岸。 */
+    public void swimUp() {
+        swimTo(this.blockPosition());
+    }
+
+    /**
+     * 挖开自己头顶的方块（头格与头上一格）：淹水洞穴/被盖住的小坑里浮不出去时，
+     * 玩家会凿开头顶继续往上游/爬。只挖硬度可挖的普通方块（基岩等挖不动的返回 false）。
+     *
+     * @return 是否挖开了至少一块
+     */
+    public boolean digOutAbove() {
+        BlockPos feet = this.blockPosition();
+        boolean dug = tryDigBlocking(feet.above(2));
+        dug |= tryDigBlocking(feet.above());
+        return dug;
+    }
+
+    public boolean isSwimmingEscape() {
+        return this.swimGoal != null;
     }
 
     /**
@@ -304,7 +431,6 @@ public final class FakePlayerBody extends ServerPlayer {
         if (distanceSq < this.lastDistanceSq - 1.0E-4D) {
             this.lastDistanceSq = distanceSq;
             this.noProgressTicks = 0;
-            this.stuckRescues = 0;
         } else if (++this.noProgressTicks > PATH_STUCK_TICKS) {
             BlockPos wp = this.path.get(this.pathIndex);
             // 带上 waypoint 和脚/头所在的方块：下次再卡住能直接看出是"跳不上去"还是"被方块挡住"。
@@ -317,16 +443,18 @@ public final class FakePlayerBody extends ServerPlayer {
                     + " wp头=" + this.level().getBlockState(wp.above()).getBlock());
             // 先自救再决定是否放弃：玩家撞上两格高的墙会直接把墙挖开，
             // 伪玩家如果只会每 2 秒报一次"无法到达"，就会在同一个坑里无限重试。
-            rescueFromStuck("path", wp.getX() + 0.5D, wp.getZ() + 0.5D);
-            if (this.stuckRescues == 0) {
-                // 自救过程中发生了传送：旧路径已经不可信，交给技能层按新位置重新规划。
+            boolean gaveUp = rescueFromStuck("path", wp.getX() + 0.5D, wp.getZ() + 0.5D);
+            if (gaveUp) {
+                // 挖也挖不开：放弃这条路径，交给技能层按当前位置重新规划/换目标，
+                // 不再有"传送到附近可站格"这种玩家做不到的脱困（Fong 定）。
                 finishPath(false);
             }
         }
     }
 
     /**
-     * 卡住自救：像玩家一样挖开挡路的方块，连续挖不开就把身体对齐到最近的可站立格。
+     * 卡住自救：像玩家一样挖开挡路的方块脱困；连续挖不开就放弃当前行走/路径，
+     * 让技能以失败收场、规划层换路线换目标。不许传送（Fong 定：只许真玩家手段）。
      *
      * <p>为什么需要它：A* 只保证一格"能站人"，不保证 1.8 格高的身体能从当前格挤过去。
      * 丛林里竹子、树叶、藤蔓的组合经常把一格宽的缝堵成实际过不去的墙——
@@ -334,10 +462,12 @@ public final class FakePlayerBody extends ServerPlayer {
      *
      * @param phase 触发阶段（path/walk），只用于日志
      * @param tx    当前想去的水平坐标，用来决定往哪个方向挖
+     * @return 是否已经放弃（计数攒满仍脱困失败）：路径调用方据此 finishPath(false)
      */
-    private void rescueFromStuck(String phase, double tx, double tz) {
+    private boolean rescueFromStuck(String phase, double tx, double tz) {
         this.stuckRescues++;
         BlockPos feet = this.blockPosition();
+        this.lastRescueCell = feet;
         int dirX = (int) Math.signum(tx - this.getX());
         int dirZ = (int) Math.signum(tz - this.getZ());
         if (dirX == 0 && dirZ == 0) {
@@ -350,31 +480,68 @@ public final class FakePlayerBody extends ServerPlayer {
         BlockPos frontHead = frontFeet.above();
         boolean dugFeet = tryDigBlocking(frontFeet);
         boolean dugHead = tryDigBlocking(frontHead);
+        // 斜着走被卡住时，真正挡路的往往不是斜前格（是空气），
+        // 而是左右两侧正交格的边角（树冠、墙角）：身体 0.6 格宽，斜穿时两边都会剐蹭。
+        // 实测 NPC 卡在树冠角落里，斜前全是空气、挖脚/挖头恒为 false，自救等于空转。
+        // 斜向移动且斜前没挖到东西时，把两个正交侧格也试着挖开。
+        boolean dugSide = false;
+        if (!dugFeet && !dugHead && dirX != 0 && dirZ != 0) {
+            BlockPos sideA = feet.offset(dirX, 0, 0);
+            BlockPos sideB = feet.offset(0, 0, dirZ);
+            dugSide = tryDigBlocking(sideA) | tryDigBlocking(sideA.above())
+                    | tryDigBlocking(sideB) | tryDigBlocking(sideB.above());
+        }
+        // 前方都挖不到时再试自己头顶：被盖住的小坑/低矮洞口里，挡路的是头上的方块，
+        // 挖掉才能起跳出去（玩家在 1×2 洞里也是先挖头顶）。
+        boolean dugCeiling = false;
+        if (!dugFeet && !dugHead && !dugSide) {
+            dugCeiling = tryDigBlocking(feet.above(2)) | tryDigBlocking(feet.above());
+        }
         String detail = "阶段=" + phase + " 次数=" + this.stuckRescues
                 + " 方向=" + dirX + "," + dirZ
                 + " 前脚=" + this.level().getBlockState(frontFeet).getBlock()
                 + " 前头=" + this.level().getBlockState(frontHead).getBlock()
                 + " 脚下=" + this.level().getBlockState(feet.below()).getBlock()
-                + " 挖脚=" + dugFeet + " 挖头=" + dugHead;
+                + " 挖脚=" + dugFeet + " 挖头=" + dugHead + " 侧挖=" + dugSide + " 挖顶=" + dugCeiling;
 
+        boolean gaveUp = false;
         if (this.stuckRescues >= MAX_DIG_RESCUES) {
-            // 连续几轮都挖不开，说明不是被方块挡住，而是身体卡在半格方块的碰撞里（比如站在 81.17）。
-            // 直接挪到最近的可站立格，等价于玩家被卡住后退出重进。
-            BlockPos safe = this.nearestStandableCell(feet, tx, tz);
-            if (safe != null) {
-                this.teleportTo(this.level(), safe.getX() + 0.5D, safe.getY() + 0.001D, safe.getZ() + 0.5D,
-                        Set.of(), this.getYRot(), this.getXRot(), true);
-                log(npcName, "stuck-teleport", detail + " → " + safe.toShortString());
-                this.stuckRescues = 0;
-            } else {
-                log(npcName, "stuck-teleport-fail", detail);
-            }
+            // 连续几轮都挖不开：不是被普通方块挡住（半格碰撞/基岩/挖不动的组合）。
+            // 老实放弃——旧做法是传送到最近可站格，已按 Fong 的决定拆除：
+            // 假人只能靠自己，失败收场后由规划层换路线、换目标，总好过原地无限重试。
+            log(npcName, "stuck-giveup", detail + " 放弃当前行走，等待上层换路线");
+            this.stuckRescues = 0;
+            this.lastRescueCell = null;
+            gaveUp = true;
         } else {
             log(npcName, "stuck-rescue", detail);
         }
         // 重新给一个完整的观察窗口；刚挖掉的方块要等下一 tick 才会让碰撞消失。
+        // 基线设成"自救这一刻离目标的真实距离"，下一轮卡住判定从这里重新计时。
         this.noProgressTicks = 0;
-        this.lastDistanceSq = Double.MAX_VALUE;
+        double markDx = tx - this.getX();
+        double markDz = tz - this.getZ();
+        this.lastDistanceSq = markDx * markDx + markDz * markDz;
+        return gaveUp;
+    }
+
+    /**
+     * 自救计数清零的唯一常规出口：人已经离开上次卡住的格子 4 格以外，
+     * 说明早就脱困了，之前的卡住不该再连累新路段。
+     * 技能换目标重新寻路时调用——新路径只要还在这片区域里，计数保留，
+     * 这样"卡住→技能重试→又卡住"的循环能攒满 3 次、触发放弃兜底（失败换路线）。
+     */
+    private void resetRescuesIfLeftArea() {
+        if (this.lastRescueCell == null) {
+            this.stuckRescues = 0;
+            return;
+        }
+        double dx = this.getX() - (this.lastRescueCell.getX() + 0.5D);
+        double dz = this.getZ() - (this.lastRescueCell.getZ() + 0.5D);
+        if (dx * dx + dz * dz > 16.0D) {
+            this.stuckRescues = 0;
+            this.lastRescueCell = null;
+        }
     }
 
     /** 只挖"确实挡路"的方块：空气/液体不碰，基岩和黑曜石这种挖不动的也不碰。 */
@@ -388,29 +555,6 @@ public final class FakePlayerBody extends ServerPlayer {
             return false;
         }
         return this.mineWithBestTool(pos);
-    }
-
-    /** 在身体周围（水平 ±2、垂直 ±2）找最近的可站立格，倾向靠近想去的方向。 */
-    private BlockPos nearestStandableCell(BlockPos around, double tx, double tz) {
-        BlockPos best = null;
-        double bestScore = Double.MAX_VALUE;
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
-                for (int dy = -2; dy <= 2; dy++) {
-                    BlockPos candidate = around.offset(dx, dy, dz);
-                    if (!PathFinder.isStandable(this.level(), candidate)) {
-                        continue;
-                    }
-                    double score = Math.sqrt(dx * dx + dz * dz) * 1.5D + Math.abs(dy)
-                            + Math.hypot(candidate.getX() + 0.5D - tx, candidate.getZ() + 0.5D - tz) * 0.2D;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        best = candidate;
-                    }
-                }
-            }
-        }
-        return best;
     }
 
     /**
@@ -430,17 +574,18 @@ public final class FakePlayerBody extends ServerPlayer {
         }
         BlockPos start = path.get(0);
         // A* 的起点会向下/向上吸附到最近的能站格；身体可能正站在半格方块或树冠边缘（例如 y=81.17）。
-        // 这种"身体不在路径起点那一层"的情况下继续走，会一直朝一个自己并不在的高度靠近，
-        // 40 tick 后判定卡住。先对齐到起点格，等价于玩家挪一下脚站到方块上。
+        // 旧做法是把身体小传送对齐到起点格——已按 Fong 的决定拆除（不许任何传送）。
+        // 现在靠身体自己走/跳/落到起点那一层：人在上面就走过去掉下来，在下面就靠跳跃
+        // 上一格；落差超过跳跃高度（1.5 格）时 applyPathInput 会自己放弃这条路径、
+        // 让技能层按当前位置重新规划。水平本来就在 2.5 格内，走过去花不了一秒。
         double verticalGap = Math.abs(start.getY() - this.getY());
         double horizontalGap = Math.hypot(start.getX() + 0.5D - this.getX(), start.getZ() + 0.5D - this.getZ());
         if (verticalGap > 0.8D && horizontalGap < 2.5D) {
-            log(npcName, "path-align", String.format(Locale.ROOT,
-                    "身体 y=%.2f 与路径起点 %s 相差 %.2f，先对齐",
+            log(npcName, "path-align-walk", String.format(Locale.ROOT,
+                    "身体 y=%.2f 与路径起点 %s 相差 %.2f，靠走/跳对齐（不传送）",
                     this.getY(), start.toShortString(), verticalGap));
-            this.teleportTo(this.level(), start.getX() + 0.5D, start.getY() + 0.001D, start.getZ() + 0.5D,
-                    Set.of(), this.getYRot(), this.getXRot(), true);
         }
+        this.swimGoal = null;
         this.walkTarget = null;
         this.walkCallback = null;
         this.path = path;
@@ -450,7 +595,7 @@ public final class FakePlayerBody extends ServerPlayer {
         this.pathAbandon = onAbandon;
         this.lastDistanceSq = Double.MAX_VALUE;
         this.noProgressTicks = 0;
-        this.stuckRescues = 0;
+        resetRescuesIfLeftArea();
         log(npcName, "path-start", "节点=" + path.size() + " 终点=" + path.get(path.size() - 1).toShortString());
     }
 
@@ -468,6 +613,11 @@ public final class FakePlayerBody extends ServerPlayer {
         this.pathIndex = 0;
         this.pathArrive = null;
         this.pathAbandon = null;
+        if (arrived) {
+            // 整条路走完了：之前的卡住已经翻篇，计数清零。
+            this.stuckRescues = 0;
+            this.lastRescueCell = null;
+        }
         this.xxa = 0.0F;
         this.zza = 0.0F;
         this.setSprinting(false);
@@ -479,7 +629,8 @@ public final class FakePlayerBody extends ServerPlayer {
 
     /** 走到指定坐标；到达后执行 callback（在主线程 tick 内触发）。 */
     public void walkTo(Vec3 target, boolean sprint, Runnable callback) {
-        // 直线行走和 A* 路径互斥，手动 walkTo 视为放弃当前路径。
+        // 直线行走和 A* 路径互斥，手动 walkTo 视为放弃当前路径；游泳脱困也一并取消。
+        this.swimGoal = null;
         this.path = null;
         this.pathIndex = 0;
         this.pathArrive = null;
@@ -489,10 +640,12 @@ public final class FakePlayerBody extends ServerPlayer {
         this.walkCallback = callback;
         this.lastDistanceSq = Double.MAX_VALUE;
         this.noProgressTicks = 0;
+        resetRescuesIfLeftArea();
         log(npcName, "walk-start", String.format(Locale.ROOT, "目标 (%.2f, %.2f, %.2f)", target.x, target.y, target.z));
     }
 
     public void stopWalking() {
+        this.swimGoal = null;
         this.walkTarget = null;
         this.walkCallback = null;
         this.path = null;
@@ -506,6 +659,16 @@ public final class FakePlayerBody extends ServerPlayer {
 
     public boolean isWalking() {
         return this.walkTarget != null || this.path != null;
+    }
+
+    /**
+     * 原地起跳一次（跳搭垫柱用）：站在地面上才跳，走的还是原版跳跃物理
+     * （初速、重力、落地全由 travel 接管），技能层负责在腾空时往脚下放方块。
+     */
+    public void jumpNow() {
+        if (this.onGround()) {
+            this.jumpFromGround();
+        }
     }
 
     /** 挖掘方块，返回是否成功。Survival 模式下会走正常掉落流程。 */

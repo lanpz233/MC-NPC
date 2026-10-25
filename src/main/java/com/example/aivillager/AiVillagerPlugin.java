@@ -7,6 +7,7 @@ import com.example.aivillager.goals.GoalExecutor;
 import com.example.aivillager.listener.NpcChatListener;
 import com.example.aivillager.llm.LlmRouter;
 import com.example.aivillager.npc.FakePlayerBody;
+import com.example.aivillager.progression.ProgressionMode;
 import com.example.aivillager.progression.ProgressionPlanner;
 import com.example.aivillager.skills.SkillRunner;
 import com.example.aivillager.spike.SpikeScenario;
@@ -33,6 +34,7 @@ import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -68,6 +70,12 @@ public final class AiVillagerPlugin extends JavaPlugin {
     private double survivalDefendRadius = 8.0D;
     /** 发展层开关：开着时由确定性规划器推进科技树，LLM 只负责聊天。 */
     private boolean progressionEnabled = true;
+    /** 阶段模式全局默认（config: progression.default-mode）。 */
+    private ProgressionMode defaultProgressionMode = ProgressionMode.SPEEDRUN;
+    /** 按 NPC 名覆盖的阶段模式（config: progression.modes.<NPC 名>），键统一小写匹配。 */
+    private final Map<String, ProgressionMode> npcProgressionModes = new HashMap<>();
+    /** 按 NPC 名的自定义阶段计划原文（config: progression.plans.<NPC 名>，逗号分隔的阶段 id），键统一小写匹配。 */
+    private final Map<String, java.util.List<String>> npcCustomPlans = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -81,6 +89,38 @@ public final class AiVillagerPlugin extends JavaPlugin {
         survivalDefendRadius = Math.max(2.0D, Math.min(16.0D, getConfig().getDouble("survival.defend-radius", 8.0D)));
         // 默认开启：没有它 NPC 只会被 LLM 随机指挥，永远走不到钻石装备。
         progressionEnabled = getConfig().getBoolean("progression.enabled", true);
+        // 阶段模式：全局默认 + 按 NPC 名覆盖。后续"玩家改某个 NPC 的目标"也走这张表：
+        // 运行时改表并重建该 NPC 的规划器即可，规划器本身不关心模式是谁设的。
+        defaultProgressionMode = ProgressionMode.parse(
+                getConfig().getString("progression.default-mode", "speedrun"));
+        org.bukkit.configuration.ConfigurationSection modesSection =
+                getConfig().getConfigurationSection("progression.modes");
+        if (modesSection != null) {
+            for (String key : modesSection.getKeys(false)) {
+                npcProgressionModes.put(key.toLowerCase(java.util.Locale.ROOT),
+                        ProgressionMode.parse(modesSection.getString(key)));
+            }
+        }
+        getLogger().info("阶段模式配置 | 默认=" + defaultProgressionMode.configKey()
+                + "（" + defaultProgressionMode.displayName() + "） 按NPC覆盖=" + npcProgressionModes);
+        // 阶段级自定义计划：progression.plans.<NPC 名> = "id,id,..."（逗号分隔的阶段 id）。
+        // 这里只收原文，解析与前置校验在 planForNpc 里做（每个 NPC 注册时各打一次明确日志）。
+        org.bukkit.configuration.ConfigurationSection plansSection =
+                getConfig().getConfigurationSection("progression.plans");
+        if (plansSection != null) {
+            for (String key : plansSection.getKeys(false)) {
+                String raw = plansSection.getString(key, "");
+                java.util.List<String> ids = new java.util.ArrayList<>();
+                for (String part : raw.split(",")) {
+                    String id = part.trim();
+                    if (!id.isEmpty()) {
+                        ids.add(id);
+                    }
+                }
+                npcCustomPlans.put(key.toLowerCase(java.util.Locale.ROOT), ids);
+            }
+        }
+        getLogger().info("阶段自定义配置 | 按NPC计划=" + npcCustomPlans);
 
         PluginCommand command = getCommand("aivspike");
         if (command != null) {
@@ -212,7 +252,9 @@ public final class AiVillagerPlugin extends JavaPlugin {
 
         // 发展层必须拿到同一个目标层实例：它只负责"下一步做什么"，执行仍归目标层。
         if (progressionEnabled) {
-            ProgressionPlanner planner = new ProgressionPlanner(this, body, skill(body.npcName()), goalExecutor);
+            ProgressionMode mode = modeForNpc(body.npcName());
+            ProgressionPlanner planner = new ProgressionPlanner(this, body, skill(body.npcName()),
+                    goalExecutor, mode, planForNpc(body.npcName(), mode));
             planner.start();
             progression.put(body.npcName(), planner);
         }
@@ -292,6 +334,38 @@ public final class AiVillagerPlugin extends JavaPlugin {
     }
 
     /** 发展层是否启用：启用时自主决策由规划器负责，LLM 不再下目标。 */
+    /**
+     * 查某个 NPC 的阶段模式：先按名字（不分大小写）查覆盖表，没有就用全局默认。
+     * 这是"每个 NPC 目标"的唯一入口——config、将来的游戏内命令/GUI 都改这一层。
+     */
+    public ProgressionMode modeForNpc(String npcName) {
+        if (npcName != null) {
+            ProgressionMode mode = npcProgressionModes.get(npcName.toLowerCase(java.util.Locale.ROOT));
+            if (mode != null) {
+                return mode;
+            }
+        }
+        return defaultProgressionMode;
+    }
+
+    /**
+     * 查某个 NPC 的有效阶段计划：config 里配了自定义计划（progression.plans）就解析它
+     * （含前置依赖校验，缺前置的阶段会被禁用并打 plan-invalid 日志），没配就返回 null
+     * 表示用模式预设。这是"每个阶段都可以自定义"的唯一入口，与 modeForNpc 同层：
+     * 将来游戏内改目标也改这两张表 + 重建规划器。
+     */
+    public java.util.List<com.example.aivillager.progression.StagePlan.StageDef> planForNpc(
+            String npcName, ProgressionMode mode) {
+        if (npcName == null) {
+            return null;
+        }
+        java.util.List<String> raw = npcCustomPlans.get(npcName.toLowerCase(java.util.Locale.ROOT));
+        if (raw == null) {
+            return null;
+        }
+        return com.example.aivillager.progression.StagePlan.resolvePlan(raw, getLogger(), npcName);
+    }
+
     public boolean progressionEnabled() {
         return progressionEnabled;
     }

@@ -54,6 +54,31 @@ survival:
 # 关掉它会退回到"模型每次随机指挥一步"的旧行为。
 progression:
   enabled: true
+  # 阶段模式（发展路线）：决定每个 NPC 沿哪条路线发展。
+  #   speedrun = 通关模式（默认）：木头→铁→钻石工具→钻石甲→下界→末地打龙，一条路走到底。
+  #   steady   = 安稳发育模式：走到钻石套齐、食物和基础物资有余就停，
+  #              之后只维持生存（吃饱、补工具、补木料、附近巡视），不再推进下界/末地。
+  default-mode: speedrun
+  # 按 NPC 名单独指定模式（名字不分大小写）；没写到的 NPC 用上面的默认。
+  # 以后玩家在游戏里改某个 NPC 的目标，走的也是这一层（模式表），界面是后续的事。
+  modes:
+    # Villager_A1: steady
+  # 阶段级自定义计划（比 modes 更细）：给某个 NPC 单独列出它要走的阶段，
+  # 用逗号分隔阶段 id，可挑子集、可跳过阶段。写了 plans 就以 plans 为准（modes 只定默认模板）。
+  # 合法阶段 id（按依赖顺序）：
+  #   hunger 饥饿求生, workbench 工作台, wood_tools 木工具, stone_tools 石工具,
+  #   furnace 熔炉, wood_reserve 木料安全线, coal 煤, iron_ore 挖铁, smelt_iron 炼铁,
+  #   iron_gear 铁装备, spare_picks 备用铁镐, diamond 钻石镐, diamond_sword 钻石剑,
+  #   diamond_armor 钻石甲, food 食物储备, portal_prep 传送门准备, nether 下界,
+  #   bow_arrows 弓箭, stronghold 要塞, end 末地打龙, shelter 夜间小屋,
+  #   explore 探索兜底, sustain 维持生存（终点站：启用它且没启用后期阶段时，走到它就停下维持）
+  # 注意前置依赖：后面的阶段依赖前面的产物（如 diamond 依赖 iron_gear）。
+  # 缺了前置的阶段会在启动日志里被 plan-invalid 明确点名并禁用，不会让 NPC 在游戏里死等。
+  plans:
+    # 只发育到铁套就停下维持生存的例子：
+    # Villager_A1: "hunger,workbench,wood_tools,stone_tools,furnace,wood_reserve,coal,iron_ore,smelt_iron,iron_gear,spare_picks,food,sustain"
+    # 跳过钻石甲和钻石剑、钻石镐直奔下界的例子：
+    # Villager_A2: "hunger,workbench,wood_tools,stone_tools,furnace,wood_reserve,coal,iron_ore,smelt_iron,iron_gear,spare_picks,diamond,food,portal_prep,nether,bow_arrows,stronghold,end"
 
 # 模型路由：按 本地 -> 云端 的顺序尝试，前一个失败才切下一个。
 llm:
