@@ -772,7 +772,16 @@ public final class FakePlayerBody extends ServerPlayer {
         // 不需要正确工具的方块（泥土/沙/木头）：直接空手挖。
         // destroyBlock 是瞬时的，换工具不会更快，只会白白磨损耐久——
         // 这正是"木镐挖 20 层楼梯就报废"的根因，而玩家会空手挖泥土。
-        if (!state.requiresCorrectToolForDrops()) {
+        // 【第三十四轮】雪层/雪块并入素手类：Wiki 核实——雪硬度 0.1、徒手 0.5 秒
+        // 可挖，只是没有锹不掉落（雪球靠锹采集）。旧版按 requiresCorrectToolForDrops
+        // 把雪挡进"必须工具"分支、包里没锹就 mine-no-tool 跳过：长跑#11 实证
+        // 84 次 mine-no-tool 里 71 次是雪层，descend 在雪原地表"挖不动"6 次、
+        // 挖煤目标 193 秒零进展放弃、寻路 waypoint 卡雪层——雪原/雪针叶林开局
+        // 整条下矿链被一层雪堵死。玩家清路时直接用手砸开雪（不要掉落），
+        // 这里同理：素手挖掉、不给掉落，与原版徒手行为一致。
+        if (!state.requiresCorrectToolForDrops()
+                || state.is(net.minecraft.world.level.block.Blocks.SNOW)
+                || state.is(net.minecraft.world.level.block.Blocks.SNOW_BLOCK)) {
             // 挖泥土/沙/木头不掉耐久，但主手拿着可损坏工具时先换成空格再挖。
             // 挖完必须还原选中格：之前漏了这一步，选中格一直停在空格上，
             // 生存层每 1.5 秒又把剑切回来，日志里就出现"切换武器"刷屏，

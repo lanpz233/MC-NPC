@@ -708,32 +708,23 @@ public final class ProgressionPlanner {
                     params("need", "leather", "stock", LEATHER_STOCK_TARGET, "radius", 12));
         }
 
-        // 7) 煤：火把和燃料。没有煤也能用木板烧，但不能无限烧。
-        // 连续两次挖煤失败 = 当前矿层确实没有煤（实测 Y=16 连挖两条 24 格矿道都是 0）。
-        // 玩家这时会改用木板/木炭当燃料，而不是永远卡在"煤不足"这一条上；
-        // 跳过煤以后，后面的铁装备、砍木头补木棍都能继续推进，过一阵带退避再回来挖。
-        boolean coalStarved = failStreak >= 2 && "挖煤".equals(lastFailedStage);
-        // 【第二十二轮】挖煤改存量驱动：补到 COAL_STOCK_TARGET 为止（够一轮冶炼+火把），
-        // 不再固定 count=4 挖完就走、下一轮又因 coal<4 被派回来。
-        if (planHas(StagePlan.COAL) && coal < COAL_STOCK_TARGET && hasStonePickaxe && !coalStarved) {
-            return goal("挖煤", "dig",
-                    params("resource", "coal", "count", COAL_STOCK_TARGET - coal));
-        }
-
-        // 8) 铁矿石：石镐就能挖，Y=16 附近最密集。
-        // 【第二十二轮】同理按存量差额：生铁+铁锭合计补到 8（够镐+剑+余量）。
-        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe) {
-            return goal("挖铁", "dig",
-                    params("resource", "iron", "count", 8 - rawIron - ingots));
-        }
-
-        // 9) 冶炼：手里有生铁、有熔炉、有燃料才炼。
+        // 7) 冶炼（原第 9 步，【第三十四轮】提到挖煤/挖铁之前）：手里有生铁、有熔炉、
+        // 有燃料就先炼。长跑#11 实证：冶炼原排在挖煤(原7)/挖铁(原8)两个"存量达标型"
+        // 长目标之后——挖煤目标几乎常驻、单次以分钟计且在雪原地表反复零进展失败，
+        // 其跳过条件 coalStarved 又靠共享 failStreak（被口粮/皮革 hunt 交替改写、永远
+        // 凑不满 2），结果生铁在包里躺 1 小时以上、冶炼/挖铁/铁装备全程 0 次。
+        // 玩家是有料先炼、先把铁镐铁剑做出来再去挖新的，这里把转化口钉在挖矿之前。
+        // 燃料口径不变：规划层 canFuel 与执行层 pickFuel 都认煤/木炭/木板/原木/木棍，
+        // #11 不是"木头不算燃料"，是根本轮不到冶炼这一步。
         if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && ingots < 4 && hasFurnace && canFuel()) {
             return goal("冶炼铁锭", "smelt",
                     params("item", "iron_ingot", "count", Math.min(8, rawIron)));
         }
 
-        // 10) 铁制装备：剑 → 镐 → 胸甲 → 头盔 → 护腿 → 靴子。
+        // 8) 铁制装备（原第 10 步，【第三十四轮】随冶炼一并提前到挖煤/挖铁之前）：
+        // 剑 → 镐 → 胸甲 → 头盔 → 护腿 → 靴子。本块是阻塞式的（缺锭自己炼/挖），
+        // 只要轮得到就能自驱走完铁线；原排序下被挖煤常驻目标挡在后面，贫瘠群系
+        // 永远轮不到（长跑#11 实证），故随冶炼一起提前。
         // 每一件都要求背包里真的有对应数量的锭，避免反复下"材料不够"的合成目标。
         if (planHas(StagePlan.IRON_GEAR)
                 && !hasAny("iron_sword", "diamond_sword", "netherite_sword") && ingots >= 2) {
@@ -801,6 +792,25 @@ public final class ProgressionPlanner {
             return goal("挖铁（铁靴）", "dig",
                     params("resource", "iron", "count", Math.max(1, 4 - ingots - rawIron)));
         }
+        // 9) 煤（原第 7 步，【第三十四轮】顺延到冶炼/铁装备之后）：火把和燃料。没有煤也能用木板烧，但不能无限烧。
+        // 连续两次挖煤失败 = 当前矿层确实没有煤（实测 Y=16 连挖两条 24 格矿道都是 0）。
+        // 玩家这时会改用木板/木炭当燃料，而不是永远卡在"煤不足"这一条上；
+        // 跳过煤以后，后面的铁装备、砍木头补木棍都能继续推进，过一阵带退避再回来挖。
+        boolean coalStarved = failStreak >= 2 && "挖煤".equals(lastFailedStage);
+        // 【第二十二轮】挖煤改存量驱动：补到 COAL_STOCK_TARGET 为止（够一轮冶炼+火把），
+        // 不再固定 count=4 挖完就走、下一轮又因 coal<4 被派回来。
+        if (planHas(StagePlan.COAL) && coal < COAL_STOCK_TARGET && hasStonePickaxe && !coalStarved) {
+            return goal("挖煤", "dig",
+                    params("resource", "coal", "count", COAL_STOCK_TARGET - coal));
+        }
+
+        // 10) 铁矿石（原第 8 步，【第三十四轮】顺延）：石镐就能挖，Y=16 附近最密集。
+        // 【第二十二轮】同理按存量差额：生铁+铁锭合计补到 8（够镐+剑+余量）。
+        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe) {
+            return goal("挖铁", "dig",
+                    params("resource", "iron", "count", 8 - rawIron - ingots));
+        }
+
 
         // 11) 钻石前的工具保障：至少 2 把可用铁镐，且总剩余耐久 >= 250。
         // 先补铁镐，再继续挖铁——否则"只有 1 把铁镐但只剩 2 锭"会被判成"继续挖铁"，
