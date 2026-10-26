@@ -78,7 +78,8 @@ String path = pathOf(stack);
 int count = stack.getCount();
 var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
 if (food!= null && food.nutrition() > 0) {
-foodNutrition += food.nutrition() * count;
+// 【第二十四轮】腐肉每块按 1 点计（满值 4 会高估口粮），与规划/目标层同一口径。
+foodNutrition += ("rotten_flesh".equals(path) ? 1 : food.nutrition()) * count;
 }
 switch (path) {
 case "leather" -> leather += count;

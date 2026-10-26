@@ -97,6 +97,16 @@ public final class ProgressionPlanner {
     /** 同一资源连续被目标层放弃的次数（跨阶段名统计，只认目标层结果）。 */
     private int digAbandonStreak;
     private String digAbandonResource = "";
+    /** 【第二十四轮】皮革专属连败与退避到期：共享 failStreak 按"上一阶段名"记账，
+     * 皮革与挖铁交替派活时每次都重置成 1，6.8 的"连败 2 次退避"永远凑不满
+     * （长跑#8 F 段皮革/挖铁 ping-pong 实证）。皮革自己记账：失败退避 60 秒起、
+     * 随连败翻倍、上限 5 分钟；成功清零；其他阶段的成败不冲它。 */
+    private int leatherFailStreak;
+    private long leatherBackoffUntil;
+    /** 【第二十四轮】口粮补给专属连败与退避：与皮革同理。补给连败时短暂让位
+     * 主线（附近真没动物不能把整条科技树堵死），退避到期仍由它优先重试。 */
+    private int foodFailStreak;
+    private long foodBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -262,6 +272,31 @@ public final class ProgressionPlanner {
             // 目标成功完成，或（无新目标结果时）技能步骤有了结果且非失败：清零。
             failStreak = 0;
             lastFailedStage = "";
+        }
+        // 【第二十四轮】皮革/口粮专属退避记账：只认目标层结果、只认各自阶段名，
+        // 与共享 failStreak 分开（理由见字段注释）。退避时长随各自连败增长。
+        if (goalNewOutcome) {
+            if ("找皮革做皮靴".equals(lastStage)) {
+                if (goalFailed) {
+                    leatherFailStreak++;
+                    leatherBackoffUntil = now + Math.min(300_000L, 60_000L * leatherFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 皮革退避 | 连败=" + leatherFailStreak
+                            + " 退避秒=" + (leatherBackoffUntil - now) / 1000L);
+                } else {
+                    leatherFailStreak = 0;
+                    leatherBackoffUntil = 0L;
+                }
+            } else if ("补随身口粮".equals(lastStage)) {
+                if (goalFailed) {
+                    foodFailStreak++;
+                    foodBackoffUntil = now + Math.min(180_000L, 45_000L * foodFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 口粮补给退避 | 连败=" + foodFailStreak
+                            + " 退避秒=" + (foodBackoffUntil - now) / 1000L);
+                } else {
+                    foodFailStreak = 0;
+                    foodBackoffUntil = 0L;
+                }
+            }
         }
         // 挖矿连败统计（第三轮修复 C）：目标层放弃一次挖矿目标不奇怪（这一片可能真没矿），
         // 注：连败判定关键词集中在 isFailureText（第十九轮抽出，目标/技能共用）。
@@ -625,14 +660,33 @@ public final class ProgressionPlanner {
                     + " failStreak=" + failStreak);
         }
 
+        // 6.6) 随身口粮见底（第二十四轮，Fong 18:49/18:51 的存量口径）：看背包
+        // 营养存量、不看饥饿条——长跑#8 F 段实证：复活后饥饿条满格（20）把
+        // "背包零食物"盖住，步骤 0（饥饿求生，要 foodLevel≤8）与步骤 13
+        // （食物储备，旧版要 foodLevel<16）双双不触发，派活在无源皮革与挖铁
+        // 之间 ping-pong 到收尾、终局盘点 foodNutrition=0。改：随身存量为 0
+        // 且有剑时，先把口粮补到下矿线再谈皮靴/煤铁；地下没动物，先回地表；
+        // 没剑不挡路（工具线优先，真饿着有步骤 0 兜底）。补给自身连败退避中
+        // 时让位主线，退避到期仍由它优先重试（专属记账见上方结果处理段）。
+        if (planHas(StagePlan.FOOD) && hasSword && foodNutrition() <= 0
+                && System.currentTimeMillis() >= foodBackoffUntil) {
+            if (underground()) {
+                return skill("补随身口粮", "ascend");
+            }
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 随身口粮见底，先补口粮 | foodNutrition=0");
+            return goal("补随身口粮", "hunt",
+                    params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+        }
+
         // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
         // 针叶林等细雪地带时，皮靴从"顺手做"升级为"优先做"——没皮靴在雪地
         // 里寸步难行（寻路已避开细雪，没靴寸步难行的是探索范围被雪原封死）。
-        // 皮不够就去打猎（hunt 已优先牛、牛肉皮革双收）；连败 2 次退避，
-        // 不许为一双靴子饿死在雪地里。暖区完全不进这一段。
+        // 皮不够就去打猎（hunt 已优先牛、牛肉皮革双收）；【第二十四轮】退避
+        // 改皮革专属记账（见字段注释）：共享 failStreak 在交替派活时永远攒
+        // 不到 2，旧门形同虚设、皮革与挖铁 ping-pong 到长跑收尾。
         if (planHas(StagePlan.LEATHER_BOOTS) && npc.inPowderSnowCountry()
                 && !hasAny("leather_boots") && leather < 4 && hasSword
-                && !(failStreak >= 2 && "找皮革做皮靴".equals(lastFailedStage))) {
+                && System.currentTimeMillis() >= leatherBackoffUntil) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 细雪地带优先皮靴 | biome="
                     + npc.biomePath() + " leather=" + leather);
             return goal("找皮革做皮靴", "hunt",
@@ -843,11 +897,13 @@ public final class ProgressionPlanner {
         // 蜘蛛只在夜晚出没，先凑弓弦会让白天的整条下线主链（下界→末影珍珠）全堵在后面。
 
         // 13) 食物储备：有剑以后打猎，再用熔炉把生肉烤熟（熟肉回复量更高）。
-        // 但 foodLevel 还够高（>12）时不急——附近没动物会一直 hunt 失败卡死主线。
-        // 13) 食物储备：【第二十二轮】改存量驱动——按食物总营养值达到下矿口粮线
-        // （24）停，不再"打 2 只就收工"；foodLevel 还满（>=16）时不急着囤。
+        // 【第二十二轮】改存量驱动——按食物总营养值达到下矿口粮线（24）停，
+        // 不再"打 2 只就收工"；【第二十四轮】去掉旧版 foodLevel<16 的饥饿条
+        // 门槛：储备看的是背包存量，饥饿条满格时包里照样可能一口吃的都没有
+        // （长跑#8 F 段终局 foodNutrition=0 实证）。零存量已由 6.6 提前处理，
+        // 这里负责把储备补到线。
         if (planHas(StagePlan.FOOD) && foodNutrition() < MINING_FOOD_NUTRITION
-                && hasSword && foodLevel < 16) {
+                && hasSword) {
             return goal("储备食物", "hunt",
                     params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
         }
@@ -1309,7 +1365,13 @@ public final class ProgressionPlanner {
         return total;
     }
 
-    /** 【第二十二轮】背包食物总营养值（nutrition×数量合计），下矿口粮线与食物存量驱动的口径。 */
+    /**
+     * 【第二十二轮】背包食物总营养值（nutrition×数量合计），下矿口粮线与食物存量驱动的口径。
+     * 【第二十四轮】腐肉打折：Wiki 食物表——腐肉恢复 4 点、饱和度只有 0.8，且
+     * 80% 概率附加 30 秒饥饿效果（吃完掉得更快），按满值计会把口粮严重高估
+     * （第二十三轮盘点实证：foodNutrition=32 全是腐肉）。腐肉每块按 1 点计，
+     * 只当应急不当储备。规划层/目标层/盘点三处同一口径。
+     */
     private int foodNutrition() {
         int total = 0;
         for (int slot = 0; slot < COUNT_SLOTS; slot++) {
@@ -1319,7 +1381,8 @@ public final class ProgressionPlanner {
             }
             var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
             if (food != null && food.nutrition() > 0) {
-                total += food.nutrition() * stack.getCount();
+                total += ("rotten_flesh".equals(itemPath(stack)) ? 1 : food.nutrition())
+                        * stack.getCount();
             }
         }
         return total;

@@ -2014,7 +2014,9 @@ public final class GoalExecutor {
         wander();
     }
 
-    /** 【第二十二轮】背包食物总营养值：按 FOOD 组件 nutrition×数量合计（下矿口粮线的口径）。 */
+    /** 【第二十二轮】背包食物总营养值：按 FOOD 组件 nutrition×数量合计（下矿口粮线的口径）。
+     * 【第二十四轮】腐肉每块按 1 点计（Wiki：恢复 4/饱和 0.8/80% 概率饥饿效果，
+     * 满值高估），与规划层、盘点同一口径。 */
     private int foodNutrition() {
         int total = 0;
         for (int slot = 0; slot < COUNT_SLOTS; slot++) {
@@ -2024,7 +2026,8 @@ public final class GoalExecutor {
             }
             var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
             if (food != null && food.nutrition() > 0) {
-                total += food.nutrition() * stack.getCount();
+                total += ("rotten_flesh".equals(pathOf(stack)) ? 1 : food.nutrition())
+                        * stack.getCount();
             }
         }
         return total;

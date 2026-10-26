@@ -147,6 +147,23 @@ public final class SurvivalController {
     /** 暂时无视的威胁：实体 UUID → 解除无视的时间戳（毫秒）。 */
     private final java.util.Map<java.util.UUID, Long> ignoredThreats = new java.util.HashMap<>();
     /**
+     * 【第二十四轮】逃跑直线脱离兜底（长跑#8 F 段实证）：A* 各档落点全灭时
+     * 不再站着挨打——沿远离威胁方向 walkTo 直线跑，靠身体层的撞墙跳/卡住挖路
+     * 硬走（玩家式跑法）。engaged=兜底进行中；attempts 轮换偏转角；anchor 记
+     * 本轮兜底起点，连着两轮换方向都没挪出 2 格 = 真被地形困死，放弃兜底
+     * 交回贴脸自卫；until 是本轮直行的观察窗（身体还在走就不重发）。
+     */
+    private boolean straightFleeEngaged;
+    private int straightFleeAttempts;
+    private BlockPos straightFleeAnchor;
+    private long straightFleeUntil;
+    /** 兜底偏转角序列：正后方优先，其次斜后、侧向，最后回头（总比原地强）。 */
+    private static final int[] STRAIGHT_FLEE_ROTATIONS = {0, 45, -45, 90, -90, 180};
+    /** 兜底直行距离：与远程加长档同量级，先脱离弩/弓射程再说。 */
+    private static final double STRAIGHT_FLEE_DISTANCE = 16.0D;
+    /** 兜底直行观察窗：走完/卡住都由 defend 的快速重试接管，这里只防同 tick 重发。 */
+    private static final long STRAIGHT_FLEE_WINDOW_MILLIS = 5_000L;
+    /**
      * 死亡前的背包快照。
      * 伪玩家死后原版会把背包全部掉在地上，目标层辛苦攒的材料会瞬间清零；
      * 复活时用这份快照恢复，才算真正"像玩家一样持续发展"（而不是死了重来）。
@@ -710,6 +727,7 @@ public final class SurvivalController {
         if (threat == null) {
             fleeing = false;
             fleeCooldown = 0;
+            resetStraightFlee();
             if (chasing) {
                 // 目标死了或跑远了，停掉追击路径。
                 // 但如果技能层此刻正在执行（比如玩家刚让它 goto），不能清，
@@ -774,7 +792,12 @@ public final class SurvivalController {
             if (npc.isUsingItem()) {
                 npc.stopUsingItem();
             }
-            if (fleeCooldown <= 0) {
+            // 【第二十四轮】直线脱离兜底进行中、身体已经停下（走完或卡住放弃）
+            // 时不等 fleeCooldown：立刻重规划——A* 先行，仍无路就轮换方向接着跑。
+            // 长跑#8 F 段实证旧节奏是灾难：逃跑失败每约 20 秒才重试一次，其余
+            // 时间原地挨箭，直到被掠夺者射杀（第 4 次死亡，hpPrev=2.2）。
+            boolean straightRetry = straightFleeEngaged && fleeing && !npc.isWalking();
+            if (fleeCooldown <= 0 || straightRetry) {
                 fleeCooldown = 40;
                 if (flee(threat, rangedStandOff)) {
                     fleeing = true;
@@ -922,6 +945,9 @@ public final class SurvivalController {
         // （实测低血逃跑因此直接失败、被迫贴脸战死），退到 10 格、6 格再试——
         // 先跑开几格脱离攻击距离，也比原地恋战强，这正是惜命要的。
         int[] tiers = extended ? new int[]{28, 22, 16, 10} : new int[]{16, 10, 6};
+        // 【第二十四轮】逐档失败明细（无可站立点/A* 详情）攒下来打进日志：
+        // 旧版只报"各档全灭"，雪原上为什么全灭无从查起（日志标准：失败留痕）。
+        StringBuilder diag = new StringBuilder();
         for (int distance : tiers) {
             double targetX = npc.getX() + dx / length * distance;
             double targetZ = npc.getZ() + dz / length * distance;
@@ -945,12 +971,15 @@ public final class SurvivalController {
                 }
             }
             if (goal == null) {
+                diag.append(distance).append("格:无可站立点 ");
                 continue;
             }
             PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000, !npc.wearingLeatherBoots());
             if (!result.found()) {
+                diag.append(distance).append("格:").append(result.detail()).append(' ');
                 continue;
             }
+            resetStraightFlee();
             npc.followPath(result.path(), true, null, null);
             chasing = true;
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑 | threat=" + threat.getType()
@@ -958,9 +987,68 @@ public final class SurvivalController {
                     + " 距离档=" + distance + " 路径=" + result.path().size() + " 终点=" + goal.toShortString());
             return true;
         }
+        // 【第二十四轮】各档 A* 全灭 ≠ 站着等死：玩家这时沿远离威胁的方向
+        // 直线跑，撞坡跳、撞墙挖。走兜底直线脱离；兜底也走不动（真困死）时
+        // 才落回原失败语义（贴脸自卫+暂时无视），且远程威胁在兜底开启期间
+        // 永远走不到"无视"这一步——箭还在飞，无视等于等死。
+        if (fleeStraightLine(threat, dx, dz, diag.toString().trim())) {
+            return true;
+        }
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：" + java.util.Arrays.toString(tiers)
-                + " 格各档都没有可站立位置或路径");
+                + " 格各档都没有可站立位置或路径 | 明细=" + diag.toString().trim());
         return false;
+    }
+
+    /**
+     * 【第二十四轮】逃跑兜底：直线脱离。沿远离威胁方向（多轮失败后依次偏转
+     * ±45°/±90°/180°）用身体层 walkTo 直行 16 格：撞到 1 格坡自动跳、卡住
+     * 会挖开挡路方块——都是玩家手段，无传送。身体还在走时不重发；连着两轮
+     * 换方向都没挪出 2 格，判定真被地形困死，返回 false 交回贴脸自卫。
+     *
+     * @param dx/dz 已归一化的远离方向（flee 主方法算好）
+     * @param diag  A* 逐档失败明细，进日志留痕
+     */
+    private boolean fleeStraightLine(LivingEntity threat, double dx, double dz, String diag) {
+        long now = System.currentTimeMillis();
+        if (npc.isWalking() && now < straightFleeUntil) {
+            straightFleeEngaged = true;
+            return true;
+        }
+        BlockPos here = npc.blockPosition();
+        boolean moved = straightFleeAnchor == null
+                || here.distSqr(straightFleeAnchor) >= 4.0D;
+        if (!moved && straightFleeAttempts >= 2) {
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑兜底放弃：直线脱离也走不动"
+                    + " | threat=" + threat.getType() + " pos=" + here.toShortString()
+                    + " A*明细=" + diag);
+            resetStraightFlee();
+            return false;
+        }
+        if (moved) {
+            straightFleeAnchor = here;
+            straightFleeAttempts = 0;
+        }
+        int rotation = STRAIGHT_FLEE_ROTATIONS[straightFleeAttempts % STRAIGHT_FLEE_ROTATIONS.length];
+        double angle = Math.atan2(dz, dx) + Math.toRadians(rotation);
+        double tx = npc.getX() + Math.cos(angle) * STRAIGHT_FLEE_DISTANCE;
+        double tz = npc.getZ() + Math.sin(angle) * STRAIGHT_FLEE_DISTANCE;
+        npc.walkTo(new net.minecraft.world.phys.Vec3(tx, npc.getY(), tz), true, null);
+        straightFleeEngaged = true;
+        straightFleeAttempts++;
+        straightFleeUntil = now + STRAIGHT_FLEE_WINDOW_MILLIS;
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑兜底：直线脱离 | threat=" + threat.getType()
+                + " hp=" + String.format(Locale.ROOT, "%.1f", npc.getHealth())
+                + " 偏转=" + rotation + " 次数=" + straightFleeAttempts
+                + " 目标=(" + (int) tx + "," + (int) tz + ") A*明细=" + diag);
+        return true;
+    }
+
+    /** 直线脱离兜底状态清零：A* 逃跑成功、无威胁、兜底放弃时调用。 */
+    private void resetStraightFlee() {
+        straightFleeEngaged = false;
+        straightFleeAttempts = 0;
+        straightFleeAnchor = null;
+        straightFleeUntil = 0L;
     }
 
     private LivingEntity findThreat() {
