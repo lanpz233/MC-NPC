@@ -1535,10 +1535,22 @@ public final class SkillRunner {
                 if (!npc.onGround) {
                     if (lastTarget != null) {
                         airTotalRounds = 0;
-                        // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
-                        // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
-                        // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
-                        if (!npc.isWalking() && ++landWaitRounds > 200) {
+                        // 【第四十二轮】先按高度结算：雪层/边缘的小数高度站姿下
+                        // onGround 恒 false，旧逻辑在悬空分支里 return、永远走不到
+                        // 下面的到达结算——长跑#13b 实测 lastTarget 已到达（方块 Y
+                        // 已低于起始线）仍等满 30 秒落地死线判失败，steps 恒 0、
+                        // 身体靠转向一点点蹭下、挖铁目标连吃 360 秒超时。方块 Y
+                        // 已越线就按到达结算，与下方 onGround 分支同口径。
+                        if (npc.blockPosition().getY() < stepStartY) {
+                            lastTarget = null;
+                            landWaitRounds = 0;
+                            stepWaitRounds = 0;
+                            steps++;
+                            failedSteps = 0;
+                        } else if (!npc.isWalking() && ++landWaitRounds > 200) {
+                            // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
+                            // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
+                            // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
                             landWaitRounds = 0;
                             lastTarget = null;
                             dirIndex++;
@@ -1821,6 +1833,15 @@ public final class SkillRunner {
                 if (!npc.onGround) {
                     if (lastTarget != null) {
                         airTotalRounds = 0;
+                        // 【第四十二轮】与 descend 同修：先按高度结算——方块 Y
+                        // 已高于起始线即算到达。雪层站姿 onGround 恒 false 时旧
+                        // 逻辑直接 return、步数永不结算，只能等步数看门狗收场。
+                        if (npc.blockPosition().getY() > stepStartY) {
+                            lastTarget = null;
+                            steps++;
+                            failedSteps = 0;
+                            unsafeTurns = 0;
+                        }
                         return;
                     }
                     // 与 descend 同病（第十三轮）：无待结算步却报悬空
