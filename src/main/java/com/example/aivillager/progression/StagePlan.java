@@ -52,6 +52,14 @@ public final class StagePlan {
     public static final StageDef DIAMOND_SWORD = new StageDef("diamond_sword", "钻石剑");
     public static final StageDef DIAMOND_ARMOR = new StageDef("diamond_armor", "钻石甲");
     public static final StageDef FOOD = new StageDef("food", "食物储备");
+    /**
+     * 皮靴（第十九轮，Fong 拍板）：细雪地带的条件触发阶段——身处雪原/针叶林等
+     * 有细雪的群系时优先攒皮革做皮靴穿上（没皮靴寻路避开细雪、陷住要挖出/垫出）。
+     * 暖区出生不强制（只在打猎顺手攒够 4 张皮时顺带做）。做成独立阶段就是为了
+     * 能被阶段自定义控制：自定义计划不写 leather_boots，这个驱动就不启用
+     * （寻路避细雪的安全规则不受阶段控制，那是保命不是发展路线）。
+     */
+    public static final StageDef LEATHER_BOOTS = new StageDef("leather_boots", "皮靴（细雪地带）");
     public static final StageDef PORTAL_PREP = new StageDef("portal_prep", "下界门准备");
     public static final StageDef BOW_ARROWS = new StageDef("bow_arrows", "弓箭");
     public static final StageDef STRONGHOLD = new StageDef("stronghold", "要塞与末地门");
@@ -66,7 +74,7 @@ public final class StagePlan {
     private static final List<StageDef> SPEEDRUN_PLAN = List.of(
             HUNGER, WORKBENCH, WOOD_TOOLS, STONE_TOOLS, FURNACE, WOOD_RESERVE,
             COAL, IRON_ORE, SMELT_IRON, IRON_GEAR, SPARE_PICKS,
-            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD,
+            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD, LEATHER_BOOTS,
             PORTAL_PREP, BOW_ARROWS, STRONGHOLD, NETHER, END,
             SHELTER, EXPLORE);
 
@@ -77,7 +85,7 @@ public final class StagePlan {
     private static final List<StageDef> STEADY_PLAN = List.of(
             HUNGER, WORKBENCH, WOOD_TOOLS, STONE_TOOLS, FURNACE, WOOD_RESERVE,
             COAL, IRON_ORE, SMELT_IRON, IRON_GEAR, SPARE_PICKS,
-            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD,
+            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD, LEATHER_BOOTS,
             SUSTAIN);
 
     /**
@@ -89,7 +97,7 @@ public final class StagePlan {
     private static final List<StageDef> CANONICAL = List.of(
             HUNGER, WORKBENCH, WOOD_TOOLS, STONE_TOOLS, FURNACE, WOOD_RESERVE,
             COAL, IRON_ORE, SMELT_IRON, IRON_GEAR, SPARE_PICKS,
-            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD,
+            DIAMOND, DIAMOND_SWORD, DIAMOND_ARMOR, FOOD, LEATHER_BOOTS,
             PORTAL_PREP, NETHER, BOW_ARROWS, STRONGHOLD, END,
             SHELTER, EXPLORE, SUSTAIN);
 
@@ -130,6 +138,7 @@ public final class StagePlan {
             Map.entry("diamond", List.of("iron_gear")),
             Map.entry("diamond_sword", List.of("diamond")),
             Map.entry("diamond_armor", List.of("diamond")),
+            Map.entry("leather_boots", List.of("wood_tools")),
             Map.entry("portal_prep", List.of("diamond")),
             Map.entry("nether", List.of("portal_prep")),
             Map.entry("stronghold", List.of("nether")),

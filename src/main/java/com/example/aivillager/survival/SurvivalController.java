@@ -301,6 +301,25 @@ public final class SurvivalController {
             fluidEscapeDir = null;
             return;
         }
+        // 【第十九轮】陷进细雪脱困（Fong 拍板）：没穿皮靴陷进细雪（脚格就是
+        // 细雪方块）时不许靠硬走挣扎——把脚下/头顶的细雪逐格挖掉、跳着往外
+        // 挪，落到实地后再由寻路（已改为避开细雪）接管。和挖树叶下树同理，
+        // 只挖不传送。穿了皮靴按原版机制正常踩过，不进这一段。
+        if (state.is(net.minecraft.world.level.block.Blocks.POWDER_SNOW)
+                && !npc.wearingLeatherBoots()) {
+            boolean dug = npc.mineWithBestTool(feet) || npc.mine(feet);
+            net.minecraft.core.BlockPos head = feet.above();
+            if (npc.level().getBlockState(head)
+                    .is(net.minecraft.world.level.block.Blocks.POWDER_SNOW)) {
+                dug |= npc.mineWithBestTool(head) || npc.mine(head);
+            }
+            npc.jumpNow();
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " powder-snow-escape | pos="
+                    + feet.toShortString() + " dug=" + dug);
+            fluidStuckChecks = 0;
+            fluidEscapeDir = null;
+            return;
+        }
         if ((state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK))
                 && !npc.isInWater() && !npc.isInLava()) {
             // 【第十四轮】真离水（身体包围盒也不沾水）连续 2 次检查才清零泡水计数：
@@ -735,7 +754,7 @@ public final class SurvivalController {
                     chasing = false;
                     return true;
                 }
-                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 3000);
+                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 3000, !npc.wearingLeatherBoots());
                 if (result.found()) {
                     npc.followPath(result.path(), true, null, null);
                     chasing = true;
@@ -851,7 +870,7 @@ public final class SurvivalController {
             if (goal == null) {
                 continue;
             }
-            PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000);
+            PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000, !npc.wearingLeatherBoots());
             if (!result.found()) {
                 continue;
             }
@@ -1042,6 +1061,25 @@ public final class SurvivalController {
             int candidateScore = armorScore(candidate);
             ItemStack current = npc.getItemBySlot(equipmentSlot);
             int currentScore = current.isEmpty() ? -1 : armorScore(current);
+            // 【第十九轮】细雪地带护脚特例：原版只有皮靴防细雪下陷，铁靴防御
+            // 更高但一穿上就又陷雪。在细雪地带（身体判定）里，脚部只认皮靴：
+            // 皮靴在脚上时不许被任何其他靴子换下；背包里有皮靴而脚上不是，
+            // 无视防御分直接换上。离开细雪地带后恢复纯防御评分。
+            if (equipmentSlot == EquipmentSlot.FEET && npc.inPowderSnowCountry()) {
+                boolean candidateLeather = candidate.is(Items.LEATHER_BOOTS);
+                boolean currentLeather = current.is(Items.LEATHER_BOOTS);
+                if (currentLeather && !candidateLeather) {
+                    continue;
+                }
+                if (candidateLeather && !currentLeather) {
+                    npc.setItemSlot(equipmentSlot, candidate);
+                    inventory.setItem(slot, current);
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                            + " powder-snow-boots | 细雪地带换上皮靴 替换="
+                            + (current.isEmpty() ? "空" : current.getItem().toString()));
+                    continue;
+                }
+            }
             if (candidateScore <= currentScore) {
                 continue;
             }

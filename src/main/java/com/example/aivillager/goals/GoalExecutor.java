@@ -1901,6 +1901,11 @@ public final class GoalExecutor {
         // 旧版永远看不见、只能靠搬迁碰运气。
         params.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 24 : 12);
         params.addProperty("hits", 10);
+        // 【第十九轮】皮革不足 4 张时打猎优先牛：牛肉是顶级食物、皮革是皮靴
+        // 材料，一举两得（Fong 口径）。攒够 4 张后恢复"最近优先"。
+        if (countItem("leather") < 4) {
+            params.addProperty("prefer", "cow");
+        }
         huntAttempts++;
         if (skills.run(new Intent("", "hunt", params), "目标")) {
             return;

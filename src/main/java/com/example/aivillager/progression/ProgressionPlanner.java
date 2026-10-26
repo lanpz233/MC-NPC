@@ -215,31 +215,47 @@ public final class ProgressionPlanner {
         // 目标层自己的结果单独留一份：技能层结果会在下面覆盖 outcome，
         // 但"挖矿连败"只能认目标层的放弃/完成，认错来源会误触发换区。
         String goalOutcomeText = null;
+        boolean goalNewOutcome = false;
         if (outcomeId != lastOutcomeId) {
             lastOutcomeId = outcomeId;
             newOutcome = true;
+            goalNewOutcome = true;
             outcome = goals.lastOutcome();
             goalOutcomeText = outcome;
         }
+        String skillOutcomeText = null;
         if (skillSeq != lastSkillOutcomeSeq) {
             lastSkillOutcomeSeq = skillSeq;
             newOutcome = true;
-            outcome = skills.lastOutcome();
+            skillOutcomeText = skills.lastOutcome();
+            if (!goalNewOutcome) {
+                outcome = skillOutcomeText;
+            }
         }
-        if (newOutcome && outcome != null
-                && (outcome.contains("失败") || outcome.contains("放弃") || outcome.contains("超时")
-                        || outcome.contains("不可达") || outcome.contains("无法")
-                        || outcome.contains("找不到") || outcome.contains("挖不动"))) {
+        // 【第十九轮附带修复】失败记账分开算（雪原复验实测逮到）：旧版技能层
+        // 结果会覆盖目标层结果——目标刚"放弃"、同 tick 一个技能报"到达"，
+        // 失败就被冲掉、连败清零，木料安全线放行/挖煤退避/皮靴退避这些靠
+        // failStreak 的机制全部失效（长跑#7 挖煤看门狗连烧 4 轮同源）。
+        // 改为：目标结果是权威（目标内部本来就驱动技能），目标失败优先记账；
+        // 技能结果只在没有新目标结果时单独记账；连败只被"目标成功完成"
+        // 或"技能步骤成功"清零，技能的附带成功不再冲掉目标的失败。
+        boolean goalFailed = goalNewOutcome && isFailureText(goalOutcomeText);
+        boolean skillFailed = !goalNewOutcome && skillOutcomeText != null
+                && isFailureText(skillOutcomeText);
+        if (goalFailed || skillFailed) {
+            String failedText = goalFailed ? goalOutcomeText : skillOutcomeText;
             failStreak = lastStage.equals(lastFailedStage) ? failStreak + 1 : 1;
             lastFailedStage = lastStage;
             lastFailAt = now;
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 检测到失败 | outcome=" + outcome
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 检测到失败 | outcome=" + failedText
                     + " 阶段=" + lastStage + " 连续=" + failStreak);
-        } else if (newOutcome) {
+        } else if (goalNewOutcome || (!goalNewOutcome && skillOutcomeText != null)) {
+            // 目标成功完成，或（无新目标结果时）技能步骤有了结果且非失败：清零。
             failStreak = 0;
             lastFailedStage = "";
         }
         // 挖矿连败统计（第三轮修复 C）：目标层放弃一次挖矿目标不奇怪（这一片可能真没矿），
+        // 注：连败判定关键词集中在 isFailureText（第十九轮抽出，目标/技能共用）。
         // 但同一资源连弃 2 次还留在原地重发，就是长跑里"贫铁洞原地烧掉几十分钟"的死循环。
         // 连弃 2 次 → 置位换区：下次再给同一资源下挖矿目标前，先回地表 + 远距离移动换矿区。
         if (goalOutcomeText != null && !issuedDigStage.isEmpty()
@@ -327,6 +343,13 @@ public final class ProgressionPlanner {
     private record Step(String stage, Kind kind, Intent intent) {
     }
 
+    /** 结果文本是否算"失败"（第十九轮抽出）：目标层与技能层共用同一套关键词。 */
+    private static boolean isFailureText(String text) {
+        return text != null && (text.contains("失败") || text.contains("放弃")
+                || text.contains("超时") || text.contains("不可达") || text.contains("无法")
+                || text.contains("找不到") || text.contains("挖不动"));
+    }
+
     private Step goal(String stage, String action, JsonObject params) {
         return new Step(stage, Kind.GOAL, new Intent("", action, params));
     }
@@ -374,6 +397,7 @@ public final class ProgressionPlanner {
         int rawIron = countItem("raw_iron");
         int ingots = countItem("iron_ingot");
         int diamonds = countItem("diamond");
+        int leather = countItem("leather");
         int food = countFood();
         boolean hasPickaxe = hasUsable("wooden_pickaxe", "stone_pickaxe", "iron_pickaxe",
                 "diamond_pickaxe", "netherite_pickaxe");
@@ -530,6 +554,15 @@ public final class ProgressionPlanner {
             }
         }
 
+        // 5.5) 皮靴顺手做（第十九轮）：打猎顺手攒够 4 张皮革就做皮靴——不限
+        // 群系（皮都到手了，做双靴子不亏），穿戴由生存层护甲逻辑负责（细雪
+        // 地带强制优先皮靴）。受 leather_boots 阶段开关控制：自定义计划关了
+        // 这个阶段就完全不做。放在熔炉之前只是图它便宜（4 张皮、无前置工具），
+        // 没皮时这一段直接跳过、不耽误主线。
+        if (planHas(StagePlan.LEATHER_BOOTS) && leather >= 4 && !hasAny("leather_boots")) {
+            return goal("制作皮靴", "craft", params("item", "leather_boots", "count", 1));
+        }
+
         // 6) 熔炉：冶炼铁必须用，8 个圆石。
         if (planHas(StagePlan.FURNACE) && !hasFurnace && cobble >= 8) {
             return goal("制作熔炉", "craft", params("item", "furnace", "count", 1));
@@ -558,6 +591,19 @@ public final class ProgressionPlanner {
             LOG.info("[AIV][PLAN] " + npc.npcName()
                     + " 采集木头连败，木料安全线临时放行挖矿步骤 | wood=" + wood
                     + " failStreak=" + failStreak);
+        }
+
+        // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
+        // 针叶林等细雪地带时，皮靴从"顺手做"升级为"优先做"——没皮靴在雪地
+        // 里寸步难行（寻路已避开细雪，没靴寸步难行的是探索范围被雪原封死）。
+        // 皮不够就去打猎（hunt 已优先牛、牛肉皮革双收）；连败 2 次退避，
+        // 不许为一双靴子饿死在雪地里。暖区完全不进这一段。
+        if (planHas(StagePlan.LEATHER_BOOTS) && npc.inPowderSnowCountry()
+                && !hasAny("leather_boots") && leather < 4 && hasSword
+                && !(failStreak >= 2 && "找皮革做皮靴".equals(lastFailedStage))) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 细雪地带优先皮靴 | biome="
+                    + npc.biomePath() + " leather=" + leather);
+            return goal("找皮革做皮靴", "hunt", params("count", 2, "radius", 12));
         }
 
         // 7) 煤：火把和燃料。没有煤也能用木板烧，但不能无限烧。

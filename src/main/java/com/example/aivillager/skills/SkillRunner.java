@@ -141,7 +141,7 @@ public final class SkillRunner {
                     return false;
                 }
 
-                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal);
+                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, !npc.wearingLeatherBoots());
                 logPath("goto", goal, result);
                 if (!result.found()) {
                     // 短距离兜底（第六轮补充3）：A* 把流体判不可通行，沼泽/河口地形里
@@ -320,7 +320,7 @@ public final class SkillRunner {
                             + tried + " 棵，先放弃本次");
                     break outer;
                 }
-                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), candidate);
+                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), candidate, !npc.wearingLeatherBoots());
                 logPath("mine-approach", candidate, result);
                 if (result.found()) {
                     target = candidateTarget;
@@ -916,7 +916,7 @@ public final class SkillRunner {
             LOG.info("[AIV][SKILL] " + npc.npcName() + " attack 目标附近没有可站立位置 | target=" + target.getType());
             return false;
         }
-        PathFinder.Result approachPath = PathFinder.find(npc.level(), npc.blockPosition(), approach);
+        PathFinder.Result approachPath = PathFinder.find(npc.level(), npc.blockPosition(), approach, !npc.wearingLeatherBoots());
         logPath("attack-approach", approach, approachPath);
         if (!approachPath.found()) {
             lastOutcome = "attack 找不到接近路径 " + approachPath.detail();
@@ -955,7 +955,7 @@ public final class SkillRunner {
                         if (!npc.isFollowingPath()) {
                             BlockPos chaseGoal = PathFinder.standableGoal(npc.level(), target.blockPosition(), 3);
                             if (chaseGoal != null) {
-                                PathFinder.Result chase = PathFinder.find(npc.level(), npc.blockPosition(), chaseGoal);
+                                PathFinder.Result chase = PathFinder.find(npc.level(), npc.blockPosition(), chaseGoal, !npc.wearingLeatherBoots());
                                 if (chase.found()) {
                                     npc.followPath(chase.path(), true, null, null);
                                 }
@@ -1024,7 +1024,7 @@ public final class SkillRunner {
         // 目标可能悬空（烈焰人、末影龙）：找不到落脚点或路径时不能直接失败，
         // 否则猎杀目标会在"目标在天上"这种情况下被永久跳过。
         PathFinder.Result approachPath = approach == null ? null
-                : PathFinder.find(npc.level(), npc.blockPosition(), approach);
+                : PathFinder.find(npc.level(), npc.blockPosition(), approach, !npc.wearingLeatherBoots());
         if (approachPath != null) {
             logPath("slay-approach", approach, approachPath);
         }
@@ -1066,7 +1066,7 @@ public final class SkillRunner {
                                     target.blockPosition(), 2);
                             if (chaseGoal != null) {
                                 PathFinder.Result chase = PathFinder.find(npc.level(),
-                                        npc.blockPosition(), chaseGoal);
+                                        npc.blockPosition(), chaseGoal, !npc.wearingLeatherBoots());
                                 if (chase.found()) {
                                     npc.followPath(chase.path(), true, null, null);
                                     return;
@@ -1209,7 +1209,7 @@ public final class SkillRunner {
                 BlockPos goal = new BlockPos((int) Math.floor(targetX),
                         (int) Math.floor(targetY), (int) Math.floor(targetZ));
                 PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(),
-                        goal, 24000);
+                        goal, 24000, !npc.wearingLeatherBoots());
                 if (result.found()) {
                     noPathRounds = 0;
                     npc.followPath(result.path(), true, null, null);
@@ -1961,7 +1961,7 @@ public final class SkillRunner {
                 if (ticks % 10 != 1 && ticks > 1) {
                     return;
                 }
-                PathFinder.Result result = PathFinder.find(npc.level(), feet, target, 4000);
+                PathFinder.Result result = PathFinder.find(npc.level(), feet, target, 4000, !npc.wearingLeatherBoots());
                 if (result.found()) {
                     npc.followPath(result.path(), false, null, null);
                 } else {
@@ -2185,6 +2185,18 @@ public final class SkillRunner {
             LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 附近没有动物 | radius=" + radius);
             return false;
         }
+        // 【第十九轮】皮革未攒够 4 张时优先打牛（Fong：找食物打猎时牛兼顾皮革
+        // 来源，攒皮做皮靴）。上层（GoalExecutor.tickHunt）按皮革存量传 prefer=cow；
+        // 附近有牛先打牛，没有牛照旧打最近的，不为皮革饿着。
+        if ("cow".equals(intent.param("prefer", ""))) {
+            List<Entity> cows = candidates.stream()
+                    .filter(e -> "cow".equals(net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
+                            .getKey(e.getType()).getPath()))
+                    .toList();
+            if (!cows.isEmpty()) {
+                candidates = cows;
+            }
+        }
         LivingEntity target = (LivingEntity) candidates.stream()
                 .min((left, right) -> Double.compare(npc.distanceToSqr(left), npc.distanceToSqr(right)))
                 .orElseThrow();
@@ -2193,7 +2205,7 @@ public final class SkillRunner {
             lastOutcome = "hunt 目标附近没有可站立位置 target=" + target.getType();
             return false;
         }
-        PathFinder.Result approachPath = PathFinder.find(npc.level(), npc.blockPosition(), approach);
+        PathFinder.Result approachPath = PathFinder.find(npc.level(), npc.blockPosition(), approach, !npc.wearingLeatherBoots());
         logPath("hunt-approach", approach, approachPath);
         if (!approachPath.found()) {
             lastOutcome = "hunt 找不到接近路径 " + approachPath.detail();
@@ -2229,7 +2241,7 @@ public final class SkillRunner {
                         if (!npc.isFollowingPath()) {
                             BlockPos chaseGoal = PathFinder.standableGoal(npc.level(), target.blockPosition(), 3);
                             if (chaseGoal != null) {
-                                PathFinder.Result chase = PathFinder.find(npc.level(), npc.blockPosition(), chaseGoal);
+                                PathFinder.Result chase = PathFinder.find(npc.level(), npc.blockPosition(), chaseGoal, !npc.wearingLeatherBoots());
                                 if (chase.found()) {
                                     npc.followPath(chase.path(), true, null, null);
                                 }
@@ -2326,7 +2338,7 @@ public final class SkillRunner {
                     BlockPos goal = PathFinder.standableGoal(npc.level(), BlockPos.containing(
                             playerLocation.getX(), playerLocation.getY(), playerLocation.getZ()), 3);
                     if (goal != null) {
-                        PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal);
+                        PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, !npc.wearingLeatherBoots());
                         logPath("follow", goal, result);
                         if (result.found()) {
                             npc.followPath(result.path(), true, null, null);
@@ -2376,7 +2388,7 @@ public final class SkillRunner {
             finish(id, "fillbucket", "水源附近没有可站立位置");
             return true;
         }
-        PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand);
+        PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand, !npc.wearingLeatherBoots());
         logPath("fillbucket", stand, path);
         if (!path.found()) {
             // A* 找不到路径（地下洞穴被墙堵死）：启动挖路模式，
@@ -2533,7 +2545,7 @@ public final class SkillRunner {
             finish(id, "castobsidian", "岩浆旁没有落脚点");
             return true;
         }
-        PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand);
+        PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand, !npc.wearingLeatherBoots());
         logPath("castobsidian", stand, path);
         if (!path.found()) {
             finish(id, "castobsidian", "无法接近岩浆 " + path.detail());

@@ -10,6 +10,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -694,6 +695,29 @@ public final class FakePlayerBody extends ServerPlayer {
      *
      * @return 是否挖掉；缺少必需工具时返回 false（不白挖）
      */
+    /** 脚上穿的是不是皮靴（第十九轮）：原版只有皮靴能防细雪下陷。 */
+    public boolean wearingLeatherBoots() {
+        return this.getItemBySlot(EquipmentSlot.FEET).is(Items.LEATHER_BOOTS);
+    }
+
+    /** 当前所在群系的路径名（如 snowy_plains）；取不到返回空串。 */
+    public String biomePath() {
+        return this.level().getBiome(this.blockPosition()).unwrapKey()
+                .map(key -> key.identifier().getPath()).orElse("");
+    }
+
+    /**
+     * 是否身处"细雪地带"（第十九轮，Fong 拍板）：雪原/针叶林及山地细雪群系。
+     * 皮靴的优先制作、护甲层"不许把皮靴换成铁靴"都按这个判定走；
+     * 沙漠/平原等暖区返回 false，那里的 NPC 不会被逼着先找牛做靴子。
+     */
+    public boolean inPowderSnowCountry() {
+        String biome = biomePath();
+        return biome.contains("snow") || biome.contains("taiga")
+                || biome.equals("grove") || biome.equals("jagged_peaks")
+                || biome.equals("frozen_peaks") || biome.equals("ice_spikes");
+    }
+
     public boolean mineWithBestTool(BlockPos pos) {
         BlockState state = this.level().getBlockState(pos);
         if (state.isAir()) {

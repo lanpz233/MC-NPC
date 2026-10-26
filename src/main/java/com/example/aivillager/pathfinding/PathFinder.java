@@ -85,11 +85,22 @@ public final class PathFinder {
         return find(level, start, goal, DEFAULT_MAX_NODES);
     }
 
+    /** 带细雪规避的寻路（第十九轮）：avoidPowderSnow=true 时细雪格一律不踩。 */
+    public static Result find(BlockGetter level, BlockPos start, BlockPos goal,
+                              boolean avoidPowderSnow) {
+        return find(level, start, goal, DEFAULT_MAX_NODES, avoidPowderSnow);
+    }
+
     /**
      * 从 start 搜到 goal。start/goal 会先被修正到最近的合法落脚点，
      * 因为模型给的坐标、以及实体自身位置，都可能落在半空或方块内部。
      */
     public static Result find(BlockGetter level, BlockPos start, BlockPos goal, int maxNodes) {
+        return find(level, start, goal, maxNodes, false);
+    }
+
+    public static Result find(BlockGetter level, BlockPos start, BlockPos goal, int maxNodes,
+                              boolean avoidPowderSnow) {
         long begin = System.nanoTime();
 
         // 起点解析放宽（第五轮修复）：NPC 可能正站在树冠/细雪这类
@@ -105,6 +116,29 @@ public final class PathFinder {
         BlockPos safeGoal = nearestStandable(level, goal, 2);
         if (safeGoal == null) {
             return new Result(List.of(), 0, elapsedMillis(begin), "终点不可站立 " + goal.toShortString());
+        }
+        // 【第十九轮】细雪规避（Fong 拍板，推翻第三轮"细雪可走、只是贵"）：
+        // 没穿皮靴时细雪按"避开"处理——终点本身落在细雪里就近挪到雪外落脚点，
+        // 挪不到就如实失败让上层换目标，绝不规划一条趟雪的路。
+        if (avoidPowderSnow && isPowderSnow(level, safeGoal)) {
+            BlockPos outside = null;
+            outer:
+            for (int r = 1; r <= 3 && outside == null; r++) {
+                for (int dx = -r; dx <= r; dx++) {
+                    for (int dz = -r; dz <= r; dz++) {
+                        BlockPos cand = nearestStandable(level, safeGoal.offset(dx, 0, dz), 2);
+                        if (cand != null && !isPowderSnow(level, cand)) {
+                            outside = cand;
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (outside == null) {
+                return new Result(List.of(), 0, elapsedMillis(begin),
+                        "终点在细雪中且未穿皮靴 " + goal.toShortString());
+            }
+            safeGoal = outside;
         }
 
         long startKey = safeStart.asLong();
@@ -154,10 +188,12 @@ public final class PathFinder {
                     continue;
                 }
 
-                double stepCost = (diagonal ? DIAGONAL_COST : 1.0D) + verticalCost(next.getY() - current.pos().getY());
-                if (isPowderSnow(level, next)) {
-                    stepCost += POWDER_SNOW_COST;
+                // 【第十九轮】规避模式下细雪格直接不踩（宁可绕远/无路）；
+                // 穿皮靴时按原版机制正常踩过，不加任何代价。
+                if (isPowderSnow(level, next) && avoidPowderSnow) {
+                    continue;
                 }
+                double stepCost = (diagonal ? DIAGONAL_COST : 1.0D) + verticalCost(next.getY() - current.pos().getY());
                 double tentative = current.g() + stepCost;
                 Double known = gScore.get(nextKey);
                 if (known != null && known <= tentative) {
@@ -280,20 +316,17 @@ public final class PathFinder {
     }
 
     /**
-     * 细雪（powder snow）单独处理，不再算"不可通行"（第三轮长跑短验实测）：
-     * 出生点落在雪原时，NPC 脚格就是细雪——旧判定让 A* 连起点都拒绝（0 节点），
-     * 所有计划瞬间失败，身体层脱困又只在行走中触发，于是永久卡死、零位移。
-     * 真人玩家陷在细雪里是可以趟出来的（只是慢），所以这里改成"可通行但贵"：
-     * 踩进细雪格加一大笔代价（见 find 里的 POWDER_SNOW_COST），寻路会优先绕开，
-     * 只有没别的路时才趟雪脱困。细雪本身没有碰撞体积，isPassable 天然放行；
-     * 脚下支撑仍要求实心地面，悬空的细雪不会被当成落脚点。
+     * 细雪（powder snow）判定。处理口径（第十九轮，Fong 拍板，推翻第三轮
+     * "可通行但贵"）：没穿皮靴时寻路一律避开（见 find 的 avoidPowderSnow），
+     * 宁可绕远或无路，也不许再出现陷进细雪反复挣扎（雪原第一遍卡 58 次的
+     * 背景正是旧设定）；已经陷住的由生存层挖出/垫出脱困（powder-snow-escape）。
+     * 穿皮靴后按原版机制正常踩过。起点豁免仍在：NPC 正站在细雪里时 A* 以
+     * 当前格为起点照常展开（起点不是"踩进去"的邻格），先走到雪外再说。
+     * 细雪本身没有碰撞体积，isPassable 天然放行；脚下支撑仍要求实心地面。
      */
     private static boolean isPowderSnow(BlockGetter level, BlockPos pos) {
         return level.getBlockState(pos).is(Blocks.POWDER_SNOW);
     }
-
-    /** 趟细雪一步的额外代价：约等于多走 8 格，足够让 A* 优先选裸地。 */
-    private static final double POWDER_SNOW_COST = 8.0D;
 
     /**
      * 把一个水平邻格修正到"能站的那一层"：先试同层，再逐层向下，最后试上 1 格。
