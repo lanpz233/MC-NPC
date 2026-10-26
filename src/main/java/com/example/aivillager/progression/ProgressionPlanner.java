@@ -671,6 +671,14 @@ public final class ProgressionPlanner {
             return goal("补圆石做熔炉", "dig", params("resource", "stone", "count", 8));
         }
 
+        // 5.6) 【fix39·夜晚总闸】夜里先搭棚再谈补给（审计第 3 环：长跑#12
+        // 两死皆夜间地表补给——小屋原排第 14 步、主线没走完轮不到，夜里照样
+        // 被派去地表打猎砍树）。与步 14 同条件、排位提前到木料/口粮补给步
+        // 之前；步 14 保留作主线走完后的兜底。
+        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25) {
+            return goal("夜间小屋", "build", params("structure", "shelter"));
+        }
+
         // 6.5) 木料安全线（第三轮修复 E 前半，StagePlan.WOOD_RESERVE）：下矿之前先看木料。
         // 长跑实测的死结：地下把原木/木板/木棍用光 → 镐一坏就造不出新工具 → 回地表又在
         // 没树的山顶小范围内打转。这里把"先补给再下矿"钉成硬规矩：一旦木料（原木等价，
@@ -704,9 +712,17 @@ public final class ProgressionPlanner {
             if (underground()) {
                 return skill("补随身口粮", "ascend");
             }
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 随身口粮见底，先补口粮 | foodNutrition=0");
-            return goal("补随身口粮", "hunt",
-                    params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+            // 【fix39·夜晚总闸】夜里在地表不为补口粮远行打猎（#12 两死型）：
+            // 未挨饿（foodLevel>6）时跳过 hunt，落到冶炼/合成/下矿等原地或
+            // 地下步骤；真饿了照旧先补给——饿死比夜怪更确定。
+            if (isNight() && npc.getFoodData().getFoodLevel() > 6) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 口粮 hunt 夜里跳过（夜晚总闸） | foodLevel="
+                        + npc.getFoodData().getFoodLevel());
+            } else {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 随身口粮见底，先补口粮 | foodNutrition=0");
+                return goal("补随身口粮", "hunt",
+                        params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+            }
         }
 
         // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
@@ -1001,8 +1017,14 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.FOOD) && hasSword
                 && (foodNutrition() < FOOD_RESERVE_NUTRITION
                     || countFood() < FOOD_RESERVE_PORTIONS)) {
-            return goal("储备食物", "hunt",
-                    params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
+            // 【fix39·夜晚总闸】储备是顺路型软向导：夜里地表不为囤食远行打
+            // 猎，落到补仓/维持步，天亮再补。挨饿急救走步 0/6.6，不经这里。
+            if (isNight() && !underground()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 食物储备 hunt 夜里跳过（夜晚总闸） | foodNutrition=" + foodNutrition());
+            } else {
+                return goal("储备食物", "hunt",
+                        params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
+            }
         }
 
         // 13.3) 常备补仓（【fix38】顺路型软向导，Fong 04:11/04:14）：主线步骤都
@@ -1010,7 +1032,9 @@ public final class ProgressionPlanner {
         // （生铁+铁锭）补到 INGOT_RESERVE_TARGET。只填空档、永不挡主线；
         // 下潜硬门（木料安全线/口粮门/铁镐耐久门）在各自位置另行把关，
         // 与补仓互不替代。挖铁补仓单趟封顶 16，防一趟挖太久变相常驻。
-        if (planHas(StagePlan.WOOD_RESERVE) && logs < LOG_RESERVE_TARGET && !underground()) {
+        // 【fix39·夜晚总闸】原木补仓同为顺路型：夜里地表跳过，天亮再补；
+        // 挖铁补仓走地下、不受影响。
+        if (planHas(StagePlan.WOOD_RESERVE) && logs < LOG_RESERVE_TARGET && !underground() && !isNight()) {
             return gatherLogs("原木常备补仓");
         }
         if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < INGOT_RESERVE_TARGET

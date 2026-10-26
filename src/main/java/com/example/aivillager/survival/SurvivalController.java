@@ -144,6 +144,10 @@ public final class SurvivalController {
     private int fleeCooldown;
     /** 是否处于逃跑状态（没有威胁后清除），目标层据此暂停推进。 */
     private boolean fleeing;
+    /** 【fix39】逃跑记忆：正在逃的威胁本体。8 格扫描圈外不等于脱离（僵尸
+     * 仇恨 40 格）——28 格（远程 36 格）安全圈内仍按威胁处理，防逃出扫描圈
+     * 就清状态、目标层领着 NPC 往回走迎头相撞（#11/#12 逃跑 yo-yo 定因）。 */
+    private LivingEntity fleeThreatRef;
     /** 暂时无视的威胁：实体 UUID → 解除无视的时间戳（毫秒）。 */
     private final java.util.Map<java.util.UUID, Long> ignoredThreats = new java.util.HashMap<>();
     /**
@@ -725,7 +729,15 @@ public final class SurvivalController {
     private boolean defend() {
         LivingEntity threat = findThreat();
         if (threat == null) {
+            if (fleeing && fleeThreatRef != null) {
+                // 【fix39】脱离留痕：验收按这行看逃跑是否真拉开到安全圈外。
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 脱离成功 | threat=" + fleeThreatRef.getType()
+                        + " 距离=" + (fleeThreatRef.isAlive()
+                            ? String.format(Locale.ROOT, "%.1f", Math.sqrt(npc.distanceToSqr(fleeThreatRef)))
+                            : "已死亡"));
+            }
             fleeing = false;
+            fleeThreatRef = null;
             fleeCooldown = 0;
             resetStraightFlee();
             if (chasing) {
@@ -747,7 +759,8 @@ public final class SurvivalController {
         // 玩家遇到苦力怕会先拉开距离。跑不掉（矿道尽头/无路径）时不进入逃跑状态，
         // 落到下面的近战逻辑——总比站在原地等爆炸强。
         if (threat instanceof net.minecraft.world.entity.monster.Creeper && distanceSq < 49.0D) {
-            if (fleeCooldown <= 0) {
+            // 【fix39】苦力怕同理加 pathDone 豁免：路径走完立刻续跑，不等冷却。
+            if (fleeCooldown <= 0 || (fleeing && !npc.isWalking() && !npc.isFollowingPath())) {
                 // 一秒后才能再规划一次逃跑路径，避免每 0.5 秒跑一次 A*。
                 fleeCooldown = 20;
                 // 顺序不能反：必须先停技能再铺逃跑路径。
@@ -782,7 +795,11 @@ public final class SurvivalController {
         // 并用加长档（28/22/16/10）先脱离射程；甲厚血足仍可按原逻辑压上。
         boolean rangedStandOff = isRangedThreat(threat) && distanceSq > ATTACK_RANGE_SQ
                 && !(npc.getArmorValue() >= 8 && npc.getHealth() > LOW_HEALTH_THRESHOLD);
-        if (!canEngage(npc.getHealth(), hasWeaponOrArmor()) || rangedStandOff) {
+        // 【fix39】逃跑未脱离时不许半路改主意回头追击：血回过惜命线（回血）
+        // 但怪还在安全圈内、又没贴脸时，继续把这一程跑完再说。
+        boolean stillFleeing = fleeing && threat == fleeThreatRef
+                && distanceSq > ATTACK_RANGE_SQ;
+        if (!canEngage(npc.getHealth(), hasWeaponOrArmor()) || rangedStandOff || stillFleeing) {
             if (!"idle".equals(skills.currentSkill())) {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能逃跑（惜命） | threat=" + threat.getType()
                         + " skill=" + skills.currentSkill() + " hp=" + npc.getHealth()
@@ -797,7 +814,11 @@ public final class SurvivalController {
             // 长跑#8 F 段实证旧节奏是灾难：逃跑失败每约 20 秒才重试一次，其余
             // 时间原地挨箭，直到被掠夺者射杀（第 4 次死亡，hpPrev=2.2）。
             boolean straightRetry = straightFleeEngaged && fleeing && !npc.isWalking();
-            if (fleeCooldown <= 0 || straightRetry) {
+            // 【fix39】无停顿重规划：A* 主路走完也立刻续跑，不等 cooldown——
+            // 旧节奏每 16 格停 0~2 秒，怪是连续移动的，停顿期正好被贴脸
+            // （#11/#12 四死 fleeing=true 的主因）。
+            boolean pathDone = fleeing && !npc.isWalking() && !npc.isFollowingPath();
+            if (fleeCooldown <= 0 || straightRetry || pathDone) {
                 fleeCooldown = 40;
                 if (flee(threat, rangedStandOff)) {
                     fleeing = true;
@@ -932,6 +953,7 @@ public final class SurvivalController {
      *                 弩/弓的射程和视线（第二十一轮），必须跑得更远才算脱离。
      */
     private boolean flee(LivingEntity threat, boolean extended) {
+        fleeThreatRef = threat;
         double dx = npc.getX() - threat.getX();
         double dz = npc.getZ() - threat.getZ();
         double length = Math.sqrt(dx * dx + dz * dz);
@@ -955,7 +977,12 @@ public final class SurvivalController {
             // standableGoal 只在目标那一列上下找：矿道里逃跑方向那一列多半是实心石，
             // 纵向翻遍也找不到能站的格（实测三档全灭）。补一圈横向搜索：
             // 以目标列为中心、半径 3 内逐列试，矿道横截面就这么宽，总有一列是通道。
+            // 【fix39】落点避流体（沼泽定因）：干落点优先——候选格本身或四邻
+            // 有流体的记为湿落点兜底，整圈搜完没有干的才用湿的（沼泽全是水
+            // 时不至于无路可逃）；旧版拿第一个能站的点，常贴着水边、直线兜底
+            // 再走进水里被史莱姆入水追杀。
             BlockPos goal = null;
+            BlockPos wetGoal = null;
             outer:
             for (int r = 0; r <= 3; r++) {
                 for (int ox = -r; ox <= r; ox++) {
@@ -963,12 +990,22 @@ public final class SurvivalController {
                         if (Math.max(Math.abs(ox), Math.abs(oz)) != r) {
                             continue;
                         }
-                        goal = PathFinder.standableGoal(npc.level(), desired.offset(ox, 0, oz), 4);
-                        if (goal != null) {
+                        BlockPos candidate = PathFinder.standableGoal(npc.level(), desired.offset(ox, 0, oz), 4);
+                        if (candidate == null) {
+                            continue;
+                        }
+                        if (!fluidAdjacent(candidate)) {
+                            goal = candidate;
                             break outer;
+                        }
+                        if (wetGoal == null) {
+                            wetGoal = candidate;
                         }
                     }
                 }
+            }
+            if (goal == null) {
+                goal = wetGoal;
             }
             if (goal == null) {
                 diag.append(distance).append("格:无可站立点 ");
@@ -1043,6 +1080,19 @@ public final class SurvivalController {
         return true;
     }
 
+    /** 【fix39】落点是否贴水：本格或四邻同层有流体（逃跑落点避流体用）。 */
+    private boolean fluidAdjacent(BlockPos pos) {
+        if (!npc.level().getFluidState(pos).isEmpty()) {
+            return true;
+        }
+        for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+            if (!npc.level().getFluidState(pos.relative(dir)).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 直线脱离兜底状态清零：A* 逃跑成功、无威胁、兜底放弃时调用。 */
     private void resetStraightFlee() {
         straightFleeEngaged = false;
@@ -1089,6 +1139,16 @@ public final class SurvivalController {
                     && isRangedThreat(hurter) && npc.distanceToSqr(hurter) <= 32.0D * 32.0D) {
                 ignoredThreats.remove(hurter.getUUID());
                 return hurter;
+            }
+            // 【fix39】逃跑记忆兜底：正在逃的怪出了 8 格扫描圈、但还在安全圈
+            // （近战 28 格/远程 36 格）内，仍按威胁返回——逃跑不中断，直到
+            // 真正拉开距离才脱离（拉黑表对它不适用：desperate 路径已先清
+            // fleeing，记忆不会把被无视的怪复活）。
+            if (fleeing && fleeThreatRef != null && fleeThreatRef.isAlive()) {
+                double safeSq = isRangedThreat(fleeThreatRef) ? 36.0D * 36.0D : 28.0D * 28.0D;
+                if (npc.distanceToSqr(fleeThreatRef) <= safeSq) {
+                    return fleeThreatRef;
+                }
             }
         }
         return best;
@@ -1355,9 +1415,21 @@ public final class SurvivalController {
      */
     private int weaponScoreCapped(ItemStack stack) {
         int score = weaponScore(stack);
-        if (score > 0 && stack.isDamageableItem()
+        if (score <= 0) {
+            return score;
+        }
+        if (stack.isDamageableItem()
                 && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
-            return 1;
+            score = 1;
+        }
+        // 【fix39】武器类别权重：剑/斧是正经武器、永远排在镐/锹前面（退役
+        // 压分在类别内生效）——沼泽实证：退役木剑评分 1 输给健康木镐 2，
+        // NPC 拿镐打蜘蛛、剑镐先后打碎。类别 +100 后：退役剑 101 > 健康镐
+        // 2；同类内健康件仍压退役件。
+        String path = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                .getKey(stack.getItem()).getPath();
+        if (path.endsWith("_sword") || path.endsWith("_axe")) {
+            score += 100;
         }
         return score;
     }
