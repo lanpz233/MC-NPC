@@ -850,6 +850,20 @@ public final class FakePlayerBody extends ServerPlayer {
                 stoneSlot = slot;
             }
         }
+        // 【第三十六轮】石镐断供时不许拿高级镐顶普通石头（allowLastResort=false
+        // 的脱困类路径）：长跑#12 两度实证——石镐在长掘进里烧成退役壳后，
+        // ascend 回地表一路用铁镐挖普通石头（铁镐 250→60、60→16 的主烧段）。
+        // fix33 的 false 只挡"烧退役壳"，没挡"烧好镐"：评分里铁镐是唯一
+        // 未退役的合法候选。这类路径（ascend）设计上就该素手：方块石镐能采、
+        // 包里又没可用石镐时，直接走 mineBareHand（无掉落脱困、零耐久），
+        // 把"补石镐"留给规划器在决策点处理。需要高级镐的方块（钻石矿等，
+        // 石镐探针 isCorrectToolForDrops=false）不受影响，照常落回评分。
+        if (stoneSlot < 0 && !allowLastResort
+                && new ItemStack(Items.STONE_PICKAXE).isCorrectToolForDrops(state)) {
+            log(npcName, "mine-barehand-fallback", "无可用石镐，素手挖 "
+                    + state.getBlock() + "（不烧高级镐） " + pos.toShortString());
+            return mineBareHand(pos);
+        }
         int bestSlot = stoneSlot;
         int bestScore = stoneSlot >= 0 ? Integer.MAX_VALUE : -1;
         // 第一遍：优先选耐久充足的（留最后 1 点不用，避免工具瞬间碎掉后无可用工具）。
