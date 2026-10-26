@@ -58,9 +58,25 @@ public final class ProgressionPlanner {
      * 低于它就先补给再下矿，避免"地下断木→工具坏→造不出"的死结。
      */
     private static final int WOOD_SAFETY_MIN = 12;
-    /** 【第二十二轮】煤存量线：一轮冶炼（8 锭≈1 煤）+火把余量，挖煤按存量停（Fong 18:49）。 */
-    private static final int COAL_STOCK_TARGET = 8;
-    /** 【第二十二轮】下矿口粮线（Fong 18:51）：按食物总营养值计，24≈3 块牛排（Wiki 营养值牛排 8）。 */
+    /**
+     * 【fix38·Fong 04:11/04:13/04:14 定版】常备储备向导值——全部是"顺路型"软向导
+     * （顺路补、够了停、急用优先），不是开工条件：只有安全类门槛（WOOD_SAFETY_MIN、
+     * MINING_FOOD_NUTRITION、铁镐总耐久门）保留硬性。旧 COAL_STOCK_TARGET=8 的
+     * 常驻挖煤目标已按 04:14 拆除（#11 挖煤常驻饿死冶炼的病根正是硬目标）。
+     */
+    /** 补仓触发批量线：无即时需求时，生铁攒到这个数才开炉批量烧（04:13）。 */
+    private static final int RAW_IRON_BATCH = 32;
+    /** 铁锭常备向导：补仓触发把铁锭补回这个数（04:11）。 */
+    private static final int INGOT_RESERVE_TARGET = 32;
+    /** 原木常备向导：实物计数 ~32 根，低优先补仓步补（04:11）。 */
+    private static final int LOG_RESERVE_TARGET = 32;
+    /** 煤顺手采集上限向导：掘进顺手挖煤，存量到这个数就跳过省镐耐久（04:14）。 */
+    private static final int COAL_OPPORTUNISTIC_CAP = 64;
+    /** 熟食储备向导：总营养（顺路型，与 24 的安全型口粮门分开）。 */
+    private static final int FOOD_RESERVE_NUTRITION = 40;
+    /** 熟食储备向导：食物总份数余量（顺路型）。 */
+    private static final int FOOD_RESERVE_PORTIONS = 8;
+    /** 【第二十二轮】下矿口粮线（Fong 18:51）：按食物总营养值计，24≈3 块牛排（Wiki 营养值牛排 8）。安全型硬门。 */
     private static final int MINING_FOOD_NUTRITION = 24;
     /** 【第二十二轮】皮革目标存量：一双皮靴 4 张（Wiki 皮革词条：牛等 0–2/只、平均 1）。 */
     private static final int LEATHER_STOCK_TARGET = 4;
@@ -716,9 +732,28 @@ public final class ProgressionPlanner {
         // 玩家是有料先炼、先把铁镐铁剑做出来再去挖新的，这里把转化口钉在挖矿之前。
         // 燃料口径不变：规划层 canFuel 与执行层 pickFuel 都认煤/木炭/木板/原木/木棍，
         // #11 不是"木头不算燃料"，是根本轮不到冶炼这一步。
-        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && ingots < 4 && hasFurnace && canFuel()) {
-            return goal("冶炼铁锭", "smelt",
-                    params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+        // 【fix38·Fong 04:13】触发改双路径并分别记账：需求触发（急用先烧、有几块烧
+        // 几块）与补仓触发（无急用时生铁攒到 RAW_IRON_BATCH 批量烧、铁锭补回常备线；
+        // 另设低位维持小批量）。批量是习惯不是门槛，见 smelt 触发= 日志行对账。
+        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && hasFurnace && canFuel()) {
+            if (ingots < 4) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand | ingots=" + ingots
+                        + " rawIron=" + rawIron);
+                return goal("冶炼铁锭", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (rawIron >= RAW_IRON_BATCH && ingots < INGOT_RESERVE_TARGET) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=restock | rawIron=" + rawIron
+                        + " ingots=" + ingots + " 目标=" + INGOT_RESERVE_TARGET);
+                return goal("冶炼铁锭（补仓）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (ingots < 8 && rawIron >= 8) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=restock-low | rawIron=" + rawIron
+                        + " ingots=" + ingots);
+                return goal("冶炼铁锭（补仓）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8 - ingots, rawIron)));
+            }
         }
 
         // 8) 铁制装备（原第 10 步，【第三十四轮】随冶炼一并提前到挖煤/挖铁之前）：
@@ -747,6 +782,8 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.IRON_GEAR)
                 && !hasAny("iron_chestplate", "diamond_chestplate", "netherite_chestplate")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁胸甲 | ingots=" + ingots
+                        + " rawIron=" + rawIron);
                 return goal("冶炼铁锭（铁胸甲）", "smelt",
                         params("item", "iron_ingot", "count", Math.min(8, rawIron)));
             }
@@ -759,6 +796,8 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.IRON_GEAR)
                 && !hasAny("iron_helmet", "diamond_helmet", "netherite_helmet")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁头盔 | ingots=" + ingots
+                        + " rawIron=" + rawIron);
                 return goal("冶炼铁锭（铁头盔）", "smelt",
                         params("item", "iron_ingot", "count", Math.min(8, rawIron)));
             }
@@ -771,6 +810,8 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.IRON_GEAR)
                 && !hasAny("iron_leggings", "diamond_leggings", "netherite_leggings")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁护腿 | ingots=" + ingots
+                        + " rawIron=" + rawIron);
                 return goal("冶炼铁锭（铁护腿）", "smelt",
                         params("item", "iron_ingot", "count", Math.min(8, rawIron)));
             }
@@ -783,6 +824,8 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.IRON_GEAR)
                 && !hasAny("iron_boots", "diamond_boots", "netherite_boots")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁靴 | ingots=" + ingots
+                        + " rawIron=" + rawIron);
                 return goal("冶炼铁锭（铁靴）", "smelt",
                         params("item", "iron_ingot", "count", Math.min(8, rawIron)));
             }
@@ -792,16 +835,19 @@ public final class ProgressionPlanner {
             return goal("挖铁（铁靴）", "dig",
                     params("resource", "iron", "count", Math.max(1, 4 - ingots - rawIron)));
         }
-        // 9) 煤（原第 7 步，【第三十四轮】顺延到冶炼/铁装备之后）：火把和燃料。没有煤也能用木板烧，但不能无限烧。
-        // 连续两次挖煤失败 = 当前矿层确实没有煤（实测 Y=16 连挖两条 24 格矿道都是 0）。
-        // 玩家这时会改用木板/木炭当燃料，而不是永远卡在"煤不足"这一条上；
-        // 跳过煤以后，后面的铁装备、砍木头补木棍都能继续推进，过一阵带退避再回来挖。
-        boolean coalStarved = failStreak >= 2 && "挖煤".equals(lastFailedStage);
-        // 【第二十二轮】挖煤改存量驱动：补到 COAL_STOCK_TARGET 为止（够一轮冶炼+火把），
-        // 不再固定 count=4 挖完就走、下一轮又因 coal<4 被派回来。
-        if (planHas(StagePlan.COAL) && coal < COAL_STOCK_TARGET && hasStonePickaxe && !coalStarved) {
-            return goal("挖煤", "dig",
-                    params("resource", "coal", "count", COAL_STOCK_TARGET - coal));
+        // 9) 煤（原第 7 步，【第三十四轮】顺延到冶炼/铁装备之后）。
+        // 【fix38·Fong 04:14】拆除常驻挖煤目标：煤是顺路型储备——掘进时看到裸露煤
+        // 顺手挖（技能层 strip 顺手扫描，存量近 COAL_OPPORTUNISTIC_CAP 就跳过省
+        // 镐耐久），规划层不再为凑煤立项。#11 的病根正是"挖煤存量目标常驻、把
+        // 冶炼/铁装备饿死"，硬目标思维勿重蹈。这里只留燃料告急兜底（安全型）：
+        // 煤与木炭皆 0（coal 计数已含木炭）、木燃料当量也将尽时，才许挖一小批
+        // 煤自救，脱离告急即停。连续两次失败 = 当前矿层确实没有煤，退避让路
+        // （玩家这时会改烧木炭，而不是永远卡在"煤不足"上）。
+        boolean coalStarved = failStreak >= 2 && lastFailedStage != null
+                && (lastFailedStage.equals("挖煤") || lastFailedStage.startsWith("燃料告急"));
+        if (planHas(StagePlan.COAL) && coal == 0 && wood < 16 && hasStonePickaxe && !coalStarved) {
+            return goal("燃料告急挖煤", "dig",
+                    params("resource", "coal", "count", 16));
         }
 
         // 10) 铁矿石（原第 8 步，【第三十四轮】顺延）：石镐就能挖，Y=16 附近最密集。
@@ -837,9 +883,24 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.IRON_ORE) && ingots < 8 && hasStonePickaxe && rawIron == 0 && diamonds >= 3) {
             return goal("继续挖铁", "dig", params("resource", "iron", "count", 4));
         }
-        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && hasFurnace && canFuel()) {
+        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && ingots < INGOT_RESERVE_TARGET
+                && hasFurnace && canFuel()) {
+            // 【fix38】归入补仓路径记账：铁消费步都走完后，把手头生铁继续烧向常备线，
+            // 烧满 INGOT_RESERVE_TARGET 就停（多余的生铁留作生铁形态，不浪费燃料）。
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=restock | rawIron=" + rawIron
+                    + " ingots=" + ingots + " 目标=" + INGOT_RESERVE_TARGET);
             return goal("继续冶炼", "smelt",
                     params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+        }
+
+        // 12.5) 烤肉前置（【fix38】，原步 13 位于钻石段之后）：有生肉+熔炉+燃料
+        // 就先烤——熟肉营养是生肉两倍以上，能把口粮需求砍半的加工步骤不能被它
+        // 服务的下矿口粮门挡在后面（#12 实证卡点）。转化手头存货不算追储备，
+        // 与冶炼补仓同理，位置放在钻石段之前、补给区之首。
+        String rawMeatEarly = firstRawMeat();
+        if (planHas(StagePlan.FOOD) && rawMeatEarly != null && hasFurnace && canFuel()) {
+            return goal("烤肉", "smelt",
+                    params("item", cookedOf(rawMeatEarly), "count", 8));
         }
 
         // 13) 钻石：铁镐才能挖，Y=-54 附近最多。
@@ -863,6 +924,8 @@ public final class ProgressionPlanner {
                             params("item", "iron_pickaxe", "count", usableIronPickaxes + 1));
                 }
                 if (rawIron > 0 && hasFurnace && canFuel()) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=钻石前补镐 | ingots=" + ingots
+                            + " rawIron=" + rawIron);
                     return goal("挖钻石前炼铁补镐", "smelt",
                             params("item", "iron_ingot", "count", Math.min(8, rawIron)));
                 }
@@ -872,6 +935,13 @@ public final class ProgressionPlanner {
             if (foodGate != null) {
                 return foodGate;
             }
+            // 【fix38】下潜预算一次查齐留痕（安全型硬门汇总）：口粮已由上方
+            // miningFoodGate 把关，这里把木料当量/煤/铁镐耐久一并打印，
+            // 验收按 descent-budget 行对账，不再逐项猜卡点。
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " descent-budget | food=" + foodNutrition()
+                    + "/" + MINING_FOOD_NUTRITION + " wood=" + wood + " coal=" + coal
+                    + " ironPickDurability=" + ironPickDurability + "/250"
+                    + " stonePickaxes=" + stonePickaxes);
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
         if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
@@ -921,21 +991,33 @@ public final class ProgressionPlanner {
         // 13.0) 弓与箭挪到传送门准备之后（见 13.2）：
         // 蜘蛛只在夜晚出没，先凑弓弦会让白天的整条下线主链（下界→末影珍珠）全堵在后面。
 
-        // 13) 食物储备：有剑以后打猎，再用熔炉把生肉烤熟（熟肉回复量更高）。
-        // 【第二十二轮】改存量驱动——按食物总营养值达到下矿口粮线（24）停，
-        // 不再"打 2 只就收工"；【第二十四轮】去掉旧版 foodLevel<16 的饥饿条
-        // 门槛：储备看的是背包存量，饥饿条满格时包里照样可能一口吃的都没有
-        // （长跑#8 F 段终局 foodNutrition=0 实证）。零存量已由 6.6 提前处理，
-        // 这里负责把储备补到线。
-        if (planHas(StagePlan.FOOD) && foodNutrition() < MINING_FOOD_NUTRITION
-                && hasSword) {
+        // 13) 食物储备（顺路型软向导，【fix38】目标改常备口径）：有剑以后打猎，
+        // 把储备补到"熟食为主、总营养 FOOD_RESERVE_NUTRITION 且份数
+        // FOOD_RESERVE_PORTIONS"——储备是平时状态（Fong 04:11），排在主线之后
+        // 只填空档；真正挡下潜的是 miningFoodGate 的 24 安全门（步骤内另查），
+        // 两者分工不混。生肉已由 12.5 烤肉前置转化，这里 hunt 补的是总量缺口。
+        // 【第二十四轮】去掉旧版 foodLevel<16 的饥饿条门槛：储备看背包存量，
+        // 饥饿条满格时包里照样可能一口吃的都没有（长跑#8 F 段实证）。
+        if (planHas(StagePlan.FOOD) && hasSword
+                && (foodNutrition() < FOOD_RESERVE_NUTRITION
+                    || countFood() < FOOD_RESERVE_PORTIONS)) {
             return goal("储备食物", "hunt",
-                    params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+                    params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
         }
-        String rawMeat = firstRawMeat();
-        if (planHas(StagePlan.FOOD) && rawMeat != null && hasFurnace && canFuel()) {
-            String cooked = cookedOf(rawMeat);
-            return goal("烤肉", "smelt", params("item", cooked, "count", 8));
+
+        // 13.3) 常备补仓（【fix38】顺路型软向导，Fong 04:11/04:14）：主线步骤都
+        // 走完才轮到这里——原木补到 LOG_RESERVE_TARGET（实物计数）、铁
+        // （生铁+铁锭）补到 INGOT_RESERVE_TARGET。只填空档、永不挡主线；
+        // 下潜硬门（木料安全线/口粮门/铁镐耐久门）在各自位置另行把关，
+        // 与补仓互不替代。挖铁补仓单趟封顶 16，防一趟挖太久变相常驻。
+        if (planHas(StagePlan.WOOD_RESERVE) && logs < LOG_RESERVE_TARGET && !underground()) {
+            return gatherLogs("原木常备补仓");
+        }
+        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < INGOT_RESERVE_TARGET
+                && hasStonePickaxe) {
+            return goal("铁储备补仓", "dig",
+                    params("resource", "iron", "count",
+                            Math.min(16, INGOT_RESERVE_TARGET - rawIron - ingots)));
         }
 
         // 13.5) 下界传送门准备（通关路线的前置门槛）。

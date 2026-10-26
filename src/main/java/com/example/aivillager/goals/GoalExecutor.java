@@ -3189,12 +3189,90 @@ public final class GoalExecutor {
      * 竹子是木板替代品。只丢掉超出上限的部分，避免把后续科技树要用的材料扔了。
      */
     private int dropJunk(int needed) {
-        // 先按"每种物品的总保留量"裁剪一遍：这一步与背包是否满无关，
+        // 【fix38·背包处置，Fong 04:15/04:17 定】丢弃分两档：
+        // 第一档（建筑杂石+地形杂料）必须排在配额裁剪与兜底之前——旧兜底按
+        // "最小堆"挑，可能先扔掉小堆正经物资而留着整组杂石；
+        // 第二档（蜘蛛眼/骨头/线，怪掉落当前用不上）在配额裁剪之后、兜底之前：
+        // 有落脚点箱子时应优先存箱（线日后做弓），存箱逻辑随 P2 箱子落地接上，
+        // 在此之前没箱子且背包满就照扔。腐肉是应急口粮，不入档、口径照旧。
+        int freed = dropTier1Junk(needed);
+        if (freed >= needed) {
+            return freed;
+        }
+        // 再按"每种物品的总保留量"裁剪一遍：这一步与背包是否满无关，
         // 顺便把只剩 1 点耐久的废工具清出去（它们占格但已经不能挖/打）。
-        int freed = trimOverflow();
+        freed += trimOverflow();
+        if (freed < needed) {
+            freed += dropTier2Junk(needed - freed);
+        }
         // 名单式清理没腾够（比如全是工具/关键材料挤在一起）：按堆大小兜底再丢。
         if (freed < needed) {
             freed += dropLeastValuable(needed - freed);
+        }
+        return freed;
+    }
+
+    /** 第一档·建筑杂石（Fong 04:15 名单）：花岗岩/闪长岩/安山岩及其磨制变种。 */
+    private static final java.util.Set<String> BUILDING_RUBBLE = java.util.Set.of(
+            "granite", "polished_granite",
+            "diorite", "polished_diorite",
+            "andesite", "polished_andesite");
+
+    /** 第一档·地形杂料（Fong 04:17 扩充）：沙子、沙砾，挖矿/地形途中大量混入。 */
+    private static final java.util.Set<String> TERRAIN_JUNK = java.util.Set.of(
+            "sand", "gravel");
+
+    /** 第二档（Fong 04:17）：蜘蛛眼/骨头/线——怪掉落、假人当前用不上；满包压力下才扔。 */
+    private static final java.util.Set<String> TIER2_JUNK = java.util.Set.of(
+            "spider_eye", "bone", "string");
+
+    /**
+     * 第一档优先丢弃：建筑杂石 + 地形杂料，整堆丢、丢够为止，返回腾出的槽数。
+     * 每堆走 dropItems 统一入口（逐笔流水日志：物品 x数量），末尾再打一行小计
+     * （腾格数），验收按这两类行对账：满包时应先见第一档清仓、圆石与正经物资不动。
+     * 圆石是功能材料（垫脚/小屋/脱困），不在此列——它的超量由配额裁剪按 128 上限管。
+     */
+    private int dropTier1Junk(int needed) {
+        int freed = 0;
+        for (int slot = 0; slot < MAIN_SLOTS && freed < needed; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = pathOf(stack);
+            String label = BUILDING_RUBBLE.contains(path) ? "建筑杂石优先丢弃 "
+                    : TERRAIN_JUNK.contains(path) ? "地形杂料优先丢弃 " : null;
+            if (label == null) {
+                continue;
+            }
+            dropItems(slot, stack.getCount(), label + path);
+            freed++;
+        }
+        if (freed > 0) {
+            LOG.info("[AIV][INV] " + npc.npcName() + " 第一档优先丢弃小计 | 腾格=" + freed
+                    + " 需求=" + needed);
+        }
+        return freed;
+    }
+
+    /**
+     * 第二档丢弃：蜘蛛眼/骨头/线整堆丢。只在 dropJunk 满包压力路径里调用
+     * （不进周期配额裁剪——平时不扔，线还要留着日后做弓）；
+     * P2 落脚点箱子落地后，本档改为"先存箱、箱满/无箱才扔"，在此挂钩。
+     */
+    private int dropTier2Junk(int needed) {
+        int freed = 0;
+        for (int slot = 0; slot < MAIN_SLOTS && freed < needed; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !TIER2_JUNK.contains(pathOf(stack))) {
+                continue;
+            }
+            dropItems(slot, stack.getCount(), "第二档丢弃 " + pathOf(stack));
+            freed++;
+        }
+        if (freed > 0) {
+            LOG.info("[AIV][INV] " + npc.npcName() + " 第二档丢弃小计 | 腾格=" + freed
+                    + " 需求=" + needed);
         }
         return freed;
     }
@@ -3390,7 +3468,12 @@ public final class GoalExecutor {
     private int junkKeepLimit(String path) {
         switch (path) {
             case "dirt", "sand", "clay_ball", "andesite", "diorite", "granite",
-                 "tuff", "calcite", "deepslate", "cobbled_deepslate" -> {
+                 "polished_andesite", "polished_diorite", "polished_granite",
+                 "tuff", "calcite", "deepslate", "cobbled_deepslate",
+                 // 【fix38·Fong 04:17】沙砾列第一档地形杂料、不再保留：
+                 // 旧版留 16 个筛燧石，但燧石有专门的"找燧石"目标按需重挖，
+                 // 满包时先保格子；筛出的燧石本身在永不扔清单里，不受影响。
+                 "gravel" -> {
                 return 0;
             }
             // 圆石只留 1 格（128 个）：它是世界上最好再挖的东西，
@@ -3401,10 +3484,7 @@ public final class GoalExecutor {
             case "stone" -> {
                 return 64;
             }
-            // 沙砾保留 16 个：燧石就从它里面筛，全丢光会退回"没燧石"的阶段。
-            case "gravel" -> {
-                return 16;
-            }
+            // 沙砾保留量已按 Fong 04:17 改为 0（见上方第一档分组）。
             case "bamboo" -> {
                 return 32;
             }

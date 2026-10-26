@@ -2207,6 +2207,50 @@ public final class SkillRunner {
                     }
                     return;
                 }
+                // 【fix38·Fong 04:14】煤顺手采集：目标矿之外，两侧有裸露煤且背包
+                // 煤+木炭存量未到上限向导（64）就顺手挖一颗，到了上限跳过省镐
+                // 耐久。煤是顺路型储备，规划层已拆除常驻挖煤目标（#11 病根），
+                // 存量靠的就是这种掘进路过时的一颗颗积累。只认 findVariantNear
+                // 的裸露判定（不透视）；岩浆邻接同样不挖（fix37 口径）。
+                // 本技能目标本身就是煤时（燃料告急）不走这里——上面 ore 路径已处理。
+                if (!variants.contains("coal_ore")) {
+                    BlockPos coalOre = countItemStock("coal", "charcoal") < COAL_OPPORTUNISTIC_CAP
+                            ? findVariantNear(feet, oreVariants("coal_ore"), 2) : null;
+                    if (coalOre != null && !touchesLava(coalOre)) {
+                        if (npc.mineWithBestTool(coalOre)) {
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 顺手挖煤 | "
+                                    + variantPath(coalOre) + " " + coalOre.toShortString()
+                                    + " 煤存量=" + countItemStock("coal", "charcoal"));
+                        }
+                        return;
+                    }
+                }
+                // 【fix38·D7，Fong 04:25】副矿顺手挖：金矿遇见就挖、不限量；
+                // 青金石可挖但存量上限 2 组（128）、满了跳过；红石照旧不理。
+                // 与煤同口径：只认裸露、岩浆邻接不挖、一 tick 一块不抢主目标节奏。
+                if (!variants.contains("gold_ore") && hasPickTier(2)) {
+                    BlockPos goldOre = findVariantNear(feet, oreVariants("gold_ore"), 2);
+                    if (goldOre != null && !touchesLava(goldOre)) {
+                        if (npc.mineWithBestTool(goldOre)) {
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 顺手挖金 | "
+                                    + variantPath(goldOre) + " " + goldOre.toShortString());
+                        }
+                        return;
+                    }
+                }
+                if (!variants.contains("lapis_ore") && hasPickTier(1)
+                        && countItemStock("lapis_lazuli") < LAPIS_OPPORTUNISTIC_CAP) {
+                    BlockPos lapisOre = findVariantNear(feet, oreVariants("lapis_ore"), 2);
+                    if (lapisOre != null && !touchesLava(lapisOre)) {
+                        if (npc.mineWithBestTool(lapisOre)) {
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 顺手挖青金 | "
+                                    + variantPath(lapisOre) + " " + lapisOre.toShortString()
+                                    + " 青金存量=" + countItemStock("lapis_lazuli"));
+                        }
+                        return;
+                    }
+                }
+
                 // 选择一个真正能掘进的方向：从 dirIndex 开始依次尝试，并且跳过"反方向"。
                 // 反方向等于回头重走已挖空的矿道：旧逻辑在矿道尽头遇到悬空/流体时
                 // 连续转向掉头，结果在同一条 8 格矿道里来回跑，10 秒凑满 24 步
@@ -2416,6 +2460,57 @@ public final class SkillRunner {
     }
 
     /** 半径内的目标矿石（只找已经暴露的，避免隔墙透视）。 */
+    /** 煤顺手采集上限向导（fix38·Fong 04:14）：与规划层 COAL_OPPORTUNISTIC_CAP 同值。 */
+    private static final int COAL_OPPORTUNISTIC_CAP = 64;
+
+    /** 青金石顺手采集存量上限（fix38·D7，Fong 04:25）：2 组 = 128，满了跳过。 */
+    private static final int LAPIS_OPPORTUNISTIC_CAP = 128;
+
+    /**
+     * 背包里有没有达到指定等级的可用镐（顺手挖副矿的级别门，防重蹈 #6d
+     * "级别不够还硬挖"）：金矿要铁镐（tier 2）、青金要石镐（tier 1）；
+     * 等级不够时整块矿留着不碰，等有够格的镐路过再说。可用口径与全系统
+     * 一致：剩余耐久必须大于最后 1 点。
+     */
+    private boolean hasPickTier(int minTier) {
+        var inv = npc.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+            int tier = switch (path) {
+                case "netherite_pickaxe", "diamond_pickaxe" -> 3;
+                case "iron_pickaxe" -> 2;
+                case "stone_pickaxe" -> 1;
+                default -> 0;
+            };
+            if (tier >= minTier && stack.getDamageValue() < stack.getMaxDamage() - 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 背包里指定物品（按 path，多个合计）的总数：fix38 顺手采集的存量口径。 */
+    private int countItemStock(String... paths) {
+        java.util.Set<String> wanted = java.util.Set.of(paths);
+        int total = 0;
+        var inv = npc.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+            if (wanted.contains(path)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
     private BlockPos findVariantNear(BlockPos center, Set<String> variants, int radius) {
         BlockPos best = null;
         double bestDistanceSq = Double.MAX_VALUE;
