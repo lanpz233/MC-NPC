@@ -697,10 +697,19 @@ public final class SurvivalController {
         // 健康空手也被迫逃跑，不符合"健康时可以空手 A 野怪"的新规矩，现已拆开。
         // 逃跑期间目标层必须暂停，否则它会在下一 tick 立刻开始挖矿，把逃跑路径冲掉。
         boolean desperateDefense = false;
-        if (!canEngage(npc.getHealth(), hasWeaponOrArmor())) {
+        // 远程威胁（掠夺者弩/骷髅弓）不许迎着箭冲（第二十一轮，长跑#8 三次被
+        // 射杀实测）：旧逻辑满血有石剑就算"能接战"，NPC 迎着弩箭横穿雪原去
+        // 砍人，血被一路射到惜命线以下才想起逃，16 格逃跑档又出不了弩的
+        // 射程和视线，逃到终点照样被射死。改：远程威胁不在贴脸距离内、且
+        // 护甲不够厚（<8，约半套铁甲）或血已到惜命线时，一律走逃跑分支，
+        // 并用加长档（28/22/16/10）先脱离射程；甲厚血足仍可按原逻辑压上。
+        boolean rangedStandOff = isRangedThreat(threat) && distanceSq > ATTACK_RANGE_SQ
+                && !(npc.getArmorValue() >= 8 && npc.getHealth() > LOW_HEALTH_THRESHOLD);
+        if (!canEngage(npc.getHealth(), hasWeaponOrArmor()) || rangedStandOff) {
             if (!"idle".equals(skills.currentSkill())) {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 中断技能逃跑（惜命） | threat=" + threat.getType()
-                        + " skill=" + skills.currentSkill() + " hp=" + npc.getHealth());
+                        + " skill=" + skills.currentSkill() + " hp=" + npc.getHealth()
+                        + (rangedStandOff ? " 远程威胁不接战" : ""));
                 skills.stop();
             }
             if (npc.isUsingItem()) {
@@ -708,7 +717,7 @@ public final class SurvivalController {
             }
             if (fleeCooldown <= 0) {
                 fleeCooldown = 40;
-                if (flee(threat)) {
+                if (flee(threat, rangedStandOff)) {
                     fleeing = true;
                     return true;
                 }
@@ -833,6 +842,14 @@ public final class SurvivalController {
      * @return 是否真的跑起来了；调用方据此决定"躲不掉就只能硬拼"
      */
     private boolean flee(LivingEntity threat) {
+        return flee(threat, false);
+    }
+
+    /**
+     * @param extended 远程威胁用加长档（28/22/16/10）：普通档最远 16 格出不了
+     *                 弩/弓的射程和视线（第二十一轮），必须跑得更远才算脱离。
+     */
+    private boolean flee(LivingEntity threat, boolean extended) {
         double dx = npc.getX() - threat.getX();
         double dz = npc.getZ() - threat.getZ();
         double length = Math.sqrt(dx * dx + dz * dz);
@@ -845,7 +862,8 @@ public final class SurvivalController {
         // 由远到近多档试：16 格反方向在矿道/水洞里常常没有可站位或没有路
         // （实测低血逃跑因此直接失败、被迫贴脸战死），退到 10 格、6 格再试——
         // 先跑开几格脱离攻击距离，也比原地恋战强，这正是惜命要的。
-        for (int distance : new int[]{16, 10, 6}) {
+        int[] tiers = extended ? new int[]{28, 22, 16, 10} : new int[]{16, 10, 6};
+        for (int distance : tiers) {
             double targetX = npc.getX() + dx / length * distance;
             double targetZ = npc.getZ() + dz / length * distance;
             BlockPos desired = BlockPos.containing(targetX, npc.getY(), targetZ);
@@ -881,7 +899,8 @@ public final class SurvivalController {
                     + " 距离档=" + distance + " 路径=" + result.path().size() + " 终点=" + goal.toShortString());
             return true;
         }
-        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：16/10/6 格各档都没有可站立位置或路径");
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑失败：" + java.util.Arrays.toString(tiers)
+                + " 格各档都没有可站立位置或路径");
         return false;
     }
 
@@ -913,7 +932,29 @@ public final class SurvivalController {
                 best = (LivingEntity) entity;
             }
         }
+        if (best == null) {
+            // 射手在防御半径外放箭时，上面的扫描看不见它（掠夺者射程远超
+            // defendRadius=8），NPC 会站着挨射（第二十一轮）。用"最近打我
+            // 的怪"兜底：是远程敌对且在 32 格内，就按威胁交给 defend() 的
+            // 远程处置去逃；它正在打我们，拉黑表对它也不适用，一并摘掉。
+            LivingEntity hurter = npc.getLastHurtByMob();
+            if (hurter != null && hurter != npc && hurter.isAlive() && hurter instanceof Enemy
+                    && isRangedThreat(hurter) && npc.distanceToSqr(hurter) <= 32.0D * 32.0D) {
+                ignoredThreats.remove(hurter.getUUID());
+                return hurter;
+            }
+        }
         return best;
+    }
+
+    /** 远程威胁：掠夺者（弩），或主手拿弩/弓的敌对怪（骷髅等）。 */
+    private boolean isRangedThreat(LivingEntity threat) {
+        if (threat instanceof net.minecraft.world.entity.monster.illager.Pillager) {
+            return true;
+        }
+        String path = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                .getKey(threat.getMainHandItem().getItem()).getPath();
+        return path.equals("crossbow") || path.equals("bow");
     }
 
     /**
