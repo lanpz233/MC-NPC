@@ -152,6 +152,10 @@ public final class GoalExecutor {
      * 让找吃的搬迁距离逐轮放大、方向不回头（治无动物区原地小步打转饿死循环）。 */
     private int huntFailStreak;
     private double huntHeading = Double.NaN;
+    /** 【第二十二轮】存量驱动狩猎：need=leather/food 时按背包存量收工，不数击杀。 */
+    private String huntNeed = "";
+    private int huntStockTarget;
+    private int lastHuntStock = -1;
     /** 定点猎杀：目标实体 ID、对应掉落物、开始时背包里的掉落数量。 */
     private String slayEntity = "";
     private String slayDrop = "string";
@@ -304,6 +308,12 @@ public final class GoalExecutor {
             case "hunt" -> {
                 newTarget = "hunt";
                 newCount = clamp(intent.intParam("count", 3), 1, 8);
+                // 【第二十二轮】存量驱动模式：need=leather/food + stock=目标存量。
+                // 给了 need 就不再数"打死几只"，改由 tickHunt 每轮复查背包存量。
+                huntNeed = intent.param("need", "");
+                huntStockTarget = intent.intParam("stock",
+                        "leather".equals(huntNeed) ? 4 : 24);
+                lastHuntStock = -1;
             }
             case "flint" -> {
                 newTarget = "flint";
@@ -361,6 +371,9 @@ public final class GoalExecutor {
             skills.stop();
         }
         type = action;
+        if (!"hunt".equals(type)) {
+            huntNeed = "";
+        }
         targetId = newTarget;
         targetCount = newCount;
         attempts = 0;
@@ -1882,6 +1895,48 @@ public final class GoalExecutor {
     // ---------------------------------------------------------------- 狩猎
 
     private void tickHunt() {
+        // 【第二十二轮】存量驱动（Fong 18:49 拍板）：规划器给了 need/stock 就不数
+        // "打死几只"——掉落是随机的（牛皮革 0–2、1/3 空手），数击杀会出现在打完
+        // 工单皮革还是 0 的假完成。每轮复查背包存量：皮革看 leather 计数、食物看
+        // 全部食物的营养值合计；存量一变就打复查行，够了立刻收工，不够继续打；
+        // 连续 8 次找不到目标照旧连败退避交回规划器（防原地空转）。
+        if (!huntNeed.isEmpty()) {
+            boolean leatherNeed = "leather".equals(huntNeed);
+            int stock = leatherNeed ? countItem("leather") : foodNutrition();
+            status = "狩猎（存量驱动 " + huntNeed + "） " + stock + "/" + huntStockTarget;
+            if (stock != lastHuntStock) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " hunt 存量复查 | " + huntNeed + "="
+                        + stock + "/" + huntStockTarget
+                        + (stock >= huntStockTarget ? " 已达标" : " 不够，继续"));
+                lastHuntStock = stock;
+            }
+            if (stock >= huntStockTarget) {
+                huntFailStreak = 0;
+                huntHeading = Double.NaN;
+                finish("狩猎完成（存量达标）" + huntNeed + "=" + stock + "/" + huntStockTarget);
+                return;
+            }
+            if (huntAttempts >= 8) {
+                huntFailStreak++;
+                finish("狩猎放弃（存量未达标 " + stock + "/" + huntStockTarget
+                        + "）：连续 8 次没找到目标");
+                return;
+            }
+            JsonObject stockParams = new JsonObject();
+            stockParams.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 24 : 12);
+            stockParams.addProperty("hits", 10);
+            if (leatherNeed) {
+                stockParams.addProperty("filter", "leather");
+            } else if (countItem("leather") < 4) {
+                stockParams.addProperty("prefer", "cow");
+            }
+            huntAttempts++;
+            if (skills.run(new Intent("", "hunt", stockParams), "目标")) {
+                return;
+            }
+            wanderForHunt();
+            return;
+        }
         int absolute = countHuntLoot();
         int have = Math.max(0, absolute - huntBaseline);
         status = "狩猎 " + have + "/" + targetCount + "（肉类共 " + absolute + "）";
@@ -1947,6 +2002,22 @@ public final class GoalExecutor {
             }
         }
         wander();
+    }
+
+    /** 【第二十二轮】背包食物总营养值：按 FOOD 组件 nutrition×数量合计（下矿口粮线的口径）。 */
+    private int foodNutrition() {
+        int total = 0;
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
+            if (food != null && food.nutrition() > 0) {
+                total += food.nutrition() * stack.getCount();
+            }
+        }
+        return total;
     }
 
     /** 背包里的肉类总数（生熟都算）：狩猎进度按"本轮新打到多少"统计。 */

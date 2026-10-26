@@ -2233,6 +2233,28 @@ public final class SkillRunner {
         int maxHits = Math.max(1, Math.min(12, intent.intParam("hits", 10)));
         List<Entity> candidates = npc.level().getEntities(npc, npc.getBoundingBox().inflate(radius),
                 entity -> entity instanceof Animal animal && animal.isAlive() && !animal.isBaby());
+        // 【第二十二轮】皮革目标来源过滤（Fong 18:48 纠正：猪不掉皮革）：filter=leather 时
+        // 只认 Wiki 皮革词条列的掉皮动物（牛/哞菇/马/驴/骡/羊驼/行商羊驼，无抢夺 0–2、
+        // 平均 1.0、1/3 掉 0）。兔子明确排除：兔子掉兔子皮（0–1、平均 0.5），4 张才合
+        // 1 张皮革，一双靴子要 16 张兔子皮≈32 只兔子，不走这条坑路（Fong 二选一取排除）。
+        // 附近没掉皮动物就如实报"没有皮革来源"，让上层换区，不许追猪/羊/兔凑数。
+        if ("leather".equals(intent.param("filter", ""))) {
+            java.util.Set<String> leatherSources = java.util.Set.of(
+                    "cow", "mooshroom", "horse", "donkey", "mule", "llama", "trader_llama");
+            List<Entity> filtered = candidates.stream()
+                    .filter(e -> leatherSources.contains(
+                            net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
+                                    .getKey(e.getType()).getPath()))
+                    .toList();
+            if (filtered.isEmpty()) {
+                lastOutcome = "hunt 附近没有皮革来源（只认牛/哞菇/马/驴/骡/羊驼）radius=" + radius
+                        + " 附近动物=" + candidates.size();
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 没有皮革来源 | radius=" + radius
+                        + " nearbyAnimals=" + candidates.size());
+                return false;
+            }
+            candidates = filtered;
+        }
         if (candidates.isEmpty()) {
             lastOutcome = "hunt 附近没有动物 radius=" + radius;
             LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 附近没有动物 | radius=" + radius);

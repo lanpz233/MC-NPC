@@ -57,6 +57,12 @@ public final class ProgressionPlanner {
      * 低于它就先补给再下矿，避免"地下断木→工具坏→造不出"的死结。
      */
     private static final int WOOD_SAFETY_MIN = 12;
+    /** 【第二十二轮】煤存量线：一轮冶炼（8 锭≈1 煤）+火把余量，挖煤按存量停（Fong 18:49）。 */
+    private static final int COAL_STOCK_TARGET = 8;
+    /** 【第二十二轮】下矿口粮线（Fong 18:51）：按食物总营养值计，24≈3 块牛排（Wiki 营养值牛排 8）。 */
+    private static final int MINING_FOOD_NUTRITION = 24;
+    /** 【第二十二轮】皮革目标存量：一双皮靴 4 张（Wiki 皮革词条：牛等 0–2/只、平均 1）。 */
+    private static final int LEATHER_STOCK_TARGET = 4;
 
     private final AiVillagerPlugin plugin;
     private final FakePlayerBody npc;
@@ -435,7 +441,8 @@ public final class ProgressionPlanner {
                 return skill("饥饿求生：先回地表", "ascend");
             }
             if (hasSword) {
-                return goal("饥饿求生", "hunt", params("count", 2, "radius", 12));
+                return goal("饥饿求生", "hunt",
+                        params("need", "food", "stock", 12, "radius", 12));
             }
             return gatherLogs("饥饿但无武器");
         }
@@ -603,7 +610,8 @@ public final class ProgressionPlanner {
                 && !(failStreak >= 2 && "找皮革做皮靴".equals(lastFailedStage))) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 细雪地带优先皮靴 | biome="
                     + npc.biomePath() + " leather=" + leather);
-            return goal("找皮革做皮靴", "hunt", params("count", 2, "radius", 12));
+            return goal("找皮革做皮靴", "hunt",
+                    params("need", "leather", "stock", LEATHER_STOCK_TARGET, "radius", 12));
         }
 
         // 7) 煤：火把和燃料。没有煤也能用木板烧，但不能无限烧。
@@ -611,13 +619,18 @@ public final class ProgressionPlanner {
         // 玩家这时会改用木板/木炭当燃料，而不是永远卡在"煤不足"这一条上；
         // 跳过煤以后，后面的铁装备、砍木头补木棍都能继续推进，过一阵带退避再回来挖。
         boolean coalStarved = failStreak >= 2 && "挖煤".equals(lastFailedStage);
-        if (planHas(StagePlan.COAL) && coal < 4 && hasStonePickaxe && !coalStarved) {
-            return goal("挖煤", "dig", params("resource", "coal", "count", 4));
+        // 【第二十二轮】挖煤改存量驱动：补到 COAL_STOCK_TARGET 为止（够一轮冶炼+火把），
+        // 不再固定 count=4 挖完就走、下一轮又因 coal<4 被派回来。
+        if (planHas(StagePlan.COAL) && coal < COAL_STOCK_TARGET && hasStonePickaxe && !coalStarved) {
+            return goal("挖煤", "dig",
+                    params("resource", "coal", "count", COAL_STOCK_TARGET - coal));
         }
 
         // 8) 铁矿石：石镐就能挖，Y=16 附近最密集。
-        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 4 && hasStonePickaxe) {
-            return goal("挖铁", "dig", params("resource", "iron", "count", 4));
+        // 【第二十二轮】同理按存量差额：生铁+铁锭合计补到 8（够镐+剑+余量）。
+        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe) {
+            return goal("挖铁", "dig",
+                    params("resource", "iron", "count", 8 - rawIron - ingots));
         }
 
         // 9) 冶炼：手里有生铁、有熔炉、有燃料才炼。
@@ -751,6 +764,10 @@ public final class ProgressionPlanner {
                 }
                 return goal("挖钻石前挖铁补镐", "dig", params("resource", "iron", "count", 4));
             }
+            Step foodGate = miningFoodGate(hasSword);
+            if (foodGate != null) {
+                return foodGate;
+            }
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
         if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
@@ -788,6 +805,10 @@ public final class ProgressionPlanner {
                     return goal(diaArmor[i][2], "craft",
                             params("item", diaArmor[i][0], "count", 1));
                 }
+                Step armorFoodGate = miningFoodGate(hasSword);
+                if (armorFoodGate != null) {
+                    return armorFoodGate;
+                }
                 return goal("挖钻石（钻石甲）", "dig",
                         params("resource", "diamond", "count", diaCost[i] - diamonds));
             }
@@ -798,8 +819,12 @@ public final class ProgressionPlanner {
 
         // 13) 食物储备：有剑以后打猎，再用熔炉把生肉烤熟（熟肉回复量更高）。
         // 但 foodLevel 还够高（>12）时不急——附近没动物会一直 hunt 失败卡死主线。
-        if (planHas(StagePlan.FOOD) && food < 4 && hasSword && foodLevel < 12) {
-            return goal("储备食物", "hunt", params("count", 2, "radius", 12));
+        // 13) 食物储备：【第二十二轮】改存量驱动——按食物总营养值达到下矿口粮线
+        // （24）停，不再"打 2 只就收工"；foodLevel 还满（>=16）时不急着囤。
+        if (planHas(StagePlan.FOOD) && foodNutrition() < MINING_FOOD_NUTRITION
+                && hasSword && foodLevel < 16) {
+            return goal("储备食物", "hunt",
+                    params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
         }
         String rawMeat = firstRawMeat();
         if (planHas(StagePlan.FOOD) && rawMeat != null && hasFurnace && canFuel()) {
@@ -1257,6 +1282,46 @@ public final class ProgressionPlanner {
             }
         }
         return total;
+    }
+
+    /** 【第二十二轮】背包食物总营养值（nutrition×数量合计），下矿口粮线与食物存量驱动的口径。 */
+    private int foodNutrition() {
+        int total = 0;
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
+            if (food != null && food.nutrition() > 0) {
+                total += food.nutrition() * stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * 【第二十二轮】下矿口粮门（Fong 18:51 第 1 条）：下钻石层开工前先查口粮——
+     * 长跑#7 反面教材是下到 -54 后 food=0 在矿下空转。营养值低于口粮线（24）时：
+     * 人在地下先 ascend 回地表，在地表先 hunt 补到口粮线；没剑（极早期）不挡路。
+     * 每次调用都打"下矿口粮检查"行，通过/拦截都留痕，验收按这行对账。
+     */
+    private Step miningFoodGate(boolean hasSword) {
+        int value = foodNutrition();
+        boolean ok = value >= MINING_FOOD_NUTRITION;
+        LOG.info("[AIV][PLAN] " + npc.npcName() + " 下矿口粮检查 | foodNutrition=" + value
+                + "/" + MINING_FOOD_NUTRITION + (ok ? " 通过" : " 不足，先补给再下矿"));
+        if (ok) {
+            return null;
+        }
+        if (underground()) {
+            return skill("下矿口粮不足：先回地表补给", "ascend");
+        }
+        if (hasSword) {
+            return goal("下矿前补口粮", "hunt",
+                    params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+        }
+        return null;
     }
 
     /** 有煤/木炭，或者有木板/原木/木棍可以当燃料。 */
