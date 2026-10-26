@@ -501,16 +501,22 @@ public final class ProgressionPlanner {
             return goal("补石头做石剑", "dig", params("resource", "stone", "count", 8));
         }
 
-        // 备用石镐：石制工具只有 131 点耐久，一条 24 格矿道加下挖就会见底。
-        // 没有铁镐之前保持 3 把：实测 2 把在连续下挖+掘进时仍会同时耗尽，
-        // 一旦断镐且地下没有木头，NPC 就只能原地空转。
+        // 石镐主力保障（第十八轮，Fong 工具分级口径）：石镐是全程主力——
+        // 石头/圆石、煤、铁都用石镐挖，铁镐只挖必须铁镐的矿（钻石/金/红石/绿宝石）。
+        // 旧版这条只在"没有铁镐之前保持 3 把"，有了铁镐就不再补石镐，于是掘进
+        // 把石镐烧光后身体只能拿铁镐顶上（fix24 只解决了选工具顺序，没解决
+        // 石镐库存断供）。改为全程保持至少 2 把可用石镐：挖到圆石随手就做，
+        // 掘进前/掘进间隙自动补齐；一把不剩且圆石也不够时，先挖石头补圆石。
         int stonePickaxes = countUsableItem("stone_pickaxe");
         LOG.info("[AIV][PLAN-DEBUG] cobble=" + cobble + " stickMaterial=" + stickMaterial
                 + " woodFromLogs=" + woodFromLogs + " woodFromBamboo=" + woodFromBamboo
                 + " stonePickaxes=" + stonePickaxes + " hasIronPickaxe=" + hasIronPickaxe
                 + " logs=" + logs + " planks=" + planks + " sticks=" + sticks
                 + " bamboo=" + bamboo + " ingots=" + ingots);
-        if (planHas(StagePlan.STONE_TOOLS) && !hasIronPickaxe && stonePickaxes < 3) {
+        if (planHas(StagePlan.STONE_TOOLS) && stonePickaxes < 2) {
+            if (stonePickaxes == 0 && cobble < 3 && hasPickaxe) {
+                return goal("补圆石做石镐", "dig", params("resource", "stone", "count", 8));
+            }
             // 1 把石镐 = 3 圆石 + 2 木棍；而合成木棍的配方本身要一次性放入 2 块木板，
             // 所以有 2 根木棍或 2 块木板当量就能再做一把。
             // 每次只排一把（count = 现有 + 1），材料刚好够时才下单，避免"排 3 把只做成 1 把"的空转。

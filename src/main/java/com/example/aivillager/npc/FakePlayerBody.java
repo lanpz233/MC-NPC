@@ -86,6 +86,9 @@ public final class FakePlayerBody extends ServerPlayer {
     private static final int MAX_DIG_RESCUES = 3;
 
     private int jumpCooldown;
+    /** 工具使用取证日志（第十八轮）：上次记录的工具名 + 抽样计数。 */
+    private String lastToolLogName = "";
+    private int toolLogCounter;
     private double lastDistanceSq = Double.MAX_VALUE;
     private int noProgressTicks;
     /** 连续卡住自救次数：只有路径真正走完、或离开上次卡住的区域，才清零。 */
@@ -759,6 +762,10 @@ public final class FakePlayerBody extends ServerPlayer {
                     + pos.toShortString());
             return false;
         }
+        // 【第十八轮】工具名先抓：下面的换格会把 bestSlot 的内容换走，
+        // 换完再读就成了换工具前的手持物（第一版短验把手里的剑误报成
+        // 挖石头的工具，当场逮到）。取证日志见换格后。
+        String toolName = String.valueOf(inventory.getItem(bestSlot).getItem());
         if (bestSlot < 9) {
             inventory.setSelectedSlot(bestSlot);
         } else {
@@ -767,6 +774,14 @@ public final class FakePlayerBody extends ServerPlayer {
             inventory.setItem(selected, inventory.getItem(bestSlot));
             inventory.setItem(bestSlot, old);
             inventory.setSelectedSlot(selected);
+        }
+        // 【第十八轮】工具使用取证日志：Fong 工具分级口径（石镐主力、铁镐只挖
+        // 必需矿）需要掘进段实证——换工具时打一行、每 100 次抽样一行，
+        // 事后能按日志核对"这段深板岩/石头/煤/铁到底是哪把镐挖的"。
+        if (!toolName.equals(lastToolLogName) || ++toolLogCounter >= 100) {
+            log(npcName, "tool-use", "tool=" + toolName + " block=" + state.getBlock());
+            lastToolLogName = toolName;
+            toolLogCounter = 0;
         }
         boolean mined = mine(pos);
         // 挖完把选中格还原，理由同上面空手挖的分支：否则生存层每次检查都会切回武器。

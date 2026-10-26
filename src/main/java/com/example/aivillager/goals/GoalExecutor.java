@@ -1259,6 +1259,24 @@ public final class GoalExecutor {
             finish("挖矿放弃：没有可用的镐，先补工具");
             return;
         }
+        // 【第十七轮】有镐但级别不够同样当场收场：钻石/金/红石/绿宝石矿必须
+        // 铁镐以上，铁/青金/铜矿必须石镐以上——长跑#6d 实测手里只剩石镐时
+        // 旧版照常下发 mine 技能，身体层对着裸露钻石矿 mine-no-tool 刷 159 次、
+        // 耗约 30 秒才靠"12 次无进展"放弃，矿也凉了。这里按矿种查镐，
+        // 不够格立刻结束目标交回规划器补铁镐，人还在矿区附近，补完能再扫到。
+        if (!hasHarvestPickaxe(oreTarget.block())) {
+            finish("挖矿放弃：没有能挖 " + oreTarget.block() + " 的镐（级别不够），先补工具");
+            return;
+        }
+        // 【第十八轮】石镐主力（Fong 工具分级口径）：除"挖石头"本身（那是补圆石
+        // 的手段）外，任何挖矿目标开工/续工前必须有可用石镐——掘进段的普通
+        // 石头/深板岩全靠它烧。石镐断了若不收场，身体层会自动拿铁镐顶上，
+        // 一条矿道就能把铁镐烧掉大半（fix24 只改了选工具顺序，库存断供时
+        // 顺序无从谈起）。当场收场交回规划器：它会用背包圆石当场补做石镐。
+        if (!"stone".equals(oreTarget.block()) && !hasUsableStonePick()) {
+            finish("挖矿放弃：石镐耗尽，先补石镐（石镐主力，铁镐只留给必需矿）");
+            return;
+        }
         // 上一条矿道如果挖空了，下一轮掘进前要先换位置（见下方步骤 3 前的处理）。
         noteStripOutcome();
         if (have >= targetCount) {
@@ -2002,7 +2020,9 @@ public final class GoalExecutor {
                 return false;
             }
             npc.level().setBlockAndUpdate(candidate, Blocks.GRAVEL.defaultBlockState());
-            boolean mined = npc.mine(candidate);
+            // 【第十八轮】走 mineWithBestTool：沙砾不需要工具，它会先换空手再挖；
+            // 旧版 npc.mine() 拿主手当前的镐硬挖，白磨铁镐耐久（选工具审计逮到的小漏口）。
+            boolean mined = npc.mineWithBestTool(candidate);
             LOG.info("[AIV][GOAL] " + npc.npcName() + " 刷燧石 | 放挖沙砾 success=" + mined
                     + " 燧石=" + countItem("flint"));
             return true;
@@ -2924,6 +2944,49 @@ public final class GoalExecutor {
             }
             if (!stack.isDamageableItem() || stack.getDamageValue() < stack.getMaxDamage() - 1) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /** 是否有可用石镐（第十八轮，石镐主力检查；见底的按没有算，口径同 hasUsablePickaxe）。 */
+    private boolean hasUsableStonePick() {
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !"stone_pickaxe".equals(pathOf(stack))) {
+                continue;
+            }
+            if (!stack.isDamageableItem() || stack.getDamageValue() < stack.getMaxDamage() - 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 目标矿的收获等级检查（第十七轮）：原版掉落规则——低级镐挖高级矿只碎不掉。 */
+    private boolean hasHarvestPickaxe(String blockId) {
+        String[] tiers = switch (blockId) {
+            case "diamond_ore", "gold_ore", "redstone_ore", "emerald_ore" ->
+                    new String[]{"iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe"};
+            case "iron_ore", "lapis_ore", "copper_ore" ->
+                    new String[]{"stone_pickaxe", "iron_pickaxe", "diamond_pickaxe",
+                            "netherite_pickaxe"};
+            default -> null;
+        };
+        if (tiers == null) {
+            return true;
+        }
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = pathOf(stack);
+            for (String tier : tiers) {
+                if (tier.equals(path) && (!stack.isDamageableItem()
+                        || stack.getDamageValue() < stack.getMaxDamage() - 1)) {
+                    return true;
+                }
             }
         }
         return false;
