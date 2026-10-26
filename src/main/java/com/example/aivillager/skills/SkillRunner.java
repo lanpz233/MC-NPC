@@ -278,7 +278,8 @@ public final class SkillRunner {
             block = CraftMagicNumbers.getBlock(material);
         }
         int radius = Math.max(2, Math.min(16, intent.intParam("radius", 8)));
-        // 是不是矿石（够矿求解只对矿石启用；砍树等其他 mine 不走求解，别把垫柱用在树上）。
+        // 是不是矿石（够矿求解对矿石启用；【第三十五轮】起原木在站立点全灭时
+        // 也走同一求解作 tree-reach 兜底，见下方 chosen==null 分支）。
         boolean oreBlock = !anyLog && block != null
                 && BuiltInRegistries.BLOCK.getKey(block).getPath().endsWith("_ore");
         List<BlockPos> targets = findNearestBlocks(block, anyLog, radius);
@@ -341,6 +342,24 @@ public final class SkillRunner {
                     }
                     String reachMode = oreReachMode(candidateTarget);
                     if (reachMode != null) {
+                        return runOreReach(intent, id, candidateTarget, reachMode);
+                    }
+                }
+            }
+            // 【第三十五轮】原木同理走够取求解（tree-reach）：长跑#12 实证——
+            // trek-to-tree 能把 NPC 送到看得见的树跟前（17 格/29 格两例），但树干
+            // 长在陡坡台地上时 17 个站立候选全灭、A* 无路，mine 直接"候选全部
+            // 不可达"放弃，采集连败到 7、整局三度被木头卡住（开局 26 分钟 +
+            // 两次补木危机）。树干是地表可见物、不存在透视问题，玩家够不到树干
+            // 时会挖台阶/垫柱上去砍，这里复用同一状态机（接近挖步/垫柱/拆柱
+            // 都是玩家手段）。旧注释"别把垫柱用在树上"防的是常态滥用——现在
+            // 只在站立点全灭的兜底才启用，常态砍树路径不变。
+            if (anyLog) {
+                for (BlockPos candidateTarget : targets) {
+                    String reachMode = oreReachMode(candidateTarget);
+                    if (reachMode != null) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " tree-reach | mode=" + reachMode
+                                + " target=" + candidateTarget.toShortString());
                         return runOreReach(intent, id, candidateTarget, reachMode);
                     }
                 }
