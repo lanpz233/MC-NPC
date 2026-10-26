@@ -571,6 +571,17 @@ public final class SkillRunner {
             private int waitRounds;
             private int stepFails;
             private int minedCount;
+            /**
+             * 落定窗口（第二十轮）：waitingBody 严格判定（!isWalking && onGround）
+             * 等不到时，用位置窗口兜底——连续约 6 秒（60 轮×2 tick）内 Y 活动
+             * 幅度 ≤0.1 格且水平格不变，按实际已站稳放行。锚格一变（真在走）
+             * 或 Y 幅度超限（真下落）立刻重置窗口，不会误放。
+             */
+            private int settleRounds;
+            private double settleMinY = Double.NaN;
+            private double settleMaxY = Double.NaN;
+            private int settleCellX = Integer.MIN_VALUE;
+            private int settleCellZ = Integer.MIN_VALUE;
             private List<BlockPos> bonus = List.of();
             private int bonusIndex;
             /** 阶段：0=接近（dig 全程在此；pillar 先接近柱位） 1=垫柱上升 2=挖主矿/顺手矿 3=拆柱下降。 */
@@ -627,7 +638,49 @@ public final class SkillRunner {
             private boolean waitingBody() {
                 if (!npc.isWalking() && npc.onGround) {
                     waitRounds = 0;
+                    settleRounds = 0;
+                    settleMinY = Double.NaN;
+                    settleMaxY = Double.NaN;
+                    settleCellX = Integer.MIN_VALUE;
                     return false;
+                }
+                // 悬空/走位状态不落定但身体实际已站稳（与 descend 的 fix13/fix20
+                // 同病）：站在自挖矿道台阶边缘等怪碰撞上时 onGround 假报、走位
+                // 标志不解除，严格判定永远等不到落定——长跑#8B 实测 pillar 够
+                // 头顶煤时连环超时 6 次整次放弃。改用窗口判定：连续约 6 秒
+                // Y 活动幅度 ≤0.1 格且水平格不变，按已站稳放行并清走位状态；
+                // 真下落时 Y 幅度数格、真行走时锚格每轮在变，窗口都会被重置，
+                // 不会误放（与 descend 放行同一安全论证）。
+                BlockPos cellNow = npc.blockPosition();
+                double yNow = npc.getY();
+                if (settleCellX == Integer.MIN_VALUE
+                        || cellNow.getX() != settleCellX || cellNow.getZ() != settleCellZ
+                        || Double.isNaN(settleMinY)) {
+                    settleCellX = cellNow.getX();
+                    settleCellZ = cellNow.getZ();
+                    settleMinY = yNow;
+                    settleMaxY = yNow;
+                    settleRounds = 0;
+                } else {
+                    settleMinY = Math.min(settleMinY, yNow);
+                    settleMaxY = Math.max(settleMaxY, yNow);
+                    if (settleMaxY - settleMinY > 0.1D) {
+                        settleMinY = yNow;
+                        settleMaxY = yNow;
+                        settleRounds = 0;
+                    } else if (++settleRounds >= 60) {
+                        settleRounds = 0;
+                        settleMinY = Double.NaN;
+                        settleMaxY = Double.NaN;
+                        settleCellX = Integer.MIN_VALUE;
+                        waitRounds = 0;
+                        npc.stopWalking();
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " ore-reach 等待落定：位置窗口稳定，按已落定放行 | mode=" + mode
+                                + " y=" + String.format(java.util.Locale.ROOT, "%.2f", yNow)
+                                + " pos=" + cellNow.toShortString());
+                        return false;
+                    }
                 }
                 if (++waitRounds > 120) {
                     waitRounds = 0;
