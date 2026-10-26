@@ -679,11 +679,45 @@ public final class FakePlayerBody extends ServerPlayer {
     /** 挖掘方块，返回是否成功。Survival 模式下会走正常掉落流程。 */
     public boolean mine(BlockPos pos) {
         String before = this.level().getBlockState(pos).toString();
+        // 【第二十三轮】工具损坏取证：动作前先记下主手工具，挖完比对（标准第 4 条）。
+        ItemStack handBefore = this.getMainHandItem();
+        String handPath = handBefore.isEmpty() ? "" : itemPathOf(handBefore);
+        boolean handDamageable = !handBefore.isEmpty() && handBefore.isDamageableItem();
+        int handDamage = handDamageable ? handBefore.getDamageValue() : 0;
+        int handMax = handDamageable ? handBefore.getMaxDamage() : 0;
         boolean success = this.gameMode.destroyBlock(pos);
         String after = this.level().getBlockState(pos).toString();
         log(npcName, "mine", "pos=" + pos.toShortString() + " success=" + success
                 + " before=" + before + " after=" + after);
+        if (handDamageable) {
+            checkToolBreak(handPath, handDamage, handMax, "mine", before);
+        }
         return success;
+    }
+
+    /**
+     * 【第二十三轮】工具损坏专行（日志标准第 4 条：资源流水，损坏必须有着落）：
+     * 动作前主手是可损坏工具、动作后主手变空或换成了别的物品 → 这件工具碎了，
+     * 打一条 [AIV][TOOL-BREAK]：哪件、碎时耐久（已耗/总）、当时在干什么。
+     * 注：本插件工具普遍"留最后 1 点耐久不用"，真碎多发生在战斗武器/护甲上。
+     */
+    private void checkToolBreak(String path, int damageBefore, int maxDamage,
+                                String action, String targetDesc) {
+        ItemStack after = this.getMainHandItem();
+        boolean gone = after.isEmpty() || !path.equals(itemPathOf(after));
+        if (!gone) {
+            return;
+        }
+        java.util.logging.Logger.getLogger("AIVillager").info("[AIV][TOOL-BREAK] " + npcName
+                + " item=" + path + " durability=" + damageBefore + "/" + maxDamage
+                + " action=" + action + " target=" + targetDesc
+                + " pos=" + getBlockX() + "," + getBlockY() + "," + getBlockZ());
+    }
+
+    private static String itemPathOf(ItemStack stack) {
+        net.minecraft.resources.Identifier id =
+                net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem());
+        return id == null ? "" : id.getPath();
     }
 
     /**
@@ -853,12 +887,23 @@ public final class FakePlayerBody extends ServerPlayer {
     public float attackTarget(Entity target) {
         // 视线对准目标胸口，保证命中判定和原版一致。
         this.lookAt(EntityAnchorArgument.Anchor.EYES, target.position().add(0.0D, target.getBbHeight() * 0.5D, 0.0D));
+        // 【第二十三轮】武器损坏取证（同 mine 的口径，标准第 4 条）。
+        ItemStack handBefore = this.getMainHandItem();
+        String handPath = handBefore.isEmpty() ? "" : itemPathOf(handBefore);
+        boolean handDamageable = !handBefore.isEmpty() && handBefore.isDamageableItem();
+        int handDamage = handDamageable ? handBefore.getDamageValue() : 0;
+        int handMax = handDamageable ? handBefore.getMaxDamage() : 0;
         float before = target instanceof LivingEntity living ? living.getHealth() : -1.0F;
         this.attack(target);
         this.swing(InteractionHand.MAIN_HAND);
         float after = target instanceof LivingEntity living ? living.getHealth() : -1.0F;
         float delta = before >= 0.0F ? before - after : -1.0F;
         log(npcName, "attack", "target=" + target.getType() + " health " + before + " -> " + after + " (damage=" + delta + ")");
+        if (handDamageable) {
+            var key = net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.getKey(target.getType());
+            checkToolBreak(handPath, handDamage, handMax, "attack",
+                    key == null ? "?" : key.getPath());
+        }
         return delta;
     }
 

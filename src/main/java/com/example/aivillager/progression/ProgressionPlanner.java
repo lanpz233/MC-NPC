@@ -5,6 +5,7 @@ import com.example.aivillager.goals.GoalExecutor;
 import com.example.aivillager.intent.Intent;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.skills.SkillRunner;
+import com.example.aivillager.snapshot.InventorySnapshot;
 import com.example.aivillager.survival.SurvivalController;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
@@ -80,6 +81,8 @@ public final class ProgressionPlanner {
     private BukkitTask task;
     private long lastStartAt;
     private String lastStage = "-";
+    /** 【第二十三轮】上次实际下发的阶段名（与 lastStage 的结果归因口径分开），供阶段切换盘点判定。 */
+    private String lastIssuedStage = "";
     /** 已处理到的目标结束序号；目标层每次 finish 自增，用它判断"有没有新结果"。 */
     private int lastOutcomeId;
     /** 技能层也会有 finish（ascend/descend/dryland 等），同样需要驱动失败退避。 */
@@ -303,6 +306,10 @@ public final class ProgressionPlanner {
         if (step == null) {
             return;
         }
+        // 【第二十三轮】盘点定时器：约 5 分钟一张家底快照（节流在 InventorySnapshot 内）。
+        if (now - InventorySnapshot.lastSnapshotAt(npc.npcName()) >= 300_000L) {
+            InventorySnapshot.log(npc, "timer", stage, false);
+        }
         // 换区拦截：同一资源连弃 2 次后，再给它下挖矿目标之前先执行换区步骤
         // （回地表 → 远距离移动）。放在失败跳过检查之前：换区步骤的阶段名不同，
         // 不会被挖矿阶段自己的退避冷却挡住。
@@ -335,7 +342,25 @@ public final class ProgressionPlanner {
         };
         LOG.info("[AIV][PLAN] " + npc.npcName() + " 下一步 | 阶段=" + step.stage
                 + " action=" + step.intent.action() + " params=" + step.intent.params()
-                + " accepted=" + accepted);
+                + " accepted=" + accepted
+                // 【第二十三轮】决策带理由（日志标准第 1 条）：派活当口的关键量直接
+                // 跟在同一行，key=value 可对账，不再靠事后翻 PLAN-DEBUG 拼。
+                + " | why hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                + " food=" + npc.getFoodData().getFoodLevel()
+                + " foodNutrition=" + foodNutrition()
+                + " leather=" + countItem("leather")
+                + " coal=" + countItem("coal")
+                + " rawIron=" + countItem("raw_iron")
+                + " ingots=" + countItem("iron_ingot")
+                + " diamonds=" + countItem("diamond")
+                + " cobble=" + countItem("cobblestone")
+                + " failStreak=" + failStreak
+                + " lastFailed=" + (lastFailedStage.isEmpty() ? "-" : lastFailedStage));
+        // 【第二十三轮】阶段切换盘点：阶段变了打一张家底快照（节流在盘点类内）。
+        if (!step.stage.equals(lastIssuedStage)) {
+            lastIssuedStage = step.stage;
+            InventorySnapshot.log(npc, "stage", step.stage, false);
+        }
         if (!accepted) {
             lastFailedStage = step.stage;
             lastFailAt = now;

@@ -5,6 +5,7 @@ import com.example.aivillager.intent.Intent;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.pathfinding.PathFinder;
 import com.example.aivillager.skills.SkillRunner;
+import com.example.aivillager.snapshot.InventorySnapshot;
 import com.example.aivillager.survival.SurvivalController;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
@@ -110,6 +111,11 @@ public final class GoalExecutor {
      * 「采集 8 个」会在第一秒宣布完成，模型又下一遍同样的目标，NPC 看着就像站着不动。
      */
     private int baselineCount;
+    /** 【第二十三轮】目标起止（供结束行打耗时与位移，日志标准第 2 条）。 */
+    private long goalStartedMillis;
+    private int goalStartX;
+    private int goalStartY;
+    private int goalStartZ;
     private int staleChecks;
     // 找资源扩围的方向惯性（fix18）：跨目标保留的航向/档位/锚点，故意不随
     // 目标重下而重置——旧逻辑每个新目标 attempts 归零、距离永远从 8 格起步，
@@ -371,6 +377,10 @@ public final class GoalExecutor {
             skills.stop();
         }
         type = action;
+        goalStartedMillis = System.currentTimeMillis();
+        goalStartX = npc.getBlockX();
+        goalStartY = npc.getBlockY();
+        goalStartZ = npc.getBlockZ();
         if (!"hunt".equals(type)) {
             huntNeed = "";
         }
@@ -2917,7 +2927,18 @@ public final class GoalExecutor {
         outcomeCount++;
         String doneType = type;
         type = "-";
-        LOG.info("[AIV][GOAL] " + npc.npcName() + " 目标结束 | type=" + doneType + " " + reason);
+        // 【第二十三轮】动作有头有尾（日志标准第 2 条）：结束行带耗时与起止位置，
+        // 出问题时不用再靠两条日志的时间戳和坐标反推这一段干了多久、走了多远。
+        long elapsedMs = goalStartedMillis > 0 ? System.currentTimeMillis() - goalStartedMillis : -1;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 目标结束 | type=" + doneType + " " + reason
+                + " | elapsed=" + (elapsedMs < 0 ? "-"
+                        : String.format(java.util.Locale.ROOT, "%.1f", elapsedMs / 1000.0) + "s")
+                + " from=" + goalStartX + "," + goalStartY + "," + goalStartZ
+                + " to=" + npc.getBlockX() + "," + npc.getBlockY() + "," + npc.getBlockZ());
+        // 【第二十三轮】合成/冶炼一批完成后盘点一次（家底触发点之一）。
+        if (("craft".equals(doneType) || "smelt".equals(doneType)) && reason.contains("完成")) {
+            InventorySnapshot.log(npc, doneType, doneType + ":" + targetId, false);
+        }
     }
 
     /**

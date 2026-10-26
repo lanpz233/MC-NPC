@@ -3,6 +3,7 @@ package com.example.aivillager.survival;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.pathfinding.PathFinder;
 import com.example.aivillager.skills.SkillRunner;
+import com.example.aivillager.snapshot.InventorySnapshot;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.InteractionHand;
@@ -129,6 +130,8 @@ public final class SurvivalController {
     private boolean chasing;
     private int deadTicks;
     private boolean deathLogged;
+    /** 【第二十三轮】存活 tick 的最新血量：死亡现场行里的"最后一击前后血量"取它。 */
+    private float lastAliveHealth = -1.0F;
     /** 当前主手武器的攻击力评分；赤手为 0，用来决定"能不能打"而不是送死。 */
     private int cachedWeaponScore;
     /**
@@ -196,6 +199,11 @@ public final class SurvivalController {
         if (!npc.isAlive()) {
             if (!deathLogged) {
                 deathLogged = true;
+                // 【第二十三轮】死亡留现场（日志标准第 3 条）：死因（伤害类型+来源
+                // 实体）、临死前一 tick 的血量、脚下/身前/头顶方块、当时在干什么，
+                // 一条 [AIV][DEATH] 打全——不许再靠别的提交信息拼死因
+                //（掠夺者射杀 3 次靠事后拼凑是反面教材）。
+                LOG.info("[AIV][DEATH] " + npc.npcName() + " " + deathScene());
                 // 死亡瞬间原版已经把背包掉在尸体周围；先清掉这些掉落物，
                 // 否则复活后再恢复背包就等于凭空复制了一套物品。
                 discardDeathDrops();
@@ -209,6 +217,7 @@ public final class SurvivalController {
         }
         deathLogged = false;
         deadTicks = 0;
+        lastAliveHealth = npc.getHealth();
         if (fleeCooldown > 0) {
             fleeCooldown--;
         }
@@ -586,6 +595,56 @@ public final class SurvivalController {
         restoreInventory();
         npc.level().getChunkSource().move(npc);
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 复活 | " + npc.describe());
+        // 【第二十三轮】复活后盘点一次（强制打，死亡/复活永不抽样）。
+        InventorySnapshot.log(npc, "respawn", "-", true);
+    }
+
+    /** 【第二十三轮】死亡现场快照：死因 + 环境 + 活动，key=value 一行打全。 */
+    private String deathScene() {
+        String cause = "unknown";
+        String by = "-";
+        try {
+            var src = npc.getLastDamageSource();
+            if (src != null) {
+                cause = src.type().msgId();
+                var entity = src.getEntity();
+                if (entity != null) {
+                    var key = net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
+                            .getKey(entity.getType());
+                    by = key == null ? "-" : key.getPath();
+                }
+            }
+        } catch (Throwable ignored) {
+            // 取不到伤害来源时退到最后击伤者，仍取不到就如实 unknown。
+        }
+        if ("unknown".equals(cause)) {
+            var mob = npc.getLastHurtByMob();
+            if (mob != null) {
+                var key = net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
+                        .getKey(mob.getType());
+                cause = "mob";
+                by = key == null ? "-" : key.getPath();
+            }
+        }
+        BlockPos pos = npc.blockPosition();
+        return "cause=" + cause + " by=" + by
+                + " hpPrev=" + (lastAliveHealth < 0 ? "-"
+                        : String.format(java.util.Locale.ROOT, "%.1f", lastAliveHealth))
+                + " food=" + npc.getFoodData().getFoodLevel()
+                + " armor=" + npc.getArmorValue()
+                + " pos=" + pos.getX() + "," + pos.getY() + "," + pos.getZ()
+                + " yaw=" + String.format(java.util.Locale.ROOT, "%.0f", npc.getYRot())
+                + " below=" + blockPath(pos.below())
+                + " front=" + blockPath(pos.relative(npc.getDirection()))
+                + " head=" + blockPath(pos.above())
+                + " skill=" + skills.currentSkill()
+                + " fleeing=" + fleeing + " chasing=" + chasing;
+    }
+
+    private String blockPath(BlockPos pos) {
+        var key = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                .getKey(npc.level().getBlockState(pos).getBlock());
+        return key == null ? "?" : key.getPath();
     }
 
     /** 记录死亡前的背包（含护甲槽），复活时用于恢复。 */
