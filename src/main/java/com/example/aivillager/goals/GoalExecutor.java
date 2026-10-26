@@ -147,6 +147,10 @@ public final class GoalExecutor {
     private String lastOutcome = "-";
     /** 挖掘类目标的资源定义（方块 ID、掉落物、目标深度）；其他目标为 null。 */
     private OreTarget oreTarget;
+    /** 【fix40】记矿回访目标坐标（revisit 目标专用）。 */
+    private int revisitX;
+    private int revisitY;
+    private int revisitZ;
     /** 熔炼时放下的熔炉位置；null 表示还没放置。 */
     private BlockPos furnacePos;
     private int smeltTicks;
@@ -259,6 +263,7 @@ public final class GoalExecutor {
                 || "dig".equals(action) || "smelt".equals(action) || "hunt".equals(action)
                 || "flint".equals(action) || "obsidian".equals(action) || "portal".equals(action)
                 || "enterportal".equals(action) || "slay".equals(action) || "travel".equals(action)
+                || "revisit".equals(action)
                 || "endportal".equals(action) || "dragon".equals(action);
     }
 
@@ -304,6 +309,21 @@ public final class GoalExecutor {
                 oreTarget = target;
                 newTarget = target.block();
                 newCount = clamp(intent.intParam("count", 8), 1, 64);
+            }
+            case "revisit" -> {
+                // 【fix40】记矿回访：参数带记账点坐标与矿种，oreTarget 复用
+                // dig 的矿种表（掉落计数/级别门都现成）。
+                OreTarget target = oreTargetOf(normalizeBlock(intent.param("resource", "")));
+                if (target == null) {
+                    lastOutcome = "revisit 不支持的资源 " + intent.param("resource", "");
+                    return false;
+                }
+                oreTarget = target;
+                revisitX = intent.intParam("x", 0);
+                revisitY = intent.intParam("y", 0);
+                revisitZ = intent.intParam("z", 0);
+                newTarget = "revisit";
+                newCount = 1;
             }
             case "smelt" -> {
                 newTarget = normalizeItem(intent.param("item", ""));
@@ -393,7 +413,7 @@ public final class GoalExecutor {
         lastProgress = -1;
         // 必须在 targetId 赋值之后算：gatherCount() 要看目标物品。
         baselineCount = "gather".equals(type) ? gatherCount()
-                : "dig".equals(type) ? countItem(oreTarget.drop()) : 0;
+                : ("dig".equals(type) || "revisit".equals(type)) ? countItem(oreTarget.drop()) : 0;
         smeltTicks = 0;
         smeltBaseline = "smelt".equals(type) ? countItem(targetId) : 0;
         furnacePos = null;
@@ -532,6 +552,7 @@ public final class GoalExecutor {
             case "build" -> tickBuild();
             case "explore" -> tickExplore();
             case "dig" -> tickDig();
+            case "revisit" -> tickRevisit();
             case "smelt" -> tickSmelt();
             case "hunt" -> tickHunt();
             case "flint" -> tickFlint();
@@ -1285,6 +1306,7 @@ public final class GoalExecutor {
         // 没有可用的镐：继续下挖/掘进每个技能都会立刻失败，
         // 直接结束目标，让规划器先去补工具（它会先做木镐/石镐）。
         if (!hasUsablePickaxe()) {
+            recordSeenOre();
             finish("挖矿放弃：没有可用的镐，先补工具");
             return;
         }
@@ -1294,6 +1316,7 @@ public final class GoalExecutor {
         // 耗约 30 秒才靠"12 次无进展"放弃，矿也凉了。这里按矿种查镐，
         // 不够格立刻结束目标交回规划器补铁镐，人还在矿区附近，补完能再扫到。
         if (!hasHarvestPickaxe(oreTarget.block())) {
+            recordSeenOre();
             finish("挖矿放弃：没有能挖 " + oreTarget.block() + " 的镐（级别不够），先补工具");
             return;
         }
@@ -2318,6 +2341,88 @@ public final class GoalExecutor {
     }
 
     /** 长途行进：水平先靠近，再竖向对齐（要塞/传送门房间都在地下或高台）。 */
+    /**
+     * 【fix40】记矿：级别门/没镐收场前，16 格内真扫到裸露目标矿才记账
+     *（扫不到不记、不编造坐标——Fong 口径"只记真实见到的"）。
+     */
+    private void recordSeenOre() {
+        if (oreTarget == null) {
+            return;
+        }
+        BlockPos seen = scanExposedOre(oreTarget.block(), 16);
+        if (seen != null) {
+            OreMemory.record(npc.npcName(), oreTarget.block(), seen);
+        }
+    }
+
+    /**
+     * 【fix40】记矿回访：赶到记账点、把当时挖不了的矿挖掉。
+     * 长途段镜像 tickTravel（travel 技能+竖直对齐）；进 12 格圈后先验记账点
+     * 本体、再扫裸露同矿下 mine 技能。收场口径：挖到=成功销账；矿已不在=
+     * 销账（不算失败）；工具又不够=中止（不计次）；其余失败由 finish() 计次，
+     * 满 2 次自动销账防死锁。
+     */
+    private void tickRevisit() {
+        status = "回访记账矿 " + oreTarget.block() + " @ " + revisitX + "," + revisitY + "," + revisitZ;
+        if (!hasHarvestPickaxe(oreTarget.block())) {
+            finish("回访中止：又没有能挖 " + oreTarget.block() + " 的镐了");
+            return;
+        }
+        if (countItem(oreTarget.drop()) > baselineCount) {
+            OreMemory.remove(npc.npcName(), oreTarget.block(), revisitX, revisitY, revisitZ);
+            finish("回访成功：挖到 " + oreTarget.drop() + "，销账");
+            return;
+        }
+        double dx = revisitX + 0.5D - npc.getX();
+        double dz = revisitZ + 0.5D - npc.getZ();
+        double horizontalSq = dx * dx + dz * dz;
+        if (horizontalSq > 144.0D || Math.abs(revisitY - npc.getY()) > 8.0D) {
+            attempts++;
+            if (attempts > 240) {
+                finish("回访放弃：多次推进仍未到达记账点");
+                return;
+            }
+            if (horizontalSq <= 16.0D) {
+                String action = npc.getY() > revisitY ? "descend" : "ascend";
+                JsonObject p = params("y", revisitY, "max", 160);
+                if (!skills.run(new Intent("", action, p), "目标")) {
+                    finish("回访竖直对齐失败 action=" + action);
+                }
+                return;
+            }
+            JsonObject p = params("x", revisitX, "y", npc.getY(), "z", revisitZ,
+                    "tolerance", 4.0D);
+            if (!skills.run(new Intent("", "travel", p), "目标")) {
+                finish("回访行进技能启动失败");
+            }
+            return;
+        }
+        BlockPos exact = new BlockPos(revisitX, revisitY, revisitZ);
+        String exactPath = BuiltInRegistries.BLOCK.getKey(
+                npc.level().getBlockState(exact).getBlock()).getPath();
+        boolean exactOk = (exactPath.equals(oreTarget.block())
+                || exactPath.equals("deepslate_" + oreTarget.block())) && isExposed(exact);
+        BlockPos found = exactOk ? exact : scanExposedOre(oreTarget.block(), 12);
+        if (found == null) {
+            OreMemory.remove(npc.npcName(), oreTarget.block(), revisitX, revisitY, revisitZ);
+            finish("记账矿已不在（挖走/采完），销账");
+            return;
+        }
+        if (!"idle".equals(skills.currentSkill())) {
+            return;
+        }
+        JsonObject p = new JsonObject();
+        p.addProperty("block", oreTarget.block());
+        p.addProperty("radius", 16);
+        if (!skills.run(new Intent("", "mine", p), "目标")) {
+            if (++staleChecks >= 12) {
+                finish("回访放弃：矿在附近但 mine 技能反复启动失败");
+            }
+        } else {
+            staleChecks = 0;
+        }
+    }
+
     private void tickTravel() {
         double dx = travelX - npc.getX();
         double dz = travelZ - npc.getZ();
@@ -2906,7 +3011,7 @@ public final class GoalExecutor {
     private int goalMetric() {
         return switch (type) {
             case "gather" -> gatherCount();
-            case "dig" -> oreTarget != null ? countItem(oreTarget.drop()) : 0;
+            case "dig", "revisit" -> oreTarget != null ? countItem(oreTarget.drop()) : 0;
             case "smelt", "craft" -> countItem(targetId);
             case "hunt" -> countHuntLoot();
             case "slay" -> countItem(slayDrop);
@@ -2920,17 +3025,25 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "endportal", "dragon" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            case "smelt", "travel", "revisit", "endportal", "dragon" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }
 
     /** 总时长硬顶（tick）：进展再零星也不许超过。 */
     private int hardCapTicks() {
-        return "dig".equals(type) ? GOAL_HARD_CAP_TICKS_DIG : GOAL_HARD_CAP_TICKS_DEFAULT;
+        return ("dig".equals(type) || "revisit".equals(type))
+                ? GOAL_HARD_CAP_TICKS_DIG : GOAL_HARD_CAP_TICKS_DEFAULT;
     }
 
     private void finish(String reason) {
+        // 【fix40】回访失败计次统一入口：成功/销账/中止不计，其余（超时、
+        // 行进失败等）计一次，满 2 次 OreMemory 自动销账防死锁。
+        if ("revisit".equals(type) && oreTarget != null
+                && !reason.contains("回访成功") && !reason.contains("销账")
+                && !reason.contains("中止")) {
+            OreMemory.noteAttempt(npc.npcName(), oreTarget.block(), revisitX, revisitY, revisitZ);
+        }
         active = false;
         lastOutcome = reason;
         outcomeCount++;

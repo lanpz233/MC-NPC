@@ -1007,6 +1007,28 @@ public final class ProgressionPlanner {
         // 13.0) 弓与箭挪到传送门准备之后（见 13.2）：
         // 蜘蛛只在夜晚出没，先凑弓弦会让白天的整条下线主链（下界→末影珍珠）全堵在后面。
 
+        // 12.9) 【fix40】记矿回访（Fong 亲提）：账本里有当时挖不了的矿、
+        // 现在工具级别够了，就回去收账。排在主线之后、储备之前——主线
+        // 优先、空档收账；级别还不够的条目跳过，等工具齐了再说。
+        for (com.example.aivillager.goals.OreMemory.Entry oreEntry
+                : com.example.aivillager.goals.OreMemory.entries(npc.npcName())) {
+            boolean tierOk = switch (oreEntry.needTier()) {
+                case 2 -> usableIronPickaxes > 0 || hasAny("diamond_pickaxe", "netherite_pickaxe");
+                case 1 -> stonePickaxes > 0 || usableIronPickaxes > 0
+                        || hasAny("diamond_pickaxe", "netherite_pickaxe");
+                default -> true;
+            };
+            if (!tierOk) {
+                continue;
+            }
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 回访记账矿 | " + oreEntry.block()
+                    + " @ " + oreEntry.x() + "," + oreEntry.y() + "," + oreEntry.z()
+                    + " needTier=" + oreEntry.needTier());
+            return goal("回访记账矿", "revisit",
+                    params("x", oreEntry.x(), "y", oreEntry.y(), "z", oreEntry.z(),
+                            "resource", oreEntry.block().replace("_ore", "")));
+        }
+
         // 13) 食物储备（顺路型软向导，【fix38】目标改常备口径）：有剑以后打猎，
         // 把储备补到"熟食为主、总营养 FOOD_RESERVE_NUTRITION 且份数
         // FOOD_RESERVE_PORTIONS"——储备是平时状态（Fong 04:11），排在主线之后

@@ -80,6 +80,8 @@ public final class AiVillagerPlugin extends JavaPlugin {
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        // 【fix40】记矿账本落盘目录（ore-memory/<NPC>.json）。
+        com.example.aivillager.goals.OreMemory.init(getDataFolder());
 
         router = LlmRouter.fromConfig(this);
         chatRadius = getConfig().getDouble("npc.chat-radius", 16.0D);

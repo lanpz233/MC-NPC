@@ -1,5 +1,6 @@
 package com.example.aivillager.skills;
 
+import com.example.aivillager.goals.OreMemory;
 import com.example.aivillager.intent.Intent;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.pathfinding.PathFinder;
@@ -2223,6 +2224,20 @@ public final class SkillRunner {
                                     + " 煤存量=" + countItemStock("coal", "charcoal"));
                         }
                         return;
+                    }
+                }
+                // 【fix40】记矿：没有铁镐时顺手挖不了的金矿/钻石矿，记坐标
+                // 回访（只记 2 格内真扫到的裸露矿、不占本 tick 动作、不
+                // return）。有铁镐时不记——顺手挖与主线会处理。
+                if (!hasPickTier(2)) {
+                    BlockPos seenGold = findVariantNear(feet, oreVariants("gold_ore"), 2);
+                    if (seenGold != null && !touchesLava(seenGold)) {
+                        OreMemory.record(npc.npcName(), variantPath(seenGold), seenGold);
+                    } else {
+                        BlockPos seenDiamond = findVariantNear(feet, oreVariants("diamond_ore"), 2);
+                        if (seenDiamond != null && !touchesLava(seenDiamond)) {
+                            OreMemory.record(npc.npcName(), variantPath(seenDiamond), seenDiamond);
+                        }
                     }
                 }
                 // 【fix38·D7，Fong 04:25】副矿顺手挖：金矿遇见就挖、不限量；
