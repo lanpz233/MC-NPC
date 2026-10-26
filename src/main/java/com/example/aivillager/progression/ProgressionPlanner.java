@@ -643,11 +643,17 @@ public final class ProgressionPlanner {
                     params("resource", "iron", "count", Math.max(1, 4 - ingots - rawIron)));
         }
 
-        // 11) 钻石前的工具保障：至少 2 把可用铁镐，总耐久 > 500。
+        // 11) 钻石前的工具保障：至少 2 把可用铁镐，且总剩余耐久 >= 250。
         // 先补铁镐，再继续挖铁——否则"只有 1 把铁镐但只剩 2 锭"会被判成"继续挖铁"，
         // 然后铁镐在 descend 里碎掉，NPC 从 Y=-54 卡死再重生于出生点，白费 10 分钟。
+        // 【第十七轮】旧版只数把数、不看耐久：2 把残血铁镐也算"保障达标"，
+        // 长跑#6d 实测补满 2 把新铁镐不到 6 分钟全碎（身体选工具专烧铁镐，
+        // 已在身体层改成"最便宜够用"）；这里把注释早写了的总耐久门槛落成真判定：
+        // 两把合计不足一把新镐（250）就当没保障，先补再走。
         int usableIronPickaxes = countUsableItem("iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
-        if (planHas(StagePlan.SPARE_PICKS) && usableIronPickaxes < 2) {
+        int ironPickDurability = totalRemainingDurability(
+                "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
+        if (planHas(StagePlan.SPARE_PICKS) && (usableIronPickaxes < 2 || ironPickDurability < 250)) {
             if (!stickMaterial) {
                 return gatherLogs("备用铁镐缺木棍");
             }
@@ -672,8 +678,27 @@ public final class ProgressionPlanner {
             // 铁锭不够但铁也挖完了：继续挖铁，别在原地空等。
             return goal("积攒铁锭", "dig", params("resource", "iron", "count", 4));
         }
-        // usableIronPickaxes 已在前面算过了，直接复用。
+        // usableIronPickaxes / ironPickDurability 已在前面算过了，直接复用。
         if (planHas(StagePlan.DIAMOND) && diamonds < 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
+            // 【第十七轮】钻石阶段内的保镐：下钻石层前和每轮重下挖钻目标前都复核——
+            // 没有铁镐以上、或铁镐总耐久不足 60（挖一簇矿+容错都不够）时，先原地补镐
+            // 再下，别再出现长跑#6d 那种"矿在眼前（58,-50,23）、手里只剩石镐、
+            // mine-no-tool 刷 159 次最后 0/3 放弃"。补镐链：有锭先造、没锭先炼、
+            // 没生铁先挖铁；人尽量留在矿区附近，补完回来 ore-scan 还能再找到那簇矿。
+            if (!hasIronPickaxe || ironPickDurability < 60) {
+                if (ingots >= 3) {
+                    if (!stickMaterial) {
+                        return gatherLogs("钻石前补铁镐缺木棍");
+                    }
+                    return goal("挖钻石前补铁镐", "craft",
+                            params("item", "iron_pickaxe", "count", usableIronPickaxes + 1));
+                }
+                if (rawIron > 0 && hasFurnace && canFuel()) {
+                    return goal("挖钻石前炼铁补镐", "smelt",
+                            params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+                }
+                return goal("挖钻石前挖铁补镐", "dig", params("resource", "iron", "count", 4));
+            }
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
         if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
@@ -1139,6 +1164,28 @@ public final class ProgressionPlanner {
                     continue;
                 }
                 total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    /** 一组工具的剩余耐久总和（第十七轮，钻石前/钻石内保镐门槛用；见底的按 0 计）。 */
+    private int totalRemainingDurability(String... paths) {
+        int total = 0;
+        for (String path : paths) {
+            for (int slot = 0; slot < COUNT_SLOTS; slot++) {
+                ItemStack stack = npc.getInventory().getItem(slot);
+                if (stack.isEmpty() || !path.equals(itemPath(stack))) {
+                    continue;
+                }
+                if (!stack.isDamageableItem()) {
+                    total += 1000;
+                    continue;
+                }
+                int remaining = stack.getMaxDamage() - stack.getDamageValue();
+                if (remaining > 1) {
+                    total += remaining;
+                }
             }
         }
         return total;

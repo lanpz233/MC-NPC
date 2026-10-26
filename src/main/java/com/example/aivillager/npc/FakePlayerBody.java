@@ -15,6 +15,7 @@ import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
@@ -731,8 +732,7 @@ public final class FakePlayerBody extends ServerPlayer {
             if (stack.isDamageableItem() && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
                 continue;
             }
-            int score = (stack.isCorrectToolForDrops(state) ? 10000 : 0)
-                    + Math.round(stack.getDestroySpeed(state) * 100.0F);
+            int score = toolScore(stack, state);
             if (score > bestScore) {
                 bestScore = score;
                 bestSlot = slot;
@@ -746,8 +746,7 @@ public final class FakePlayerBody extends ServerPlayer {
                 if (stack.isEmpty()) {
                     continue;
                 }
-                int score = (stack.isCorrectToolForDrops(state) ? 10000 : 0)
-                        + Math.round(stack.getDestroySpeed(state) * 100.0F);
+                int score = toolScore(stack, state);
                 if (score > bestScore) {
                     bestScore = score;
                     bestSlot = slot;
@@ -773,6 +772,42 @@ public final class FakePlayerBody extends ServerPlayer {
         // 挖完把选中格还原，理由同上面空手挖的分支：否则生存层每次检查都会切回武器。
         inventory.setSelectedSlot(selected);
         return mined;
+    }
+
+    /**
+     * 工具打分（第十七轮）：够用的工具里挑最便宜的，别再按“挖得最快”选。
+     *
+     * <p>旧打分只看对不对 + 速度，铁镐比石镐快，于是所有普通石头/深板岩掘进
+     * 都优先烧铁镐，石镐全程闲置——长跑#6d 实测：补满 2 把铁镐不到 6 分钟
+     * 全碎，正好赶上找到钻石矿时只剩石镐（钻石矿必须铁镐以上才有掉落），
+     * 只能 mine-no-tool 跳过。真人玩家也是石镐挖石头、铁镐只挖必须铁镐的矿。
+     * 非镐工具（斧/锹）只对自己能收的方块 correct，等级记 0、不受影响。
+     */
+    private static int toolScore(ItemStack stack, BlockState state) {
+        if (!stack.isCorrectToolForDrops(state)) {
+            return Math.round(stack.getDestroySpeed(state) * 100.0F);
+        }
+        return 10000 - pickaxeTier(stack) * 100
+                + Math.round(stack.getDestroySpeed(state) * 10.0F);
+    }
+
+    private static int pickaxeTier(ItemStack stack) {
+        if (stack.is(Items.WOODEN_PICKAXE) || stack.is(Items.GOLDEN_PICKAXE)) {
+            return 1;
+        }
+        if (stack.is(Items.STONE_PICKAXE)) {
+            return 2;
+        }
+        if (stack.is(Items.IRON_PICKAXE)) {
+            return 3;
+        }
+        if (stack.is(Items.DIAMOND_PICKAXE)) {
+            return 4;
+        }
+        if (stack.is(Items.NETHERITE_PICKAXE)) {
+            return 5;
+        }
+        return 0;
     }
 
     /** 攻击实体，返回造成的伤害（目标不是 LivingEntity 时为 -1）。 */
