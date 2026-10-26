@@ -1317,9 +1317,9 @@ public final class SurvivalController {
         Inventory inventory = npc.getInventory();
         int selected = inventory.getSelectedSlot();
         int bestSlot = -1;
-        int bestScore = weaponScore(inventory.getItem(selected));
+        int bestScore = weaponScoreCapped(inventory.getItem(selected));
         for (int slot = 0; slot < 36; slot++) {
-            int score = weaponScore(inventory.getItem(slot));
+            int score = weaponScoreCapped(inventory.getItem(slot));
             if (score > bestScore) {
                 bestScore = score;
                 bestSlot = slot;
@@ -1348,6 +1348,20 @@ public final class SurvivalController {
     }
 
     /** 武器评分 = 所有 ATTACK_DAMAGE 修饰符之和；没有攻击加成的物品为 0。 */
+    /**
+     * 【第三十二轮】退役武器（只剩最后 1 点耐久）评分压到最低：有别的武器时绝不
+     * 拿它打架——长跑#9 实测石剑剩 1 耐久仍被选去砍僵尸、一刀碎掉。真没别的
+     * 武器时它评分仍为正，可当最后手段被选中。
+     */
+    private int weaponScoreCapped(ItemStack stack) {
+        int score = weaponScore(stack);
+        if (score > 0 && stack.isDamageableItem()
+                && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
+            return 1;
+        }
+        return score;
+    }
+
     private int weaponScore(ItemStack stack) {
         if (stack.isEmpty()) {
             return 0;

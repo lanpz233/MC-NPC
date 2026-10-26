@@ -504,6 +504,21 @@ public final class ProgressionPlanner {
                 return goal("饥饿求生", "hunt",
                         params("need", "food", "stock", 12, "radius", 12));
             }
+            // 【第三十二轮】材料够就先合一把武器再去找吃的：长跑#9 工具全灭后，
+            // 背包里原木/圆石/铁锭明明够合剑，这一支却只派「采集木头」，
+            // 在雪原找树连败 5 次死锁到收尾。合成只要几秒，先有武器 hunt 才派得出去。
+            if (ingots >= 2 && stickMaterial) {
+                return goal("饥饿求生：先造铁剑", "craft",
+                        params("item", "iron_sword", "count", 1));
+            }
+            if (cobble >= 2 && stickMaterial) {
+                return goal("饥饿求生：先造石剑", "craft",
+                        params("item", "stone_sword", "count", 1));
+            }
+            if (stickMaterial && wood >= (sticks >= 1 ? 2 : 4)) {
+                return goal("饥饿求生：先造木剑", "craft",
+                        params("item", "wooden_sword", "count", 1));
+            }
             return gatherLogs("饥饿但无武器");
         }
 

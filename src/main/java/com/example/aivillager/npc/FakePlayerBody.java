@@ -768,20 +768,71 @@ public final class FakePlayerBody extends ServerPlayer {
             // 生存层每 1.5 秒又把剑切回来，日志里就出现"切换武器"刷屏，
             // 快捷栏也在两格之间来回跳。
             int previous = selected;
+            int swappedSlot = -1;
             if (inventory.getItem(selected).isDamageableItem()) {
+                boolean moved = false;
                 for (int slot = 0; slot < 9; slot++) {
                     if (inventory.getItem(slot).isEmpty()) {
                         inventory.setSelectedSlot(slot);
+                        moved = true;
                         break;
+                    }
+                }
+                if (!moved) {
+                    // 【第三十二轮】快捷栏没有空格时的兜底：旧版直接拿着剑挖土，
+                    // 长跑#9 实测铁剑就是这样被一锄一锄烧碎的（[TOOL-BREAK] 挖 dirt 时碎）。
+                    // 改成把主手的可损坏工具与背包里任意一个不可损坏的堆（圆石/泥土等）
+                    // 整组对调，挖完再换回来——等价于玩家把剑先塞回包里空手挖。
+                    for (int slot = 0; slot < 36; slot++) {
+                        if (slot == selected) {
+                            continue;
+                        }
+                        ItemStack other = inventory.getItem(slot);
+                        if (!other.isEmpty() && !other.isDamageableItem()) {
+                            ItemStack hand = inventory.getItem(selected);
+                            inventory.setItem(selected, other);
+                            inventory.setItem(slot, hand);
+                            swappedSlot = slot;
+                            break;
+                        }
                     }
                 }
             }
             boolean mined = mine(pos);
+            if (swappedSlot >= 0) {
+                ItemStack hand = inventory.getItem(selected);
+                ItemStack bag = inventory.getItem(swappedSlot);
+                inventory.setItem(selected, bag);
+                inventory.setItem(swappedSlot, hand);
+            }
             inventory.setSelectedSlot(previous);
             return mined;
         }
-        int bestSlot = -1;
-        int bestScore = -1;
+        // 【第三十二轮】石镐主力钉成结构规则（Fong 工具分级令）：包里只要有能用的
+        // 石镐、且这块方块石镐就能采（石头/煤/铁矿等 isCorrectToolForDrops 为真），
+        // 就只准用石镐，不走下面的评分——长跑#9 实测石镐有货时铁镐仍被选去挖普通
+        // 石头，3 分钟烧穿 202 耐久。石镐采不了的（钻石/金/红石等）自然落回评分选铁镐。
+        int stoneSlot = -1;
+        int stoneRemaining = -1;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty() || !stack.is(Items.STONE_PICKAXE)) {
+                continue;
+            }
+            if (stack.getDamageValue() >= stack.getMaxDamage() - 1) {
+                continue; // 退役规则与全插件一致：留最后 1 点不用
+            }
+            if (!stack.isCorrectToolForDrops(state)) {
+                continue;
+            }
+            int remaining = stack.getMaxDamage() - stack.getDamageValue();
+            if (remaining > stoneRemaining) {
+                stoneRemaining = remaining;
+                stoneSlot = slot;
+            }
+        }
+        int bestSlot = stoneSlot;
+        int bestScore = stoneSlot >= 0 ? Integer.MAX_VALUE : -1;
         // 第一遍：优先选耐久充足的（留最后 1 点不用，避免工具瞬间碎掉后无可用工具）。
         for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = inventory.getItem(slot);
