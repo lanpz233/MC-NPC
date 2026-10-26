@@ -1395,6 +1395,14 @@ public final class SkillRunner {
              * 挖不动计数都管不到，只有 3 分钟步数看门狗能收尾。同样给 30 秒死线。
              */
             private int landWaitRounds;
+            /**
+             * 悬空放行窗（第十三轮）：!onGround 且无待结算步时，统计 Y 的
+             * 活动窗口（min/max）。身体在怪碰撞上会缓慢蠕动下沉，单点基准
+             * 永远等不到"稳定"，必须用窗口幅度判定。见 run() 的放行分支。
+             */
+            private int airGateRounds;
+            private double airGateMinY = Double.NaN;
+            private double airGateMaxY = Double.NaN;
 
             @Override
             public void run() {
@@ -1430,22 +1438,58 @@ public final class SkillRunner {
                 }
                 // 下落/走位过程中不重复挖：等身体真正站到上一格目标再挖下一级。
                 if (!npc.onGround) {
-                    // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
-                    // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
-                    // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
-                    if (lastTarget != null && !npc.isWalking() && ++landWaitRounds > 200) {
-                        landWaitRounds = 0;
-                        lastTarget = null;
-                        dirIndex++;
-                        failedSteps++;
-                        LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 落地等待超时，转向"
-                                + " 连续失败=" + failedSteps + " Y=" + Math.round(npc.getY()));
-                        if (failedSteps >= 6) {
-                            finish(id, "descend", "连续 " + failedSteps + " 级落地等待超时 Y="
-                                    + Math.round(npc.getY()));
+                    if (lastTarget != null) {
+                        // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
+                        // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
+                        // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
+                        if (!npc.isWalking() && ++landWaitRounds > 200) {
+                            landWaitRounds = 0;
+                            lastTarget = null;
+                            dirIndex++;
+                            failedSteps++;
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 落地等待超时，转向"
+                                    + " 连续失败=" + failedSteps + " Y=" + Math.round(npc.getY()));
+                            if (failedSteps >= 6) {
+                                finish(id, "descend", "连续 " + failedSteps + " 级落地等待超时 Y="
+                                        + Math.round(npc.getY()));
+                            }
                         }
+                        return;
                     }
-                    return;
+                    // 无待结算步却报悬空（第十三轮，A2 竹林实测）：站在竹竿顶/方块
+                    // 边缘等怪碰撞上时身体被物理支撑、但 onGround 永远 false，
+                    // 旧逻辑在这里无声 return 到 3 分钟步数看门狗收场（步数恒 0，
+                    // 三连 stall 把挖煤目标全拖超时）。这种站姿下身体还会缓慢蠕动
+                    // 下沉（实测约 1 格/2.5 分钟），单点 Y 基准永远等不到"稳定"，
+                    // 所以用窗口判定：约 6 秒（40 轮）内 Y 活动幅度 ≤0.1 格就判定
+                    // "实际已站稳"，放行去挖第一级；真下落时 6 秒幅度是数格，
+                    // 不会误放。挖掉支撑块后重力接管，状态自然恢复正常。
+                    double yNow = npc.getY();
+                    if (Double.isNaN(airGateMinY)) {
+                        airGateMinY = yNow;
+                        airGateMaxY = yNow;
+                    }
+                    airGateMinY = Math.min(airGateMinY, yNow);
+                    airGateMaxY = Math.max(airGateMaxY, yNow);
+                    if (airGateMaxY - airGateMinY > 0.1D) {
+                        airGateMinY = yNow;
+                        airGateMaxY = yNow;
+                        airGateRounds = 0;
+                        return;
+                    }
+                    if (++airGateRounds <= 40) {
+                        return;
+                    }
+                    if (airGateRounds == 41) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 悬空但 Y 窗口稳定，按已站稳放行 | y="
+                                + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
+                                + " pos=" + npc.blockPosition().toShortString());
+                    }
+                } else {
+                    airGateRounds = 0;
+                    airGateMinY = Double.NaN;
+                    airGateMaxY = Double.NaN;
                 }
                 landWaitRounds = 0;
                 if (lastTarget != null) {
@@ -1640,6 +1684,10 @@ public final class SkillRunner {
             /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
             private int lastStepsSeen;
             private int roundsWithoutProgress;
+            /** 悬空放行窗（第十三轮，与 descend 同修）：见 run() 里的悬空放行分支。 */
+            private int airGateRounds;
+            private double airGateMinY = Double.NaN;
+            private double airGateMaxY = Double.NaN;
 
             @Override
             public void run() {
@@ -1659,7 +1707,37 @@ public final class SkillRunner {
                 }
                 // 空中（起跳/下落）时不挖下一格，等站稳再说。
                 if (!npc.onGround) {
-                    return;
+                    if (lastTarget != null) {
+                        return;
+                    }
+                    // 与 descend 同病（第十三轮）：无待结算步却报悬空
+                    // （站在竹竿顶/方块边缘等怪碰撞上），旧逻辑无声空等到步数看门狗。
+                    // 同样用窗口判定：约 6 秒内 Y 活动幅度 ≤0.1 格按已站稳放行。
+                    double yNow = npc.getY();
+                    if (Double.isNaN(airGateMinY)) {
+                        airGateMinY = yNow;
+                        airGateMaxY = yNow;
+                    }
+                    airGateMinY = Math.min(airGateMinY, yNow);
+                    airGateMaxY = Math.max(airGateMaxY, yNow);
+                    if (airGateMaxY - airGateMinY > 0.1D) {
+                        airGateMinY = yNow;
+                        airGateMaxY = yNow;
+                        airGateRounds = 0;
+                        return;
+                    }
+                    if (++airGateRounds <= 40) {
+                        return;
+                    }
+                    if (airGateRounds == 41) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " ascend 悬空但 Y 窗口稳定，按已站稳放行 | y="
+                                + String.format(java.util.Locale.ROOT, "%.2f", npc.getY()));
+                    }
+                } else {
+                    airGateRounds = 0;
+                    airGateMinY = Double.NaN;
+                    airGateMaxY = Double.NaN;
                 }
                 if (lastTarget != null) {
                     if (npc.blockPosition().getY() > stepStartY) {

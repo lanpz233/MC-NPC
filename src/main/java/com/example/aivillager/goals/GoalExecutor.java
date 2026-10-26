@@ -148,6 +148,10 @@ public final class GoalExecutor {
     /** 狩猎目标开始时的肉类数量，进度只看本轮新打到的。 */
     private int huntBaseline;
     private int huntAttempts;
+    /** 【第十五轮】连续整轮狩猎失败次数 + 远走找猎的固定航向：跨目标保留，
+     * 让找吃的搬迁距离逐轮放大、方向不回头（治无动物区原地小步打转饿死循环）。 */
+    private int huntFailStreak;
+    private double huntHeading = Double.NaN;
     /** 定点猎杀：目标实体 ID、对应掉落物、开始时背包里的掉落数量。 */
     private String slayEntity = "";
     private String slayDrop = "string";
@@ -1864,19 +1868,60 @@ public final class GoalExecutor {
         int have = Math.max(0, absolute - huntBaseline);
         status = "狩猎 " + have + "/" + targetCount + "（肉类共 " + absolute + "）";
         if (have >= targetCount) {
+            huntFailStreak = 0;
+            huntHeading = Double.NaN;
             finish("狩猎完成 新得 " + have + "/" + targetCount + "，肉类共 " + absolute);
             return;
         }
         if (huntAttempts >= 8) {
+            huntFailStreak++;
             finish("狩猎放弃：连续 8 次附近没有可猎动物");
             return;
         }
         JsonObject params = new JsonObject();
-        params.addProperty("radius", 12);
+        // 【第十五轮】久猎无获时把搜猎半径放大到 24：12 格外一步之遥的动物
+        // 旧版永远看不见、只能靠搬迁碰运气。
+        params.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 24 : 12);
         params.addProperty("hits", 10);
         huntAttempts++;
         if (skills.run(new Intent("", "hunt", params), "目标")) {
             return;
+        }
+        wanderForHunt();
+    }
+
+    /**
+     * 【第十五轮】找猎专用搬迁：旧版所有"附近没有"都用通用 wander 小步随机
+     * 4-9 格换位，在无动物区就是原地打转——长跑#6 实测 food=0 后连续 4 轮
+     * 狩猎目标全失败、8 分钟只挪出 50 格，铁装/钻石主线被饥饿顶住饿死循环。
+     * 改为逐级放大：本轮前两次仍小步；之后沿一条固定航向走 18→32→48 格
+     * （航向在整轮失败期间保持，跨目标 streak 叠加升温），真正离开贫瘠区；
+     * 打到猎物即清零复位。航向走不通时依次试 ±45° 与反向，都不通退回通用小步。
+     */
+    private void wanderForHunt() {
+        int heat = huntAttempts + huntFailStreak * 2;
+        if (heat <= 2) {
+            wander();
+            return;
+        }
+        double distance = heat <= 4 ? 18.0D : heat <= 6 ? 32.0D : 48.0D;
+        if (Double.isNaN(huntHeading)) {
+            huntHeading = java.util.concurrent.ThreadLocalRandom.current()
+                    .nextDouble() * Math.PI * 2.0D;
+        }
+        double[] angles = {huntHeading, huntHeading + Math.PI / 4, huntHeading - Math.PI / 4,
+                huntHeading + Math.PI};
+        for (double angle : angles) {
+            JsonObject params = new JsonObject();
+            params.addProperty("x", npc.getX() + Math.cos(angle) * distance);
+            params.addProperty("z", npc.getZ() + Math.sin(angle) * distance);
+            if (skills.run(new Intent("", "goto", params), "目标")) {
+                huntHeading = angle;
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " hunt-escalate | streak="
+                        + huntFailStreak + " dist=" + (int) distance
+                        + " heading=" + (int) Math.toDegrees(angle));
+                return;
+            }
         }
         wander();
     }

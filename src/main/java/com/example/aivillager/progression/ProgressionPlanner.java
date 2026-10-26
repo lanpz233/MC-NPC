@@ -589,21 +589,58 @@ public final class ProgressionPlanner {
             }
             return goal("制作铁镐", "craft", params("item", "iron_pickaxe", "count", 1));
         }
+        // 【第十六轮】四件铁甲改"缺锭就挖、够锭就造"的阻塞式（照 13.1 钻石甲的
+        // 现成写法）：旧版每件都带 ingots>=门槛才合成、不够就穿堂而过——便宜的
+        // 靴子(4)/备用镐(3) 总是先把锭花掉，胸甲(8) 永远攒不出来，长跑#6 实测
+        // 只穿头盔+靴子（armor=4）就下钻石层，胸甲/护腿整轮没造。缺锭时先炼掉
+        // 手里的生铁，再按差额挖铁，把这一件钉死造出来再走下一件。
         if (planHas(StagePlan.IRON_GEAR)
-                && !hasAny("iron_chestplate", "diamond_chestplate", "netherite_chestplate") && ingots >= 8) {
-            return goal("制作铁胸甲", "craft", params("item", "iron_chestplate", "count", 1));
+                && !hasAny("iron_chestplate", "diamond_chestplate", "netherite_chestplate")) {
+            if (rawIron > 0 && hasFurnace && canFuel()) {
+                return goal("冶炼铁锭（铁胸甲）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (ingots >= 8) {
+                return goal("制作铁胸甲", "craft", params("item", "iron_chestplate", "count", 1));
+            }
+            return goal("挖铁（铁胸甲）", "dig",
+                    params("resource", "iron", "count", Math.max(1, 8 - ingots - rawIron)));
         }
         if (planHas(StagePlan.IRON_GEAR)
-                && !hasAny("iron_helmet", "diamond_helmet", "netherite_helmet") && ingots >= 5) {
-            return goal("制作铁头盔", "craft", params("item", "iron_helmet", "count", 1));
+                && !hasAny("iron_helmet", "diamond_helmet", "netherite_helmet")) {
+            if (rawIron > 0 && hasFurnace && canFuel()) {
+                return goal("冶炼铁锭（铁头盔）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (ingots >= 5) {
+                return goal("制作铁头盔", "craft", params("item", "iron_helmet", "count", 1));
+            }
+            return goal("挖铁（铁头盔）", "dig",
+                    params("resource", "iron", "count", Math.max(1, 5 - ingots - rawIron)));
         }
         if (planHas(StagePlan.IRON_GEAR)
-                && !hasAny("iron_leggings", "diamond_leggings", "netherite_leggings") && ingots >= 7) {
-            return goal("制作铁护腿", "craft", params("item", "iron_leggings", "count", 1));
+                && !hasAny("iron_leggings", "diamond_leggings", "netherite_leggings")) {
+            if (rawIron > 0 && hasFurnace && canFuel()) {
+                return goal("冶炼铁锭（铁护腿）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (ingots >= 7) {
+                return goal("制作铁护腿", "craft", params("item", "iron_leggings", "count", 1));
+            }
+            return goal("挖铁（铁护腿）", "dig",
+                    params("resource", "iron", "count", Math.max(1, 7 - ingots - rawIron)));
         }
         if (planHas(StagePlan.IRON_GEAR)
-                && !hasAny("iron_boots", "diamond_boots", "netherite_boots") && ingots >= 4) {
-            return goal("制作铁靴", "craft", params("item", "iron_boots", "count", 1));
+                && !hasAny("iron_boots", "diamond_boots", "netherite_boots")) {
+            if (rawIron > 0 && hasFurnace && canFuel()) {
+                return goal("冶炼铁锭（铁靴）", "smelt",
+                        params("item", "iron_ingot", "count", Math.min(8, rawIron)));
+            }
+            if (ingots >= 4) {
+                return goal("制作铁靴", "craft", params("item", "iron_boots", "count", 1));
+            }
+            return goal("挖铁（铁靴）", "dig",
+                    params("resource", "iron", "count", Math.max(1, 4 - ingots - rawIron)));
         }
 
         // 11) 钻石前的工具保障：至少 2 把可用铁镐，总耐久 > 500。

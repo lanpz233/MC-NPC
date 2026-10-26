@@ -109,6 +109,8 @@ public final class SurvivalController {
     private int unstuckTimer;
     /** 连续泡在流体里的自救检查次数（约 1 秒一次）：用于"泡久了挖开头顶"的升级脱困。 */
     private int fluidStuckChecks;
+    /** 【第十四轮】连续完全离水的检查次数：泡水计数/脱困方向的清零滞后（见流体自救）。 */
+    private int fluidDryChecks;
     /** 上次下发游泳脱困的时间：技能的行走目标会把游泳模式顶掉，短期内不重复下发，避免互相抢输入刷日志。 */
     private long lastSwimIssueMillis;
     /**
@@ -299,9 +301,17 @@ public final class SurvivalController {
             fluidEscapeDir = null;
             return;
         }
-        if (state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK)) {
-            fluidStuckChecks = 0;
-            fluidEscapeDir = null;
+        if ((state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK))
+                && !npc.isInWater() && !npc.isInLava()) {
+            // 【第十四轮】真离水（身体包围盒也不沾水）连续 2 次检查才清零泡水计数：
+            // 旧版脚格一变空气就清零，NPC 在水面浮沉交界处脚格时空时水，计数永远
+            // 到不了 12，挖岸升级从未触发（长跑#6 实测：泡水 10 分钟 fluid-escape
+            // 事件 0 次、swim-timeout 循环 18 次）。浮沉时脚格是空气但身体还在水里，
+            // 不走这条早退、落到下面的流体处理（其入口已按包围盒放宽）。
+            if (++fluidDryChecks >= 2) {
+                fluidStuckChecks = 0;
+                fluidEscapeDir = null;
+            }
             return;
         }
         // === 流体自救：游泳上岸 ===
@@ -309,9 +319,12 @@ public final class SurvivalController {
         // 改为让身体进入游泳模式，朝最近的岸边格游过去、上浮、扒岸上岸，全程流体物理。
         // 岩浆里游得慢、会持续烧伤，游不出去就可能死——那是真玩家掉进岩浆的正常下场，
         // 按正常死亡处理（死亡不掉落是本服规则，见 revive 一节），不许用瞬移作弊脱身。
-        if (!state.getFluidState().isEmpty()) {
-            boolean isWater = state.is(net.minecraft.world.level.block.Blocks.WATER);
-            String fluidName = isWater ? "water" : (state.is(net.minecraft.world.level.block.Blocks.LAVA) ? "lava" : "fluid");
+        if (!state.getFluidState().isEmpty() || npc.isInWater() || npc.isInLava()) {
+            fluidDryChecks = 0;
+            // 【第十四轮】流体判定放宽到身体包围盒（isInWater/isInLava）：浮沉交界处
+            // 脚格可能暂时是空气，旧版只看脚格会漏检并清零泡水计数。
+            boolean isWater = !npc.isInLava();
+            String fluidName = isWater ? "water" : "lava";
             // 浅水涉水不算被困：脚踩着地、眼睛不在水里时，玩家就是蹚水走过去的，
             // 行走/技能自己能处理；反复下发游泳只会在池塘边"游一步→上岸"4 秒一轮
             // 地刷屏打转（实测）。只有真泡在深水里（眼睛入水或离地沉浮）才游泳脱困。
@@ -319,13 +332,16 @@ public final class SurvivalController {
                     net.minecraft.core.BlockPos.containing(npc.getEyePosition()))
                     .getFluidState().isEmpty();
             if (!eyeInFluid && npc.onGround()) {
-                fluidStuckChecks = 0;
-                fluidEscapeDir = null;
+                // 【第十四轮】涉水早退不再清零泡水计数：浮沉中的 NPC 会间歇触底
+                // 站稳（眼出水面），旧版在此清零使计数永远到不了挖岸门槛。
+                // 计数只由流体入口上方的"连续 2 次完全离水"清零。
                 return;
             }
             fluidStuckChecks++;
             // 挖岸脱困的方向在进入升级阶段时选定一次（第四轮修复 B）：
             // 朝最近的旱地方向贴墙挖台阶；10 格内没有旱地（全淹洞穴）就保持 null。
+            // 【第十四轮】仍用 ==12 触发：计数已改为跨浮沉连续累计且只与方向
+            // 一起在真离水时清零，每轮泡水必恰好经过 12 一次，不会漏选/重选。
             if (fluidStuckChecks == 12) {
                 fluidEscapeDir = pickFluidEscapeDir(feet);
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dig start | fluid="
