@@ -1490,6 +1490,14 @@ public final class SkillRunner {
             private int airGateRounds;
             private double airGateMinY = Double.NaN;
             private double airGateMaxY = Double.NaN;
+            /**
+             * 悬空总时长死线（第四十一轮）：无待结算步的悬空累计轮数，不随窗口
+             * 重置清零，只在落地或走出放行分支时清零。长跑#13 三度实证：窗口
+             * 幅度判定在雪层/边缘站姿的微幅蠕动下永远等不到放行（整局 0 条
+             * 放行日志），悬空满 3 分钟步数看门狗、期间被骷髅当靶子。累计
+             * 200 轮（约 30 秒）一到按已站稳强制放行，窗口判定只作快路。
+             */
+            private int airTotalRounds;
 
             @Override
             public void run() {
@@ -1526,6 +1534,7 @@ public final class SkillRunner {
                 // 下落/走位过程中不重复挖：等身体真正站到上一格目标再挖下一级。
                 if (!npc.onGround) {
                     if (lastTarget != null) {
+                        airTotalRounds = 0;
                         // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
                         // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
                         // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
@@ -1558,23 +1567,37 @@ public final class SkillRunner {
                     }
                     airGateMinY = Math.min(airGateMinY, yNow);
                     airGateMaxY = Math.max(airGateMaxY, yNow);
-                    if (airGateMaxY - airGateMinY > 0.1D) {
+                    // 【第四十一轮】窗口阈值 0.1→0.25：雪层/边缘站姿的微幅蠕动
+                    // 幅度常在 0.1~0.2 之间，旧阈值下窗口被反复重置、整局零放行。
+                    if (airGateMaxY - airGateMinY > 0.25D) {
                         airGateMinY = yNow;
                         airGateMaxY = yNow;
                         airGateRounds = 0;
+                        airTotalRounds++;
                         return;
                     }
-                    if (++airGateRounds <= 40) {
-                        return;
-                    }
+                    airGateRounds++;
+                    airTotalRounds++;
                     if (airGateRounds == 41) {
                         LOG.info("[AIV][SKILL] " + npc.npcName()
                                 + " descend 悬空但 Y 窗口稳定，按已站稳放行 | y="
                                 + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
                                 + " pos=" + npc.blockPosition().toShortString());
                     }
+                    // 【第四十一轮】悬空总死线：窗口快路走不通时，累计悬空约
+                    // 30 秒（200 轮）强制放行，不再满 3 分钟步数看门狗当活靶子。
+                    if (airTotalRounds == 201) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 悬空超 30 秒死线，按已站稳强制放行 | y="
+                                + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
+                                + " pos=" + npc.blockPosition().toShortString());
+                    }
+                    if (airGateRounds <= 40 && airTotalRounds <= 200) {
+                        return;
+                    }
                 } else {
                     airGateRounds = 0;
+                    airTotalRounds = 0;
                     airGateMinY = Double.NaN;
                     airGateMaxY = Double.NaN;
                 }
@@ -1775,6 +1798,8 @@ public final class SkillRunner {
             private int airGateRounds;
             private double airGateMinY = Double.NaN;
             private double airGateMaxY = Double.NaN;
+            /** 悬空总时长死线（第四十一轮，与 descend 同修）：见 descend 字段注释。 */
+            private int airTotalRounds;
 
             @Override
             public void run() {
@@ -1795,6 +1820,7 @@ public final class SkillRunner {
                 // 空中（起跳/下落）时不挖下一格，等站稳再说。
                 if (!npc.onGround) {
                     if (lastTarget != null) {
+                        airTotalRounds = 0;
                         return;
                     }
                     // 与 descend 同病（第十三轮）：无待结算步却报悬空
@@ -1807,22 +1833,32 @@ public final class SkillRunner {
                     }
                     airGateMinY = Math.min(airGateMinY, yNow);
                     airGateMaxY = Math.max(airGateMaxY, yNow);
-                    if (airGateMaxY - airGateMinY > 0.1D) {
+                    // 【第四十一轮】阈值 0.1→0.25 + 30 秒总死线，与 descend 同口径。
+                    if (airGateMaxY - airGateMinY > 0.25D) {
                         airGateMinY = yNow;
                         airGateMaxY = yNow;
                         airGateRounds = 0;
+                        airTotalRounds++;
                         return;
                     }
-                    if (++airGateRounds <= 40) {
-                        return;
-                    }
+                    airGateRounds++;
+                    airTotalRounds++;
                     if (airGateRounds == 41) {
                         LOG.info("[AIV][SKILL] " + npc.npcName()
                                 + " ascend 悬空但 Y 窗口稳定，按已站稳放行 | y="
                                 + String.format(java.util.Locale.ROOT, "%.2f", npc.getY()));
                     }
+                    if (airTotalRounds == 201) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " ascend 悬空超 30 秒死线，按已站稳强制放行 | y="
+                                + String.format(java.util.Locale.ROOT, "%.2f", npc.getY()));
+                    }
+                    if (airGateRounds <= 40 && airTotalRounds <= 200) {
+                        return;
+                    }
                 } else {
                     airGateRounds = 0;
+                    airTotalRounds = 0;
                     airGateMinY = Double.NaN;
                     airGateMaxY = Double.NaN;
                 }

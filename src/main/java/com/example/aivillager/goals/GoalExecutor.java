@@ -153,6 +153,12 @@ public final class GoalExecutor {
     private int revisitZ;
     /** 熔炼时放下的熔炉位置；null 表示还没放置。 */
     private BlockPos furnacePos;
+    /**
+     * 【第四十一轮·工作站回收】自己亲手放下的那台熔炉的位置（跨目标保留）。
+     * 复用世界里找到的熔炉不登记——只收自己放的（Fong 04:11 规格：工作台/
+     * 熔炉随身带、用完挖回背包）。冶炼收尾 drainFurnace 后按此位拆炉回收。
+     */
+    private BlockPos placedFurnacePos;
     private int smeltTicks;
     private int smeltBaseline;
     /** 狩猎目标开始时的肉类数量，进度只看本轮新打到的。 */
@@ -1749,6 +1755,7 @@ public final class GoalExecutor {
         }
         npc.level().setBlockAndUpdate(spot, Blocks.FURNACE.defaultBlockState());
         furnacePos = spot;
+        placedFurnacePos = spot;
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 放置熔炉 | pos=" + spot.toShortString());
         fillFurnace();
         return true;
@@ -1850,6 +1857,59 @@ public final class GoalExecutor {
             LOG.info("[AIV][GOAL] " + npc.npcName() + " 熔炉收炉完成 | 共收回=" + moved
                     + " pos=" + furnacePos.toShortString());
         }
+        reclaimFurnaceBlock();
+    }
+
+    /**
+     * 【第四十一轮·工作站回收】冶炼收尾时，把自己放下的那台熔炉挖回背包
+     * （Fong 04:11：工作站随身带、用完挖回收，别再走到哪扔到哪、一局重造
+     * 好几台）。只收 placedFurnacePos 登记的那台；复用世界里现成的熔炉
+     * 不动。放弃条件（防丢物/防死锁）：炉内还有东西没收干净（背包满）→
+     * 不拆、留着下次复用；没有可用镐子 → 不拆、记一行日志。
+     */
+    private void reclaimFurnaceBlock() {
+        if (furnacePos == null || placedFurnacePos == null
+                || !furnacePos.equals(placedFurnacePos)) {
+            return;
+        }
+        if (!npc.level().getBlockState(furnacePos).is(Blocks.FURNACE)) {
+            // 炉子已经不在了（被怪炸了/被别的流程清了）：登记作废，别再惦记。
+            placedFurnacePos = null;
+            return;
+        }
+        if (!(npc.level().getBlockEntity(furnacePos) instanceof AbstractFurnaceBlockEntity furnace)) {
+            return;
+        }
+        for (int slot = 0; slot < 3; slot++) {
+            if (!furnace.getItem(slot).isEmpty()) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 工作站回收跳过：炉内还有物品"
+                        + " pos=" + furnacePos.toShortString());
+                return;
+            }
+        }
+        int before = countItem("furnace");
+        if (!npc.mineWithBestTool(furnacePos)) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 工作站回收失败：没有可用镐子，熔炉留在原地"
+                    + " pos=" + furnacePos.toShortString());
+            return;
+        }
+        // 掉落物同步收回：身体的自动拾取是逐 tick 的，这里直接把脚边的
+        // 熔炉掉落物搬进背包（与 takeFurnaceOutput 的主动搬运同一口径）。
+        int collected = 0;
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(furnacePos).inflate(2.0D);
+        for (net.minecraft.world.entity.item.ItemEntity entity : npc.level().getEntitiesOfClass(
+                net.minecraft.world.entity.item.ItemEntity.class, box,
+                e -> "furnace".equals(pathOf(e.getItem())))) {
+            collected += entity.getItem().getCount();
+            entity.discard();
+        }
+        if (collected > 0) {
+            give("furnace", collected);
+        }
+        placedFurnacePos = null;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 工作站回收：熔炉已挖回背包"
+                + " | 背包熔炉 " + before + "→" + countItem("furnace")
+                + " pos=" + furnacePos.toShortString());
     }
 
     /**
