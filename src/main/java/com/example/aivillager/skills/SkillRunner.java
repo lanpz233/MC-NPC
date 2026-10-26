@@ -870,6 +870,14 @@ public final class SkillRunner {
                 if (!withinMineReach(target)) {
                     return false;
                 }
+                // 【fix37 岩浆邻接防护】矿的六邻有岩浆就不出手：另一侧/下方是岩浆时
+                // 掉落物会落进岩浆烧毁，上方是岩浆时挖开会灌到自己头上。
+                // 跳过并记账，交回状态机按失败处理（与挖不到同路，不死等）。
+                if (touchesLava(target)) {
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach 跳过岩浆邻接矿 | "
+                            + orePath + " " + target.toShortString());
+                    return false;
+                }
                 if (!npc.mineWithBestTool(target)) {
                     return false;
                 }
@@ -895,6 +903,12 @@ public final class SkillRunner {
                     String pp = BuiltInRegistries.BLOCK.getKey(
                             npc.level().getBlockState(p).getBlock()).getPath();
                     if (!pp.equals(orePath)) {
+                        continue;
+                    }
+                    // 【fix37】顺手矿同样查岩浆邻接，命中就跳过这一块（清单继续往下走）。
+                    if (touchesLava(p)) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach 跳过岩浆邻接顺手矿 | "
+                                + pp + " " + p.toShortString());
                         continue;
                     }
                     if (withinMineReach(p) && npc.mineWithBestTool(p)) {
@@ -2171,6 +2185,13 @@ public final class SkillRunner {
                 BlockPos feet = npc.blockPosition();
                 // 先看矿道两侧 2 格内有没有暴露的目标矿石：有就直接挖，效率优先。
                 BlockPos ore = findVariantNear(feet, variants, 2);
+                if (ore != null && touchesLava(ore)) {
+                    // 【fix37】岩浆邻接的矿不挖：掉落易落岩浆、上方岩浆会灌顶。
+                    // 不 return，落到下面的掘进逻辑继续推进，别被这块矿钉在原地。
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 跳过岩浆邻接矿 | "
+                            + variantPath(ore) + " " + ore.toShortString());
+                    ore = null;
+                }
                 if (ore != null) {
                     // 必须在挖掉之前取方块名：挖完再读坐标只会拿到 air，
                     // 日志里全变成「挖到矿石 | air」，没法判断真正挖到的是哪种矿。
@@ -2186,7 +2207,6 @@ public final class SkillRunner {
                     }
                     return;
                 }
-
                 // 选择一个真正能掘进的方向：从 dirIndex 开始依次尝试，并且跳过"反方向"。
                 // 反方向等于回头重走已挖空的矿道：旧逻辑在矿道尽头遇到悬空/流体时
                 // 连续转向掉头，结果在同一条 8 格矿道里来回跑，10 秒凑满 24 步
@@ -2203,6 +2223,14 @@ public final class SkillRunner {
                     BlockState candidateFeet = npc.level().getBlockState(candidate);
                     BlockState candidateHead = npc.level().getBlockState(candidate.above());
                     BlockState candidateFloor = npc.level().getBlockState(candidate.below());
+                    // 【fix37】岩浆邻接的方向按"无路"处理：候选格或其头位格六邻有岩浆
+                    // 就不挖——挖穿岩浆袖珍层，岩浆会灌进矿道而 NPC 正站在掘进面前面。
+                    // 与 tryDigStep/digStepDown 的邻接标准对齐（此前 strip 是唯一没查的挖掘路径）。
+                    if (touchesLava(candidate) || touchesLava(candidate.above())) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 跳过方向 | 岩浆邻接 "
+                                + candidate.toShortString());
+                        continue;
+                    }
                     if (candidateFeet.is(Blocks.BEDROCK) || candidateHead.is(Blocks.BEDROCK)
                             || isFluid(candidateFeet) || isFluid(candidateHead)
                             || candidateFloor.getCollisionShape(npc.level(), candidate.below()).isEmpty()) {
@@ -2220,6 +2248,19 @@ public final class SkillRunner {
                     return;
                 }
                 dirIndex = chosenDir;
+                // 【fix37】下镐前再查一次岩浆邻接（与候选过滤同口径双保险）：
+                // 命中按"挖不动"转向，别把岩浆放进矿道。
+                if (touchesLava(ahead) || touchesLava(ahead.above())) {
+                    dirIndex++;
+                    failedSteps++;
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 挖前岩浆邻接，转向 | 前方="
+                            + ahead.toShortString() + " 连续失败=" + failedSteps);
+                    if (failedSteps >= 6) {
+                        end("连续 " + failedSteps + " 步被岩浆邻接挡住 Y="
+                                + Math.round(npc.getY()));
+                    }
+                    return;
+                }
                 npc.mineWithBestTool(ahead);
                 npc.mineWithBestTool(ahead.above());
                 // 挖完还挡着：镐子碎了或这块挖不动，继续 walkTo 只是空等卡住。
