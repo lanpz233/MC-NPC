@@ -179,6 +179,8 @@ public final class GoalExecutor {
     /** 目标总超时看门狗状态（第四轮修复 A）：目标开始 tick、最后一次有进展的 tick。 */
     private long goalStartTick;
     private long lastProgressTick;
+    /** 周期裁剪节流计数（第三十三轮）：safeTick 每 10 tick 采样一次，本计数每 10 次≈5 秒触发一轮裁剪。 */
+    private int trimTickCounter;
     /** 上次观察到的"目标相关产出计数"，变化即算进展（见 goalMetric）。 */
     private int progressMetric;
     /** 上次有进展时的位置锚点：离开锚点 6 格以上也算进展（长距离移动/下矿途中）。 */
@@ -517,7 +519,11 @@ public final class GoalExecutor {
         // 背包维护：每 5 秒裁一次"总量超限"的堆积（圆石 >128、泥巴/树苗等）。
         // 不能只在"背包全满"时才裁：实测囤到 836 个圆石占了 14 格，
         // 等满的时候合成产物已经没地方放，变成"空槽=0"的假缺料死循环。
-        if (npc.tickCount % 100 == 0) {
+        // 【第三十三轮】节流改用本地计数：旧写法 npc.tickCount % 100 == 0，而 tick 由
+        // Bukkit 调度每 10 tick 采样一次，采样值恒为同一模 10 余数——相位不对齐时
+        // 永远碰不到 %100，长跑#10 整局周期裁剪零触发、退役镐壳堆了 4 把没人清，
+        // 只有拾取腾格的 dropJunk 偶尔裁一次。本地计数与采样步长无关，钉死每 10 次 tick 一裁。
+        if (++trimTickCounter % 10 == 0) {
             trimOverflow();
         }
         switch (type) {

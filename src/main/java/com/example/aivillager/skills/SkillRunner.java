@@ -1890,20 +1890,25 @@ public final class SkillRunner {
                 unsafeTurns = 0;
 
                 stepStartY = feet.getY();
-                npc.mineWithBestTool(currentCeiling);
-                npc.mineWithBestTool(targetFeet);
-                npc.mineWithBestTool(targetHead);
+                // 【第三十三轮】ascend 是"工具耗尽素手脱困"的路径：选工具不许动退役壳
+                // （allowLastResort=false），没工具就走下面的真素手挖——长跑#10 实测
+                // 兜底+主手挖在这里 7 秒烧光石剑和 4 把退役镐，最后还是卡死。
+                npc.mineWithBestTool(currentCeiling, false);
+                npc.mineWithBestTool(targetFeet, false);
+                npc.mineWithBestTool(targetHead, false);
                 // 没有合适工具时素手挖：石头/泥土用手也能挖开（只是没有掉落），
                 // 这是"工具耗尽被困地下"时唯一的合法脱困办法（Fong 定：不许重生/传送逃逸）。
                 // 基岩这类素手也挖不动的，下面的碰撞验证会照常判失败，不会假成功。
+                // 素手挖必须走 mineBareHand：mine() 挖的是主手物品，生存层把武器切回
+                // 主手时就会拿剑挖石头烧耐久（长跑#10 实证）。
                 if (!npc.level().getBlockState(targetFeet).getCollisionShape(npc.level(), targetFeet).isEmpty()) {
-                    npc.mine(targetFeet);
+                    npc.mineBareHand(targetFeet);
                 }
                 if (!npc.level().getBlockState(targetHead).getCollisionShape(npc.level(), targetHead).isEmpty()) {
-                    npc.mine(targetHead);
+                    npc.mineBareHand(targetHead);
                 }
                 if (!npc.level().getBlockState(currentCeiling).getCollisionShape(npc.level(), currentCeiling).isEmpty()) {
-                    npc.mine(currentCeiling);
+                    npc.mineBareHand(currentCeiling);
                 }
                 // 挖完立刻验证：目标脚部还有碰撞说明挖不动（基岩/保护区域），换方向。
                 if (!npc.level().getBlockState(targetFeet).getCollisionShape(npc.level(), targetFeet).isEmpty()) {

@@ -753,6 +753,16 @@ public final class FakePlayerBody extends ServerPlayer {
     }
 
     public boolean mineWithBestTool(BlockPos pos) {
+        return mineWithBestTool(pos, true);
+    }
+
+    /**
+     * @param allowLastResort 是否允许动用"剩最后 1 点耐久"的退役工具兜底。一般挖掘
+     *                        允许（总比卡死强）；ascend 这类"设计上就该素手挖"的脱困
+     *                        路径传 false——长跑#10 实测兜底在 ascend 里把退役壳一格
+     *                        烧一把、烧完照样得素手挖，壳白白烧光。
+     */
+    public boolean mineWithBestTool(BlockPos pos, boolean allowLastResort) {
         BlockState state = this.level().getBlockState(pos);
         if (state.isAir()) {
             return false;
@@ -852,7 +862,8 @@ public final class FakePlayerBody extends ServerPlayer {
         }
         // 兜底：所有工具都只剩最后 1 耐久时，还是要用一下——总比全空转好。
         // 这种情况只会在多条矿道挖穿、工具群灭时发生（descend 140 级用掉 400+ 耐久）。
-        if (bestSlot < 0) {
+        // 但"本就该素手挖"的路径不走这条（allowLastResort=false），理由见方法注释。
+        if (bestSlot < 0 && allowLastResort) {
             for (int slot = 0; slot < 36; slot++) {
                 ItemStack stack = inventory.getItem(slot);
                 if (stack.isEmpty()) {
@@ -894,6 +905,57 @@ public final class FakePlayerBody extends ServerPlayer {
         }
         boolean mined = mine(pos);
         // 挖完把选中格还原，理由同上面空手挖的分支：否则生存层每次检查都会切回武器。
+        inventory.setSelectedSlot(selected);
+        return mined;
+    }
+
+    /**
+     * 真·素手挖（第三十三轮）：destroyBlock 挖的是主手物品，生存层又总把武器/工具
+     * 切回主手——长跑#10 实测 ascend 名义"用手挖阶梯"，实际拿石剑挖石头：剑 44 格
+     * 烧掉 88 耐久当场碎，接着被换上手的退役镐壳一格碎一把，工具全灭。这里先把
+     * 主手的可损坏物品腾开（选空格/与不可损坏的堆整组对调），挖完原样还原，
+     * 保证一根耐久都不掉。腾不开（快捷栏全满且包里没有不可损坏的堆）才照旧拿着挖。
+     */
+    public boolean mineBareHand(BlockPos pos) {
+        BlockState state = this.level().getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+        Inventory inventory = this.getInventory();
+        int selected = inventory.getSelectedSlot();
+        int swappedSlot = -1;
+        if (inventory.getItem(selected).isDamageableItem()) {
+            boolean moved = false;
+            for (int slot = 0; slot < 9; slot++) {
+                if (inventory.getItem(slot).isEmpty()) {
+                    inventory.setSelectedSlot(slot);
+                    moved = true;
+                    break;
+                }
+            }
+            if (!moved) {
+                for (int slot = 0; slot < 36; slot++) {
+                    if (slot == selected) {
+                        continue;
+                    }
+                    ItemStack other = inventory.getItem(slot);
+                    if (!other.isEmpty() && !other.isDamageableItem()) {
+                        ItemStack hand = inventory.getItem(selected);
+                        inventory.setItem(selected, other);
+                        inventory.setItem(slot, hand);
+                        swappedSlot = slot;
+                        break;
+                    }
+                }
+            }
+        }
+        boolean mined = mine(pos);
+        if (swappedSlot >= 0) {
+            ItemStack hand = inventory.getItem(selected);
+            ItemStack bag = inventory.getItem(swappedSlot);
+            inventory.setItem(selected, bag);
+            inventory.setItem(swappedSlot, hand);
+        }
         inventory.setSelectedSlot(selected);
         return mined;
     }
