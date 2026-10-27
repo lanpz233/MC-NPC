@@ -3124,7 +3124,15 @@ public final class GoalExecutor {
                 return false;
             }
             BlockPos stand = new BlockPos(baseCenter.getX(), baseCenter.getY() + 1, baseCenter.getZ());
-            if (npc.blockPosition().distSqr(stand) > 1.0D) {
+            // 【fix64】到达判定改水平+脚位容差：旧口径 distSqr(stand)>1.0 中
+            // stand 的 Y 是室内脚位（地表+1）、身体方块 Y 低一层，完美站位
+            // dist² 恒 =1.0，任何漂移都 >1 → 每 tick 重发移动、永远不落位
+            // （boot-farm22 水边址放大成游泳循环，干地同样有微移动空转）。
+            double sdx = npc.getX() - (stand.getX() + 0.5D);
+            double sdz = npc.getZ() - (stand.getZ() + 0.5D);
+            boolean atStand = sdx * sdx + sdz * sdz <= 1.44D
+                    && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
+            if (!atStand) {
                 moveToStand(stand, baseActionStuck, "[BASE]");
             }
             return false;
@@ -3256,7 +3264,12 @@ public final class GoalExecutor {
                     return;
                 }
                 BlockPos stand = base.anchor();
-                if (npc.blockPosition().distSqr(stand) > 1.0D) {
+                // 【fix64】同 processBaseQueue：水平+脚位容差判定，免 dist² 恒 ≥1 空转。
+                double bdx = npc.getX() - (stand.getX() + 0.5D);
+                double bdz = npc.getZ() - (stand.getZ() + 0.5D);
+                boolean bedAtStand = bdx * bdx + bdz * bdz <= 1.44D
+                        && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
+                if (!bedAtStand) {
                     moveToStand(stand, bedActionStuck, "[BED]");
                 }
             }
@@ -3472,6 +3485,23 @@ public final class GoalExecutor {
                         || topState.is(Blocks.SAND) || topState.is(Blocks.RED_SAND)
                         || topState.is(Blocks.GRAVEL)) {
                     return false;
+                }
+                // 【fix64】高度表返回值比地表块高一层（boot-farm22 实证：水道列
+                // top=63 而水在 62，上面的 topState 查到的是空气，流体排除从未
+                // 生效，水边址被判合格、站位正落在水道上）。改按标称地表
+                // floor 上下直接扫块：floor-2..floor 任一格有流体即否决；
+                // 农田/作物在足迹内同样否决（房子不许压田，boot-farm22 选址
+                // 足迹压了农田南侧一排）。
+                for (int y = floor - 2; y <= floor; y++) {
+                    BlockState s = level.getBlockState(new BlockPos(x, y, z));
+                    if (!s.getFluidState().isEmpty()) {
+                        return false;
+                    }
+                    if (s.is(Blocks.FARMLAND) || s.is(Blocks.WHEAT)
+                            || s.is(Blocks.CARROTS) || s.is(Blocks.POTATOES)
+                            || s.is(Blocks.BEETROOTS)) {
+                        return false;
+                    }
                 }
                 for (int up = 1; up <= 4; up++) {
                     BlockState above = level.getBlockState(new BlockPos(x, top + up, z));
