@@ -123,6 +123,10 @@ public final class ProgressionPlanner {
      * 主线（附近真没动物不能把整条科技树堵死），退避到期仍由它优先重试。 */
     private int foodFailStreak;
     private long foodBackoffUntil;
+    /** 【fix49】开田专属连败与退避：与皮革/口粮同理——没水没平地的地形里
+     * 开田注定连败，不能让它每轮 decide 都抢在铁线前面重试；退避到期再试。 */
+    private int farmFailStreak;
+    private long farmBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -311,6 +315,16 @@ public final class ProgressionPlanner {
                 } else {
                     foodFailStreak = 0;
                     foodBackoffUntil = 0L;
+                }
+            } else if ("开垦农田".equals(lastStage)) {
+                if (goalFailed) {
+                    farmFailStreak++;
+                    farmBackoffUntil = now + Math.min(300_000L, 60_000L * farmFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 开田退避 | 连败=" + farmFailStreak
+                            + " 退避秒=" + (farmBackoffUntil - now) / 1000L);
+                } else {
+                    farmFailStreak = 0;
+                    farmBackoffUntil = 0L;
                 }
             }
         }
@@ -725,6 +739,54 @@ public final class ProgressionPlanner {
             }
         }
 
+        // 6.7) 种田（fix49·D11，P2 落脚点套装第一位）：五局群系合证 hunt 在
+        // 动物稀疏/斑块分布下靠不住（沙漠局死因主项），田是自己能控的口粮
+        // 来源——靠水开田、循环种植、收了立刻补种。维护（有熟可收/有空地
+        // 可种/口粮紧且有骨粉可催）优先于开田；开田只在口粮低于下矿线时
+        // 立项（富足时不抢主线），且带专属退避防没水地形反复重试。
+        // 夜里不派（夜晚总闸同口径：地表农活属远行型暴露活动）。
+        if (planHas(StagePlan.FARMING) && hasSword && !underground()) {
+            com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.FarmMemory.Farm farm =
+                    com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+            if (farm != null && !farm.cells().isEmpty()) {
+                double farmDistSq = npc.blockPosition().distSqr(farm.anchor());
+                if (!isNight() && farmDistSq <= 48.0D * 48.0D) {
+                    com.example.aivillager.goals.FarmMemory.Scan scan =
+                            com.example.aivillager.goals.FarmMemory.scan(npc.level(), npc.npcName());
+                    boolean canPlant = countItem("wheat_seeds") > 0
+                            || countItem("carrot") > 0 || countItem("potato") > 0;
+                    boolean bonemealCase = scan.growing() > 0 && countItem("bone_meal") > 0
+                            && foodNutrition() < MINING_FOOD_NUTRITION;
+                    if (scan.mature() > 0 || (canPlant && (scan.emptyFarmland() > 0
+                            || scan.lost() > 0)) || bonemealCase) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 农田维护触发 | 熟=" + scan.mature()
+                                + " 空=" + scan.emptyFarmland() + " 坏=" + scan.lost()
+                                + " 长=" + scan.growing());
+                        return goal("农田维护", "farm", params("mode", "tend"));
+                    }
+                }
+            } else if (!isNight() && foodNutrition() < MINING_FOOD_NUTRITION
+                    && System.currentTimeMillis() >= farmBackoffUntil) {
+                // 先有锄头再开田（玩家常识）：石锄优先、木锄兜底；
+                // 材料不够就落空本步，主线砍树/挖石自然会把材料补上。
+                if (!hasAny("wooden_hoe", "stone_hoe", "iron_hoe", "golden_hoe",
+                        "diamond_hoe", "netherite_hoe")) {
+                    if (cobble >= 2 && stickMaterial) {
+                        return goal("制作石锄", "craft", params("item", "stone_hoe", "count", 1));
+                    }
+                    if (stickMaterial && wood >= (sticks >= 2 ? 2 : 4)) {
+                        return goal("制作木锄", "craft", params("item", "wooden_hoe", "count", 1));
+                    }
+                } else {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 开田触发 | foodNutrition="
+                            + foodNutrition() + "/" + MINING_FOOD_NUTRITION
+                            + "（hunt 不稳，田是根治项）");
+                    return goal("开垦农田", "farm", params("mode", "establish"));
+                }
+            }
+        }
+
         // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
         // 针叶林等细雪地带时，皮靴从"顺手做"升级为"优先做"——没皮靴在雪地
         // 里寸步难行（寻路已避开细雪，没靴寸步难行的是探索范围被雪原封死）。
@@ -946,6 +1008,20 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.FOOD) && rawMeatEarly != null && hasFurnace && canFuel()) {
             return goal("烤肉", "smelt",
                     params("item", cookedOf(rawMeatEarly), "count", 8));
+        }
+
+        // 12.6) 农产品加工（fix49·D11）：只有富余才进口粮——小麦做面包
+        // （3 小麦=1 面包，Wiki；小麦本身不能直接吃），土豆烤熟再吃且只烤
+        // 留苗线（8）以上的富余。都排在钻石段之前，口径同烤肉前置。
+        int wheatCount = countItem("wheat");
+        if (planHas(StagePlan.FARMING) && wheatCount >= 3) {
+            return goal("做面包", "craft",
+                    params("item", "bread", "count", countItem("bread") + wheatCount / 3));
+        }
+        int potatoCount = countItem("potato");
+        if (planHas(StagePlan.FARMING) && potatoCount > 8 && hasFurnace && canFuel()) {
+            return goal("烤土豆", "smelt",
+                    params("item", "baked_potato", "count", potatoCount - 8));
         }
 
         // 13) 钻石：铁镐才能挖，Y=-54 附近最多。

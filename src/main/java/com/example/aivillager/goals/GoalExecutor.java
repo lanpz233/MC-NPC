@@ -178,6 +178,42 @@ public final class GoalExecutor {
     private String huntNeed = "";
     private int huntStockTarget;
     private int lastHuntStock = -1;
+    // ---- 种田（第四十九轮 fix49，D11）----
+    /** 田块目标格数：一块小田 8 格，够验证循环种植、也不贪大。 */
+    private static final int FARM_PLOT_CELLS = 8;
+    /** 留种地板：小麦种子背包存量低于此数不许再扩种（收获补种不受此限，见 canPlantCrop）。 */
+    private static final int FARM_SEED_FLOOR = 4;
+    /** 胡萝卜/土豆留苗地板：背包+在田总量低于此数时不许吃、不许烤（生存层守卫同口径）。 */
+    private static final int FARM_STOCK_FLOOR = 8;
+    /** farm 目标模式（establish/tend/auto）与阶段机。 */
+    private String farmMode = "";
+    private int farmPhase;
+    /** 待办动作队列：锄/种/收/骨粉逐个执行（动作本身是瞬时直改，移动靠 goto 技能）。 */
+    private final java.util.List<FarmAction> farmActions = new java.util.ArrayList<>();
+    /** 选址结果（土格清单）；null 表示还没选到址。 */
+    private java.util.List<BlockPos> farmSiteCells;
+    private int farmSiteAttempts;
+    /** 同一动作连续走不到位的次数：超限丢弃该动作，防一块田卡死整个目标。 */
+    private int farmActionStuck;
+    private String farmLastActionKey = "";
+    /** 本访已收获的土格（拾取阶段要挨个走过田面收掉落物）。 */
+    private final java.util.List<BlockPos> farmHarvestedSoils = new java.util.ArrayList<>();
+    private int farmPickupIndex;
+    /** 骨粉阶段是否已排过队（维护访内只催一轮，防骨粉烧光）。 */
+    private boolean farmBonemealQueued;
+    /** 本目标内动作队列是否已构建（establish 的锄种队列 / tend 的补种队列各建一次）。 */
+    private boolean farmQueueBuilt;
+    /** 骨粉后复查的第二轮收获是否已走过（防收获↔骨粉来回横跳）。 */
+    private boolean farmSecondPass;
+    /** 维护访开始时的农产存量基线，收尾按差额记账（资源流水）。 */
+    private int farmBaseWheat;
+    private int farmBaseSeeds;
+    private int farmBaseCarrot;
+    private int farmBasePotato;
+
+    /** 一个田间动作：kind=till/plant/harvest/bonemeal；pos 语义见各动作实现（till/plant=土格，harvest/bonemeal=作物格）。 */
+    private record FarmAction(String kind, BlockPos pos, String crop) {
+    }
     /** 定点猎杀：目标实体 ID、对应掉落物、开始时背包里的掉落数量。 */
     private String slayEntity = "";
     private String slayDrop = "string";
@@ -275,7 +311,7 @@ public final class GoalExecutor {
                 || "dig".equals(action) || "smelt".equals(action) || "hunt".equals(action)
                 || "flint".equals(action) || "obsidian".equals(action) || "portal".equals(action)
                 || "enterportal".equals(action) || "slay".equals(action) || "travel".equals(action)
-                || "revisit".equals(action)
+                || "revisit".equals(action) || "farm".equals(action)
                 || "endportal".equals(action) || "dragon".equals(action);
     }
 
@@ -354,6 +390,13 @@ public final class GoalExecutor {
                 huntStockTarget = intent.intParam("stock",
                         "leather".equals(huntNeed) ? 4 : 24);
                 lastHuntStock = -1;
+            }
+            case "farm" -> {
+                // 【fix49·种田】mode=establish 开田 / tend 维护（收获补种）；
+                // 缺省 auto：有田维护、无田开田，tickFarm 按账本现状分流。
+                farmMode = intent.param("mode", "auto");
+                newTarget = "farm:" + farmMode;
+                newCount = 1;
             }
             case "flint" -> {
                 newTarget = "flint";
@@ -440,6 +483,22 @@ public final class GoalExecutor {
         endPhase = 0;
         dragonPhase = 0;
         dragonAttempts = 0;
+        // 【fix49】种田状态机复位（farmMode 已在解析段按参数设好）。
+        farmPhase = 0;
+        farmActions.clear();
+        farmSiteCells = null;
+        farmSiteAttempts = 0;
+        farmActionStuck = 0;
+        farmLastActionKey = "";
+        farmHarvestedSoils.clear();
+        farmPickupIndex = 0;
+        farmBonemealQueued = false;
+        farmQueueBuilt = false;
+        farmSecondPass = false;
+        farmBaseWheat = countItem("wheat");
+        farmBaseSeeds = countItem("wheat_seeds");
+        farmBaseCarrot = countItem("carrot");
+        farmBasePotato = countItem("potato");
         portalOrigin = null;
         portalPhase = 0;
         enterAttempts = 0;
@@ -465,6 +524,7 @@ public final class GoalExecutor {
                     + " x" + targetCount + "（Y≈" + oreTarget.y() + "）";
             case "smelt" -> "熔炼 " + targetId + " x" + targetCount;
             case "hunt" -> "狩猎 " + targetCount + " 只动物";
+            case "farm" -> "种田 " + farmMode;
             case "flint" -> "找燧石 x" + targetCount;
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
             case "portal" -> "建造并点燃下界传送门";
@@ -567,6 +627,7 @@ public final class GoalExecutor {
             case "revisit" -> tickRevisit();
             case "smelt" -> tickSmelt();
             case "hunt" -> tickHunt();
+            case "farm" -> tickFarm();
             case "flint" -> tickFlint();
             case "obsidian" -> tickObsidian();
             case "portal" -> tickPortal();
@@ -2074,10 +2135,682 @@ public final class GoalExecutor {
             case "cooked_chicken" -> "raw_chicken";
             case "cooked_mutton" -> "raw_mutton";
             case "cooked_rabbit" -> "raw_rabbit";
+            case "baked_potato" -> "potato";
             case "glass" -> "sand";
             case "stone" -> "cobblestone";
             default -> null;
         };
+    }
+
+    // ---------------------------------------------------------------- 种田（fix49·D11）
+
+    /**
+     * 种田目标（Fong D11）：开田（establish）与维护（tend）共用一个目标类型，
+     * 按 FarmMemory 账本现状分流。玩家口径的闭环：攒种（打草 1/8 掉种子，
+     * Wiki）→ 靠水选址（湿润=水水平 4 格内同层或高 1 层）→ 锄地播种 →
+     * 等熟 → 收获后立刻补种；维护访 = 收获→走过田面拾取→补种/补锄→
+     * （口粮紧且有骨粉时）催熟一轮再复查。锄/种/骨粉走直改方块+代码内
+     * 原版规则校验（placeFurnace 先例：伪玩家无客户端不走 useItemOn），
+     * 收获走 mineBareHand 真掉落；留种靠"播种不耗总存量（只入土）+
+     * 消费端地板（生存层进食守卫/规划层烤土豆只烤富余）"两头守。
+     */
+    private void tickFarm() {
+        FarmMemory.bindWorld(npc.level());
+        FarmMemory.Farm farm = FarmMemory.farm(npc.npcName());
+        boolean tend = farm != null && !farm.cells().isEmpty() && farmHasLiveCells(farm)
+                && !"establish".equals(farmMode);
+        if (tend) {
+            tickFarmTend(farm);
+        } else {
+            tickFarmEstablish();
+        }
+    }
+
+    /** 田格里还有没有能救的土（耕地或可重锄的土）：全变成水/石才算田没了、需要重选址。 */
+    private boolean farmHasLiveCells(FarmMemory.Farm farm) {
+        for (FarmMemory.Cell cell : farm.cells()) {
+            BlockState state = npc.level().getBlockState(cell.soil());
+            if (state.is(Blocks.FARMLAND) || state.is(Blocks.GRASS_BLOCK)
+                    || state.is(Blocks.DIRT) || state.is(Blocks.COARSE_DIRT)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 播种材料总量（小麦种子 + 胡萝卜 + 土豆，三者都能下地）。 */
+    private int plantStockTotal() {
+        return countItem("wheat_seeds") + countItem("carrot") + countItem("potato");
+    }
+
+    private void tickFarmEstablish() {
+        switch (farmPhase) {
+            case 0 -> {
+                status = "种田：开田准备";
+                if (findHoeSlot() < 0) {
+                    finish("开田放弃：没有可用的锄头");
+                    return;
+                }
+                farmPhase = plantStockTotal() >= FARM_PLOT_CELLS ? 2 : 1;
+            }
+            case 1 -> {
+                // 攒种子：打草 1/8 掉小麦种子（Wiki），攒够一田（8）再开田；
+                // 草就长在地表，mine 技能半径内有草就打、没有就扩围换位。
+                status = "种田：打草攒种子 " + plantStockTotal() + "/" + FARM_PLOT_CELLS;
+                if (plantStockTotal() >= FARM_PLOT_CELLS) {
+                    farmPhase = 2;
+                    return;
+                }
+                if (!"idle".equals(skills.currentSkill())) {
+                    return;
+                }
+                JsonObject grass = new JsonObject();
+                grass.addProperty("block", "short_grass");
+                grass.addProperty("radius", GATHER_RADIUS);
+                if (skills.run(new Intent("", "mine", grass), "目标")) {
+                    return;
+                }
+                JsonObject tall = new JsonObject();
+                tall.addProperty("block", "tall_grass");
+                tall.addProperty("radius", GATHER_RADIUS);
+                if (skills.run(new Intent("", "mine", tall), "目标")) {
+                    return;
+                }
+                attempts++;
+                if (attempts >= MAX_GATHER_FAILS) {
+                    if (plantStockTotal() >= 4) {
+                        LOG.info("[AIV][GOAL] " + npc.npcName()
+                                + " [FARM] 种子只攒到 " + plantStockTotal() + "，开小块田");
+                        farmPhase = 2;
+                    } else {
+                        finish("开田放弃：附近攒不到种子（打草） stock=" + plantStockTotal());
+                    }
+                    return;
+                }
+                escalateSearch();
+            }
+            case 2 -> {
+                status = "种田：选址（靠水平地）";
+                if (farmSiteCells == null) {
+                    farmSiteCells = findFarmSite();
+                    if (farmSiteCells == null) {
+                        farmSiteAttempts++;
+                        if (farmSiteAttempts >= 4) {
+                            finish("开田放弃：附近找不到靠水的平地");
+                            return;
+                        }
+                        if ("idle".equals(skills.currentSkill())) {
+                            escalateSearch();
+                        }
+                        return;
+                    }
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 选址 | cells="
+                            + farmSiteCells.size() + " anchor=" + farmSiteCells.get(0).toShortString());
+                }
+                farmPhase = 3;
+            }
+            case 3 -> {
+                status = "种田：锄地播种";
+                if (!farmQueueBuilt) {
+                    buildEstablishQueue();
+                    farmQueueBuilt = true;
+                }
+                if (!processFarmActions()) {
+                    return;
+                }
+                farmPhase = 4;
+            }
+            case 4 -> {
+                // 落盘：以活方块为准登记（锄成耕地的格才入账，种上作物的记作物）。
+                java.util.List<FarmMemory.Cell> cells = new java.util.ArrayList<>();
+                int planted = 0;
+                for (BlockPos soil : farmSiteCells) {
+                    BlockState soilState = npc.level().getBlockState(soil);
+                    if (!soilState.is(Blocks.FARMLAND)) {
+                        continue;
+                    }
+                    String crop = FarmMemory.cropOf(
+                            npc.level().getBlockState(soil.above()).getBlock());
+                    cells.add(new FarmMemory.Cell(soil.getX(), soil.getY(), soil.getZ(),
+                            crop == null ? "" : crop));
+                    if (crop != null) {
+                        planted++;
+                    }
+                }
+                if (cells.isEmpty()) {
+                    finish("开田失败：一格耕地都没锄成");
+                    return;
+                }
+                BlockPos anchor = farmSiteCells.get(0);
+                FarmMemory.save(npc.npcName(), new FarmMemory.Farm(FarmMemory.worldKey(),
+                        anchor.getX(), anchor.getY(), anchor.getZ(),
+                        System.currentTimeMillis(), cells));
+                InventorySnapshot.log(npc, "farm", "establish", true);
+                finish("开田完成 | 格=" + cells.size() + " 已种=" + planted
+                        + " 种子余=" + plantStockTotal()
+                        + " @ " + anchor.toShortString());
+            }
+            default -> finish("开田失败：未知阶段 " + farmPhase);
+        }
+    }
+
+    private void tickFarmTend(FarmMemory.Farm farm) {
+        switch (farmPhase) {
+            case 0 -> {
+                status = "种田：回田";
+                BlockPos anchor = farm.anchor();
+                double distSq = npc.blockPosition().distSqr(anchor);
+                if (distSq > 100.0D && "idle".equals(skills.currentSkill())) {
+                    JsonObject go = new JsonObject();
+                    go.addProperty("x", anchor.getX() + 0.5D);
+                    go.addProperty("z", anchor.getZ() + 0.5D);
+                    if (skills.run(new Intent("", "goto", go), "目标")) {
+                        return;
+                    }
+                }
+                if (distSq > 16.0D && !"idle".equals(skills.currentSkill())) {
+                    return;
+                }
+                // 收获队列：只收成熟的（age=7；未熟收只有 1 粒种子、没小麦，Wiki）。
+                farmActions.clear();
+                for (FarmMemory.Cell cell : farm.cells()) {
+                    BlockState cropState = npc.level().getBlockState(cell.soil().above());
+                    String crop = FarmMemory.cropOf(cropState.getBlock());
+                    if (crop != null && FarmMemory.cropAge(cropState) >= 7) {
+                        farmActions.add(new FarmAction("harvest", cell.soil().above(), crop));
+                    }
+                }
+                farmPhase = farmActions.isEmpty() ? 2 : 1;
+            }
+            case 1 -> {
+                status = "种田：收获 " + farmActions.size() + " 格";
+                if (!processFarmActions()) {
+                    return;
+                }
+                farmPickupIndex = 0;
+                farmPhase = 2;
+            }
+            case 2 -> {
+                // 拾取：挨个走过刚收获的土格收掉落（平走过田面不踩坏，
+                // Wiki 口径踩坏=从 1 格以上落下；田是平地、同层步行安全）。
+                status = "种田：拾取掉落 " + farmPickupIndex + "/" + farmHarvestedSoils.size();
+                if (farmPickupIndex >= farmHarvestedSoils.size()) {
+                    farmPhase = 3;
+                    return;
+                }
+                if (!"idle".equals(skills.currentSkill())) {
+                    return;
+                }
+                BlockPos cell = farmHarvestedSoils.get(farmPickupIndex);
+                if (farmInReach(cell)) {
+                    farmPickupIndex++;
+                    farmActionStuck = 0;
+                    farmLastActionKey = "";
+                    return;
+                }
+                String key = "pickup@" + cell.toShortString();
+                if (key.equals(farmLastActionKey) && ++farmActionStuck > 4) {
+                    farmPickupIndex++;
+                    farmActionStuck = 0;
+                    farmLastActionKey = "";
+                    return;
+                }
+                farmLastActionKey = key;
+                JsonObject go = new JsonObject();
+                go.addProperty("x", cell.getX() + 0.5D);
+                go.addProperty("z", cell.getZ() + 0.5D);
+                skills.run(new Intent("", "goto", go), "目标");
+            }
+            case 3 -> {
+                status = "种田：补种补锄";
+                if (!farmQueueBuilt) {
+                    buildTendQueue(farm);
+                    farmQueueBuilt = true;
+                }
+                farmPhase = 4;
+            }
+            case 4 -> {
+                status = "种田：田间作业 " + farmActions.size() + " 项";
+                if (!processFarmActions()) {
+                    return;
+                }
+                if (farmBonemealQueued && !farmSecondPass) {
+                    // 骨粉刚催过：回收获段复查一次（可能已有新熟的）。
+                    farmSecondPass = true;
+                    farmQueueBuilt = false;
+                    farmPhase = 0;
+                    return;
+                }
+                farmPhase = 5;
+            }
+            case 5 -> {
+                // 更新账本：死格（土变成水/石等非土方块）销账，其余按活方块刷新作物。
+                java.util.List<FarmMemory.Cell> cells = new java.util.ArrayList<>();
+                for (FarmMemory.Cell cell : farm.cells()) {
+                    BlockState soilState = npc.level().getBlockState(cell.soil());
+                    if (!soilState.is(Blocks.FARMLAND) && !soilState.is(Blocks.GRASS_BLOCK)
+                            && !soilState.is(Blocks.DIRT) && !soilState.is(Blocks.COARSE_DIRT)) {
+                        continue;
+                    }
+                    String crop = FarmMemory.cropOf(
+                            npc.level().getBlockState(cell.soil().above()).getBlock());
+                    cells.add(new FarmMemory.Cell(cell.x(), cell.y(), cell.z(),
+                            crop == null ? "" : crop));
+                }
+                FarmMemory.save(npc.npcName(), new FarmMemory.Farm(farm.world(),
+                        farm.anchorX(), farm.anchorY(), farm.anchorZ(),
+                        farm.establishedAt(), cells));
+                FarmMemory.Scan scan = FarmMemory.scan(npc.level(), npc.npcName());
+                InventorySnapshot.log(npc, "farm", "tend", true);
+                finish("农田维护完成 | 收获Δ 小麦=" + (countItem("wheat") - farmBaseWheat)
+                        + " 种子=" + (countItem("wheat_seeds") - farmBaseSeeds)
+                        + " 胡萝卜=" + (countItem("carrot") - farmBaseCarrot)
+                        + " 土豆=" + (countItem("potato") - farmBasePotato)
+                        + " | 在田=" + scan.plantedTotal() + "（熟" + scan.mature()
+                        + "/长" + scan.growing() + "） 播种存量=" + plantStockTotal());
+            }
+            default -> finish("农田维护失败：未知阶段 " + farmPhase);
+        }
+    }
+
+    /** 开田动作队列：每格先锄后种；种什么按当时存量模拟分配（见 chooseCropSim）。 */
+    private void buildEstablishQueue() {
+        farmActions.clear();
+        int[] stock = {countItem("wheat_seeds"), countItem("carrot"), countItem("potato")};
+        int[] planted = {0, 0, 0};
+        for (BlockPos soil : farmSiteCells) {
+            farmActions.add(new FarmAction("till", soil, ""));
+            String crop = chooseCropSim(stock, planted);
+            if (crop != null) {
+                farmActions.add(new FarmAction("plant", soil, crop));
+            }
+        }
+    }
+
+    /** 维护动作队列：空地补种（优先原作物）、坏地补锄补种、口粮紧时骨粉催熟一轮。 */
+    private void buildTendQueue(FarmMemory.Farm farm) {
+        farmActions.clear();
+        int[] stock = {countItem("wheat_seeds"), countItem("carrot"), countItem("potato")};
+        int[] planted = {0, 0, 0};
+        java.util.List<FarmAction> bonemealCandidates = new java.util.ArrayList<>();
+        for (FarmMemory.Cell cell : farm.cells()) {
+            BlockPos soil = cell.soil();
+            BlockState soilState = npc.level().getBlockState(soil);
+            BlockState cropState = npc.level().getBlockState(soil.above());
+            String liveCrop = FarmMemory.cropOf(cropState.getBlock());
+            if (liveCrop != null) {
+                int idx = cropIndex(liveCrop);
+                planted[idx]++;
+                int age = FarmMemory.cropAge(cropState);
+                if (age >= 0 && age < 7) {
+                    bonemealCandidates.add(new FarmAction("bonemeal", soil.above(), liveCrop));
+                }
+                continue;
+            }
+            if (soilState.is(Blocks.FARMLAND)) {
+                String crop = chooseCropSim(stock, planted,
+                        cell.crop().isEmpty() ? null : cell.crop());
+                if (crop != null) {
+                    farmActions.add(new FarmAction("plant", soil, crop));
+                }
+            } else if (soilState.is(Blocks.GRASS_BLOCK) || soilState.is(Blocks.DIRT)
+                    || soilState.is(Blocks.COARSE_DIRT)) {
+                // 耕地干回泥土/被踩坏：补锄再补种（玩家常识，田不能就这么荒着）。
+                farmActions.add(new FarmAction("till", soil, ""));
+                String crop = chooseCropSim(stock, planted,
+                        cell.crop().isEmpty() ? null : cell.crop());
+                if (crop != null) {
+                    farmActions.add(new FarmAction("plant", soil, crop));
+                }
+            }
+            // 土变成水/石等：死格，不排动作，收尾时账本销账。
+        }
+        // 骨粉催熟（Wiki：+2~5 阶段）：口粮低于下矿线、包里有骨粉、田里有
+        // 没熟的作物时才舍得用——骨粉也是打骷髅攒的，不许日常浪费。
+        if (!farmBonemealQueued && foodNutrition() < 24 && countItem("bone_meal") > 0
+                && !bonemealCandidates.isEmpty()) {
+            bonemealCandidates.sort((a, b) -> Integer.compare(
+                    FarmMemory.cropAge(npc.level().getBlockState(b.pos())),
+                    FarmMemory.cropAge(npc.level().getBlockState(a.pos()))));
+            int uses = Math.min(countItem("bone_meal"), Math.min(4, bonemealCandidates.size()));
+            for (int i = 0; i < uses; i++) {
+                farmActions.add(bonemealCandidates.get(i));
+            }
+            farmBonemealQueued = true;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 骨粉催熟 | 目标格=" + uses
+                    + " foodNutrition=" + foodNutrition());
+        }
+    }
+
+    private static int cropIndex(String crop) {
+        return switch (crop) {
+            case "carrot" -> 1;
+            case "potato" -> 2;
+            default -> 0;
+        };
+    }
+
+    /**
+     * 按模拟存量给一格选作物（stock/planted 数组随选随扣，队列建完即弃）：
+     * 稀有作物（胡萝卜/土豆，来源靠僵尸掉落/村庄）先各种 2 格繁殖起来，
+     * 其余种小麦（主粮）；原作物优先（补种保持田面格局）。
+     * 播种不耗总存量（种子只是入土），故这里不设地板门——地板守在
+     * 消费端（吃/烤），见 SurvivalController 与规划层烤土豆步。
+     */
+    private String chooseCropSim(int[] stock, int[] planted) {
+        return chooseCropSim(stock, planted, null);
+    }
+
+    private String chooseCropSim(int[] stock, int[] planted, String preferred) {
+        if (preferred != null && stock[cropIndex(preferred)] > 0) {
+            int idx = cropIndex(preferred);
+            stock[idx]--;
+            planted[idx]++;
+            return preferred;
+        }
+        String[] order = {"carrot", "potato", "wheat"};
+        for (String crop : order) {
+            int idx = cropIndex(crop);
+            if (stock[idx] <= 0) {
+                continue;
+            }
+            if (!"wheat".equals(crop) && planted[idx] >= 2) {
+                continue;
+            }
+            stock[idx]--;
+            planted[idx]++;
+            return crop;
+        }
+        // 稀有作物都已种满 2 格、或只剩小麦：有什么种什么。
+        for (String crop : order) {
+            int idx = cropIndex(crop);
+            if (stock[idx] > 0) {
+                stock[idx]--;
+                planted[idx]++;
+                return crop;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 逐个执行动作队列：技能在跑就等；到位就当场执行（动作是瞬时直改），
+     * 走不到位先 goto 到田边格；同一动作反复走不到位超限就跳过它，
+     * 不许一格田卡死整个目标（看门狗之外再加一道单格保险）。
+     *
+     * @return true = 队列已清空
+     */
+    private boolean processFarmActions() {
+        while (!farmActions.isEmpty()) {
+            FarmAction action = farmActions.get(0);
+            if (!farmActionValid(action)) {
+                farmActions.remove(0);
+                farmActionStuck = 0;
+                farmLastActionKey = "";
+                continue;
+            }
+            if (!"idle".equals(skills.currentSkill())) {
+                return false;
+            }
+            if (!farmInReach(actionReachPos(action))) {
+                String key = action.kind() + "@" + action.pos().toShortString();
+                if (key.equals(farmLastActionKey) && ++farmActionStuck > 6) {
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 动作跳过（反复走不到位） | "
+                            + key);
+                    farmActions.remove(0);
+                    farmActionStuck = 0;
+                    farmLastActionKey = "";
+                    continue;
+                }
+                farmLastActionKey = key;
+                farmGotoStandFor(action);
+                return false;
+            }
+            farmActionStuck = 0;
+            farmLastActionKey = "";
+            doFarmAction(action);
+            farmActions.remove(0);
+        }
+        return true;
+    }
+
+    /** 动作的可达判定点：till/plant 看土格，harvest/bonemeal 看作物格。 */
+    private BlockPos actionReachPos(FarmAction action) {
+        return action.pos();
+    }
+
+    /** 动作执行前复核（方块可能在排队后被水流/怪/自己改掉，失效就丢）。 */
+    private boolean farmActionValid(FarmAction action) {
+        BlockState state = npc.level().getBlockState(action.pos());
+        return switch (action.kind()) {
+            case "till" -> state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.DIRT)
+                    || state.is(Blocks.COARSE_DIRT) || state.is(Blocks.ROOTED_DIRT);
+            case "plant" -> state.is(Blocks.FARMLAND)
+                    && npc.level().getBlockState(action.pos().above()).isAir()
+                    && countItem(FarmMemory.seedItemOf(action.crop())) > 0;
+            case "harvest" -> {
+                String crop = FarmMemory.cropOf(state.getBlock());
+                yield crop != null && FarmMemory.cropAge(state) >= 7;
+            }
+            case "bonemeal" -> {
+                String crop = FarmMemory.cropOf(state.getBlock());
+                yield crop != null && FarmMemory.cropAge(state) < 7
+                        && countItem("bone_meal") > 0;
+            }
+            default -> false;
+        };
+    }
+
+    /** NPC 是否已在动作格的操作范围内（水平 3.2 格、落差 -1~+3）。 */
+    private boolean farmInReach(BlockPos pos) {
+        double dx = npc.getX() - (pos.getX() + 0.5D);
+        double dz = npc.getZ() - (pos.getZ() + 0.5D);
+        double dy = npc.getY() - pos.getY();
+        return dx * dx + dz * dz <= 10.24D && dy >= -1.0D && dy <= 3.0D;
+    }
+
+    /** 走到动作格旁边的落脚格（优先土格四邻的实心非田格；没有就直奔土格，goto 自己找落点）。 */
+    private void farmGotoStandFor(FarmAction action) {
+        BlockPos soil = ("harvest".equals(action.kind()) || "bonemeal".equals(action.kind()))
+                ? action.pos().below() : action.pos();
+        BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] dir : dirs) {
+            BlockPos candidate = soil.offset(dir[0], 0, dir[1]);
+            BlockState state = npc.level().getBlockState(candidate);
+            if (state.is(Blocks.FARMLAND) || FarmMemory.cropOf(state.getBlock()) != null) {
+                continue;
+            }
+            if (state.getCollisionShape(npc.level(), candidate).isEmpty()) {
+                continue;
+            }
+            if (!npc.level().getBlockState(candidate.above()).getCollisionShape(
+                    npc.level(), candidate.above()).isEmpty()) {
+                continue;
+            }
+            double sq = npc.blockPosition().distSqr(candidate);
+            if (sq < bestSq) {
+                bestSq = sq;
+                best = candidate;
+            }
+        }
+        BlockPos target = best != null ? best : soil;
+        JsonObject go = new JsonObject();
+        go.addProperty("x", target.getX() + 0.5D);
+        go.addProperty("z", target.getZ() + 0.5D);
+        skills.run(new Intent("", "goto", go), "目标");
+    }
+
+    /** 执行一个田间动作（瞬时；规则校验在 farmActionValid 与本方法内双保险）。 */
+    private void doFarmAction(FarmAction action) {
+        switch (action.kind()) {
+            case "till" -> {
+                // 土上方若有草，先清掉（顺手还能掉种子，1/8，Wiki）。
+                BlockPos above = action.pos().above();
+                Block aboveBlock = npc.level().getBlockState(above).getBlock();
+                if (aboveBlock == Blocks.SHORT_GRASS || aboveBlock == Blocks.TALL_GRASS
+                        || aboveBlock == Blocks.FERN || aboveBlock == Blocks.LARGE_FERN) {
+                    npc.mineBareHand(above);
+                }
+                int moisture = farmHydrated(action.pos()) ? 7 : 0;
+                npc.level().setBlockAndUpdate(action.pos(),
+                        Blocks.FARMLAND.defaultBlockState().setValue(
+                                net.minecraft.world.level.block.FarmBlock.MOISTURE, moisture));
+                damageHoe();
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 锄地 | "
+                        + action.pos().toShortString() + " moisture=" + moisture);
+            }
+            case "plant" -> {
+                // 亮度 ≤7 原版种不下（Wiki：光照不足植株会掉落），露天白天恒满足。
+                boolean lit = npc.level().canSeeSky(action.pos().above())
+                        || npc.level().getMaxLocalRawBrightness(action.pos().above()) >= 8;
+                if (!lit) {
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 播种跳过（光照不足） | "
+                            + action.pos().toShortString());
+                    return;
+                }
+                String seedItem = FarmMemory.seedItemOf(action.crop());
+                if (!consume(seedItem, 1)) {
+                    return;
+                }
+                Block cropBlock = FarmMemory.blockOfCrop(action.crop());
+                npc.level().setBlockAndUpdate(action.pos().above(),
+                        cropBlock.defaultBlockState());
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 播种 | crop=" + action.crop()
+                        + " @ " + action.pos().toShortString());
+            }
+            case "harvest" -> {
+                if (npc.mineBareHand(action.pos())) {
+                    farmHarvestedSoils.add(action.pos().below());
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 收获 | crop=" + action.crop()
+                            + " @ " + action.pos().toShortString());
+                }
+            }
+            case "bonemeal" -> {
+                BlockState state = npc.level().getBlockState(action.pos());
+                int age = FarmMemory.cropAge(state);
+                if (age < 0 || !consume("bone_meal", 1)) {
+                    return;
+                }
+                int newAge = Math.min(7, age + 2 + npc.getRandom().nextInt(4));
+                npc.level().setBlockAndUpdate(action.pos(), state.setValue(
+                        net.minecraft.world.level.block.state.properties.BlockStateProperties.AGE_7,
+                        newAge));
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 骨粉 | age " + age + "→" + newAge
+                        + " @ " + action.pos().toShortString());
+            }
+            default -> {
+            }
+        }
+    }
+
+    /**
+     * 选址（玩家口径）：地表草/泥土格、上方见天、水平 4 格内有水（湿润口径，
+     * Wiki），成团 ≥5 格才算一块田，目标 8 格。只看已加载区块的地表，
+     * 不为找田加载新区块（与找树同口径，非透视）。
+     */
+    private java.util.List<BlockPos> findFarmSite() {
+        if (!(npc.level() instanceof ServerLevel level)) {
+            return null;
+        }
+        BlockPos me = npc.blockPosition();
+        java.util.List<BlockPos> candidates = new java.util.ArrayList<>();
+        for (int dx = -26; dx <= 26; dx++) {
+            for (int dz = -26; dz <= 26; dz++) {
+                int x = me.getX() + dx;
+                int z = me.getZ() + dz;
+                if (level.getChunkIfLoaded(x >> 4, z >> 4) == null) {
+                    continue;
+                }
+                int topY = level.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                        x, z) - 1;
+                BlockPos ground = new BlockPos(x, topY, z);
+                BlockState state = level.getBlockState(ground);
+                if (!state.is(Blocks.GRASS_BLOCK) && !state.is(Blocks.DIRT)) {
+                    continue;
+                }
+                BlockState above = level.getBlockState(ground.above());
+                if (!above.isAir() && !above.is(Blocks.SHORT_GRASS) && !above.is(Blocks.TALL_GRASS)
+                        && !above.is(Blocks.FERN) && !above.is(Blocks.LARGE_FERN)
+                        && !above.is(Blocks.SNOW)) {
+                    continue;
+                }
+                if (!level.canSeeSky(ground.above())) {
+                    continue;
+                }
+                if (!farmHydrated(ground)) {
+                    continue;
+                }
+                candidates.add(ground);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        candidates.sort(java.util.Comparator.comparingDouble(me::distSqr));
+        BlockPos seed = candidates.get(0);
+        java.util.List<BlockPos> cluster = new java.util.ArrayList<>();
+        for (BlockPos candidate : candidates) {
+            int chebyshev = Math.max(Math.abs(candidate.getX() - seed.getX()),
+                    Math.abs(candidate.getZ() - seed.getZ()));
+            if (chebyshev <= 3 && Math.abs(candidate.getY() - seed.getY()) <= 1) {
+                cluster.add(candidate);
+                if (cluster.size() >= FARM_PLOT_CELLS) {
+                    break;
+                }
+            }
+        }
+        return cluster.size() >= 5 ? cluster : null;
+    }
+
+    /** 湿润判定（Wiki）：水平 4 格内、同层或高 1 层有水。 */
+    private boolean farmHydrated(BlockPos soil) {
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dz = -4; dz <= 4; dz++) {
+                for (int dy = 0; dy <= 1; dy++) {
+                    if (npc.level().getBlockState(soil.offset(dx, dy, dz)).is(Blocks.WATER)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 背包里第一把可用锄头的槽位（剩 1 点耐久的按没有算，口径同镐）。 */
+    private int findHoeSlot() {
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !pathOf(stack).endsWith("_hoe")) {
+                continue;
+            }
+            if (!stack.isDamageableItem() || stack.getDamageValue() < stack.getMaxDamage() - 1) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    /** 锄一次地记 1 点耐久（原版锄地消耗），坏了按 [TOOL-BREAK] 记账。 */
+    private void damageHoe() {
+        int slot = findHoeSlot();
+        if (slot < 0) {
+            return;
+        }
+        ItemStack stack = npc.getInventory().getItem(slot);
+        if (!stack.isDamageableItem()) {
+            return;
+        }
+        int damage = stack.getDamageValue() + 1;
+        if (damage >= stack.getMaxDamage()) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [TOOL-BREAK] " + pathOf(stack)
+                    + " 锄地用坏 slot=" + slot);
+            npc.getInventory().setItem(slot, ItemStack.EMPTY);
+        } else {
+            stack.setDamageValue(damage);
+        }
     }
 
     // ---------------------------------------------------------------- 狩猎
@@ -3170,6 +3903,8 @@ public final class GoalExecutor {
             case "dig", "revisit" -> oreTarget != null ? countItem(oreTarget.drop()) : 0;
             case "smelt", "craft" -> countItem(targetId);
             case "hunt" -> countHuntLoot();
+            case "farm" -> countItem("wheat") + countItem("wheat_seeds")
+                    + countItem("carrot") + countItem("potato") + countItem("bread");
             case "slay" -> countItem(slayDrop);
             case "flint" -> countItem("flint");
             case "obsidian" -> countItem("obsidian");
@@ -3181,7 +3916,7 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "revisit", "endportal", "dragon" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            case "smelt", "travel", "revisit", "endportal", "dragon", "farm" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }

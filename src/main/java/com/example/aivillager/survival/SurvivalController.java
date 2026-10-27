@@ -1272,11 +1272,35 @@ public final class SurvivalController {
         if (stack.isEmpty() || HARMFUL_FOODS.contains(stack.getItem())) {
             return -1;
         }
+        // 【fix49·D11 留种守卫】胡萝卜/生土豆是田里的种苗：已开田且背包存量
+        // 在留苗线（8）以内时不许当食物吃掉——吃光种苗等于把田吃绝（Fong
+        // 硬规矩：留种留苗永不吃光）。烤土豆是加工品、不在此列（规划层只烤
+        // 留苗线以上的富余）。没开田时不拦：那时它们只是普通食物。
+        if ((stack.is(Items.CARROT) || stack.is(Items.POTATO)) && isSeedStock(stack.getItem())) {
+            return -1;
+        }
         FoodProperties food = stack.get(DataComponents.FOOD);
         if (food == null) {
             return -1;
         }
         return food.nutrition() * 2 + Math.round(food.saturation() * 10.0F);
+    }
+
+    /** 该物品当前是否属于"留种存量"：已在本世界开田且背包总量 ≤ 留苗线 8。 */
+    private boolean isSeedStock(Item item) {
+        com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+        if (!com.example.aivillager.goals.FarmMemory.hasFarm(npc.npcName())) {
+            return false;
+        }
+        int total = 0;
+        Inventory inventory = npc.getInventory();
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && stack.is(item)) {
+                total += stack.getCount();
+            }
+        }
+        return total <= 8;
     }
 
     /** 指定半径平方内是否有敌对生物；用于判断"现在能不能安全吃一口"。 */
