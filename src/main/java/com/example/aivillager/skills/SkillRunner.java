@@ -21,6 +21,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.NetherPortalBlock;
+import net.minecraft.world.level.block.PointedDripstoneBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.Vec3;
@@ -509,6 +510,45 @@ public final class SkillRunner {
             }
         }
         return false;
+    }
+
+    /**
+     * 【第七十七轮】钟乳石断链检查：挖掉 pos 会不会让尖滴石锥坠落砸人。
+     * 原版机制（Wiki 核实）：钟乳石的支撑方块、或链身任一格被破坏，其下未受
+     * 支撑的滴石锥全部坠落，对正下方实体按落距造成伤害（2 格后每格 6 点、
+     * 封顶 40 心）——farm35 升井挖掉滴石块后被坠落钟乳石满血砸死（第 5 死）。
+     * 两查任一命中返回危险的滴石锥格、无危险返回 null：
+     * ①pos 正下一格是朝下的滴石锥——pos 就是悬挂链的支撑格或链身上段，
+     * 挖掉整链（或链的下段）立即坠落；
+     * ②pos 同列向上扫 10 格，最低一格滴石锥若在 pos+1/+2 且朝下（链下端与
+     * 待挖格相连或相隔一格），按定案一并回避；在 +3 以上或朝上与本格无关。
+     * 石笋（朝上）被毁下层只碎成物品、无坠落伤害，不在防护面。
+     */
+    private BlockPos stalactiteHazard(BlockPos pos) {
+        if (npc.level().getBlockState(pos).isAir()) {
+            return null; // 本格没东西可挖，不存在断链
+        }
+        BlockPos below = pos.below();
+        BlockState belowState = npc.level().getBlockState(below);
+        if (belowState.is(Blocks.POINTED_DRIPSTONE)
+                && belowState.getValue(PointedDripstoneBlock.TIP_DIRECTION) == Direction.DOWN) {
+            return below;
+        }
+        for (int dy = 1; dy <= 10; dy++) {
+            BlockPos p = pos.above(dy);
+            BlockState s = npc.level().getBlockState(p);
+            if (s.is(Blocks.POINTED_DRIPSTONE)) {
+                if (dy <= 2
+                        && s.getValue(PointedDripstoneBlock.TIP_DIRECTION) == Direction.DOWN) {
+                    return p;
+                }
+                return null; // 同列最低的滴石锥格与本格无关（太远或朝上）
+            }
+            if (!s.isAir()) {
+                return null; // 中间隔着实心块，上面的锥另有支撑
+            }
+        }
+        return null;
     }
 
     private boolean isBuildingBlock(BlockPos pos) {
@@ -2068,6 +2108,43 @@ public final class SkillRunner {
                 }
                 unsafeTurns = 0;
 
+                // 【第七十七轮】钟乳石邻接防护（照 fix37 口径）：这一步要挖的
+                // 头顶格/目标脚格/目标头格里，任一格挖掉会断钟乳石链就别挖——
+                // 坠落的滴石锥满血可秒（farm35 第 5 死）。目标格命中就转向换列；
+                // 头顶格每方向都得挖、转向没用，这一列放弃交目标层换点。
+                BlockPos dripHazard = stalactiteHazard(currentCeiling);
+                String dripCell = "头顶格";
+                if (dripHazard == null) {
+                    dripHazard = stalactiteHazard(targetFeet);
+                    dripCell = "目标脚格";
+                }
+                if (dripHazard == null) {
+                    dripHazard = stalactiteHazard(targetHead);
+                    dripCell = "目标头格";
+                }
+                if (dripHazard != null) {
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " ascend 钟乳石回避 | "
+                            + dripCell + "=" + (dripCell.equals("头顶格") ? currentCeiling
+                            : dripCell.equals("目标脚格") ? targetFeet : targetHead).toShortString()
+                            + " 钟乳石=" + dripHazard.toShortString()
+                            + " Y=" + feet.getY());
+                    if (dripCell.equals("头顶格")) {
+                        finish(id, "ascend", "头顶方块连着钟乳石，换点上升 Y=" + feet.getY());
+                    } else {
+                        dirIndex++;
+                        unsafeTurns++;
+                        if (unsafeTurns < dirs.length * 2) {
+                            return;
+                        }
+                        unsafeTurns = 0;
+                        failedSteps++;
+                        if (failedSteps >= 2) {
+                            finish(id, "ascend", "四周台阶都连着钟乳石，无法上挖 Y=" + feet.getY());
+                        }
+                    }
+                    return;
+                }
+
                 stepStartY = feet.getY();
                 // 【第三十三轮】ascend 是"工具耗尽素手脱困"的路径：选工具不许动退役壳
                 // （allowLastResort=false），没工具就走下面的真素手挖——长跑#10 实测
@@ -2436,6 +2513,17 @@ public final class SkillRunner {
                                 + candidate.toShortString());
                         continue;
                     }
+                    // 【第七十七轮】钟乳石邻接的方向同样按"无路"处理：挖开候选格
+                    // 或其头位格会断悬挂链，坠落的滴石锥正砸掘进面（farm35 第 5 死）。
+                    BlockPos candDrip = stalactiteHazard(candidate);
+                    if (candDrip == null) {
+                        candDrip = stalactiteHazard(candidate.above());
+                    }
+                    if (candDrip != null) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 跳过方向 | 钟乳石邻接 "
+                                + candidate.toShortString() + " 钟乳石=" + candDrip.toShortString());
+                        continue;
+                    }
                     if (candidateFeet.is(Blocks.BEDROCK) || candidateHead.is(Blocks.BEDROCK)
                             || isFluid(candidateFeet) || isFluid(candidateHead)
                             || candidateFloor.getCollisionShape(npc.level(), candidate.below()).isEmpty()) {
@@ -2462,6 +2550,24 @@ public final class SkillRunner {
                             + ahead.toShortString() + " 连续失败=" + failedSteps);
                     if (failedSteps >= 6) {
                         end("连续 " + failedSteps + " 步被岩浆邻接挡住 Y="
+                                + Math.round(npc.getY()));
+                    }
+                    return;
+                }
+                // 【第七十七轮】下镐前钟乳石复查（与候选过滤同口径双保险）：
+                // 命中按"挖不动"转向，别把钟乳石砸下来。
+                BlockPos digDrip = stalactiteHazard(ahead);
+                if (digDrip == null) {
+                    digDrip = stalactiteHazard(ahead.above());
+                }
+                if (digDrip != null) {
+                    dirIndex++;
+                    failedSteps++;
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 挖前钟乳石邻接，转向 | 前方="
+                            + ahead.toShortString() + " 钟乳石=" + digDrip.toShortString()
+                            + " 连续失败=" + failedSteps);
+                    if (failedSteps >= 6) {
+                        end("连续 " + failedSteps + " 步被钟乳石邻接挡住 Y="
                                 + Math.round(npc.getY()));
                     }
                     return;
