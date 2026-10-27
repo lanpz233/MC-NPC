@@ -1530,6 +1530,8 @@ public final class SkillRunner {
             /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
             private int lastStepsSeen;
             private int roundsWithoutProgress;
+            /** 【fix73】同层横移次数（自上次真步数推进以来）：防帽盖上两列间乒乓。 */
+            private int lateralMoves;
             /** 诊断心跳轮数：每 200 轮（约 30 秒）打一行完整状态，定位静默卡死卡在哪条分支。 */
             private int diagRounds;
             /**
@@ -1575,6 +1577,7 @@ public final class SkillRunner {
                 if (steps != lastStepsSeen) {
                     lastStepsSeen = steps;
                     roundsWithoutProgress = 0;
+                    lateralMoves = 0;
                 } else if (++roundsWithoutProgress > 1200) {
                     finish(id, "descend", "长时间无进展（步数约3分钟未变） Y="
                             + Math.round(npc.getY()) + " 步数=" + steps);
@@ -1745,6 +1748,27 @@ public final class SkillRunner {
                         || isFluid(nextFeetState) || isFluid(aheadState) || isFluid(aheadHeadState)
                         || npc.level().getBlockState(nextFeet.below()).getCollisionShape(
                                 npc.level(), nextFeet.below()).isEmpty()) {
+                    // 【fix73】同层横移步：本方向被判不安全时先看台面——ahead
+                    // 与 aheadHead 都空、nextFeet 本身是实心可站块（非流体），
+                    // 说明正前方就有一块同层台面/屋顶块。真人站屋顶会先横走
+                    // 到屋檐再找路，而不是原地转圈。横走落差 ≤1、必落在
+                    // nextFeet 顶面；不挂 lastTarget（无降步可结算）、不计步，
+                    // 从新列重评四向。farm31 实证缺口：叠层帽盖顶四向全灭+
+                    // 脚下走一格被帽块托住假到达，目标原地重派死循环。
+                    if (lateralMoves < 6 && !npc.isWalking()
+                            && (aheadState.isAir() || aheadState.canBeReplaced())
+                            && (aheadHeadState.isAir() || aheadHeadState.canBeReplaced())
+                            && !isFluid(nextFeetState)
+                            && !nextFeetState.getCollisionShape(
+                                    npc.level(), nextFeet).isEmpty()) {
+                        lateralMoves++;
+                        npc.walkTo(new Vec3(ahead.getX() + 0.5D, feet.getY(),
+                                ahead.getZ() + 0.5D), false, null);
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 同层横移 | to="
+                                + ahead.toShortString() + " 横移次数=" + lateralMoves
+                                + " Y=" + feet.getY());
+                        return;
+                    }
                     dirIndex++;
                     unsafeTurns++;
                     // 只在转过一整圈后记一条：雨林树冠上原本每 3 tick 刷一行日志，
