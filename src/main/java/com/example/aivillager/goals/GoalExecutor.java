@@ -235,6 +235,8 @@ public final class GoalExecutor {
     private long lastProgressTick;
     /** 周期裁剪节流计数（第三十三轮）：safeTick 每 10 tick 采样一次，本计数每 10 次≈5 秒触发一轮裁剪。 */
     private int trimTickCounter;
+    /** 【fix71·D5】插火把节流计数（目标 tick 基准，约每 10 次查一次）。 */
+    private int torchTickCounter;
     /** 上次观察到的"目标相关产出计数"，变化即算进展（见 goalMetric）。 */
     private int progressMetric;
     /** 上次有进展时的位置锚点：离开锚点 6 格以上也算进展（长距离移动/下矿途中）。 */
@@ -1490,6 +1492,59 @@ public final class GoalExecutor {
      * <p>这是"从地表发展成玩家"的关键一步：木头→石镐→石头→煤→铁→钻石，
      * 全部靠玩家式的挖掘方式获取，不凭空生成物品。
      */
+    /**
+     * 【fix71·D5】矿道插火把：规格"只插矿道/矿洞、间隔 8~11、省着用"。
+     * 只在 dig 目标的技能空闲间隙执行（不打断掘进）：脚下真黑（块光 ≤2，
+     * 有光/贴岩浆不插）且立体 8 格内没有既有火把时，在脚格插一支
+     * （原版口径：敌对怪只在块光 0 生成，间距 8 已足够压住整段矿道）。
+     */
+    private void maybePlaceTorch() {
+        if (++torchTickCounter % 10 != 0 || !"idle".equals(skills.currentSkill())) {
+            return;
+        }
+        if (countItem("torch") <= 0) {
+            return;
+        }
+        net.minecraft.core.BlockPos feet = npc.blockPosition();
+        // 只插地下：BLOCK 光照在地表白天也是 0，单靠光照会在地表乱插；
+        // 先按高度表判地下（与规划层 underground() 同口径），再看块光。
+        int surface = npc.level().getHeight(
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                feet.getX(), feet.getZ());
+        if (feet.getY() >= surface - 3) {
+            return;
+        }
+        int light = npc.level().getBrightness(
+                net.minecraft.world.level.LightLayer.BLOCK, feet);
+        if (light > 2) {
+            return;
+        }
+        for (net.minecraft.core.BlockPos p : net.minecraft.core.BlockPos.betweenClosed(
+                feet.offset(-8, -3, -8), feet.offset(8, 3, 8))) {
+            var s = npc.level().getBlockState(p);
+            if (s.is(net.minecraft.world.level.block.Blocks.TORCH)
+                    || s.is(net.minecraft.world.level.block.Blocks.WALL_TORCH)) {
+                return;
+            }
+        }
+        var feetState = npc.level().getBlockState(feet);
+        if (!feetState.isAir() && !feetState.canBeReplaced()) {
+            return;
+        }
+        net.minecraft.core.BlockPos below = feet.below();
+        if (npc.level().getBlockState(below)
+                .getCollisionShape(npc.level(), below).isEmpty()) {
+            return;
+        }
+        if (!consume("torch", 1)) {
+            return;
+        }
+        npc.level().setBlockAndUpdate(feet,
+                net.minecraft.world.level.block.Blocks.TORCH.defaultBlockState());
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 插火把 | pos=" + feet.toShortString()
+                + " 光照=" + light + " 余量=" + countItem("torch"));
+    }
+
     private void tickDig() {
         if (oreTarget == null) {
             finish("挖矿失败：缺少资源定义");
@@ -1527,6 +1582,8 @@ public final class GoalExecutor {
         }
         // 上一条矿道如果挖空了，下一轮掘进前要先换位置（见下方步骤 3 前的处理）。
         noteStripOutcome();
+        // 【fix71·D5】矿道照明：技能空闲间隙顺手插火把（只在真黑、8 格内无火把时）。
+        maybePlaceTorch();
         if (have >= targetCount) {
             finish("挖矿完成 " + targetId + " 新采 " + have + "/" + targetCount
                     + "，背包共 " + absolute);

@@ -1297,6 +1297,17 @@ public final class ProgressionPlanner {
             return goal("装满水桶", "fillbucket", params());
         }
 
+        // 13.06) 【fix71·D5】火把常备：矿道照明的消耗品（执行层 maybePlaceTorch
+        // 只在真黑且 8 格内无火把时插）。存量 <8 且有煤/木炭+木棍（或木板，
+        // 合成系统自链）就补 8 支（2 次配方）；没料跳过、不新开采集目标。
+        if (countItem("torch") < 8
+                && (countItem("coal") > 0 || countItem("charcoal") > 0)
+                && (countItem("stick") > 0 || countSuffix("_planks") > 0)) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 火把常备触发 | 火把="
+                    + countItem("torch") + " 煤=" + countItem("coal"));
+            return goal("制作火把", "craft", params("item", "torch", "count", 8));
+        }
+
         // 13.1) 钻石甲（第三轮新增，StagePlan.DIAMOND_ARMOR）：镐和剑都有了之后，
         // 继续挖钻石凑齐四件甲（头盔 5 + 胸甲 8 + 护腿 7 + 靴子 4 = 24 颗），再走下界线。
         // 原版路线里钻石只预算了镐(3)+剑(2)，长跑验收因此判定"钻石套不可能"——这里补齐。
