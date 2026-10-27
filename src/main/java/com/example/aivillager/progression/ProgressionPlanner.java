@@ -127,6 +127,12 @@ public final class ProgressionPlanner {
      * 开田注定连败，不能让它每轮 decide 都抢在铁线前面重试；退避到期再试。 */
     private int farmFailStreak;
     private long farmBackoffUntil;
+    /** 【fix50】采集木头专属连败计数：木料安全线（步 6.5）的放行阀原读共享
+     * failStreak，但采集失败后规划层总会先插一个 0.5 秒必成的合成步（补石镐），
+     * 成功即把共享连败清零，放行阀永远凑不满 2——fix49 短验实证 NPC 在
+     * gather↔craft 之间 ping-pong、每轮白烧 203 秒。与皮革/口粮同病同治：
+     * 采集木头自己记账，其他阶段的成败不冲它；采集成功清零。 */
+    private int woodGatherFailStreak;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -325,6 +331,17 @@ public final class ProgressionPlanner {
                 } else {
                     farmFailStreak = 0;
                     farmBackoffUntil = 0L;
+                }
+            }
+            // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
+            // 原因后缀，只认前缀）。供步 6.5 木料安全线放行阀读取。
+            if (lastStage.startsWith("采集木头")) {
+                if (goalFailed) {
+                    woodGatherFailStreak++;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 采集木头专属连败=" + woodGatherFailStreak
+                            + "（≥2 时木料安全线放行下矿/种田）");
+                } else {
+                    woodGatherFailStreak = 0;
                 }
             }
         }
@@ -704,13 +721,13 @@ public final class ProgressionPlanner {
             // 全部堵死、原地空转。挖矿技能自己会挖路（descend/strip，还可能触发连败
             // 换区的 ascend 挖出坑），先靠它脱困/推进，木料等能走了再补——安全线
             // 每个 tick 都在查，不会被永久绕过。
-            boolean gatherStuck = lastFailedStage.startsWith("采集木头") && failStreak >= 2;
+            boolean gatherStuck = woodGatherFailStreak >= 2;
             if (!gatherStuck) {
                 return gatherLogs("木料低于安全线，先补给再下矿");
             }
             LOG.info("[AIV][PLAN] " + npc.npcName()
                     + " 采集木头连败，木料安全线临时放行挖矿步骤 | wood=" + wood
-                    + " failStreak=" + failStreak);
+                    + " woodGatherFailStreak=" + woodGatherFailStreak);
         }
 
         // 6.6) 随身口粮见底（第二十四轮，Fong 18:49/18:51 的存量口径）：看背包
