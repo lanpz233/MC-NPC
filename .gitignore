@@ -24,3 +24,4 @@ Thumbs.db
 # 缓存
 .cache/
 
+javac*.args

@@ -4881,11 +4881,17 @@ public final class GoalExecutor {
     }
 
     /** 这类物品的保留数量；-1 表示有意义、永远不丢。 */
+    /** 本世界是否已建成落脚点（fix55 建材预留的开关；账本口径同规划层）。 */
+    private boolean baseBuiltHere() {
+        BaseMemory.bindWorld(npc.level());
+        return BaseMemory.hasBase(npc.npcName());
+    }
+
     private int junkKeepLimit(String path) {
         switch (path) {
-            case "dirt", "sand", "clay_ball", "andesite", "diorite", "granite",
+            case "sand", "clay_ball",
                  "polished_andesite", "polished_diorite", "polished_granite",
-                 "tuff", "calcite", "deepslate", "cobbled_deepslate",
+                 "calcite", "deepslate",
                  // 【fix54】落叶层（leaf_litter）：森林地表装饰，打草/路过自动
                  // 捡满包（实证囤到 215 个、3 格半），纯地形杂料不保留。
                  "leaf_litter",
@@ -4894,6 +4900,22 @@ public final class GoalExecutor {
                  // 满包时先保格子；筛出的燧石本身在永不扔清单里，不受影响。
                  "gravel" -> {
                 return 0;
+            }
+            // 【fix55】建屋建材预留：圆石深板岩/凝灰岩/泥土/三杂石是 fix51
+            // 小屋的砌墙料（pickBuildMaterial「拿来砌墙正好废物利用」、
+            // 规划层建屋触发也按它们计数），旧口径一律保留=0 等于挖一块
+            // 扔一块——farm8~10 三局实证建屋触发 0 次、地表建材永远攒
+            // 不够 80。只在「本世界还没落脚点」时给预留额度，建成后恢复
+            // 0 照旧不囤；这只改周期配额裁剪，满包时的第一档优先丢弃
+            // 顺序（Fong 04:15 规格）不动，压力兜底仍在。
+            case "cobbled_deepslate" -> {
+                return baseBuiltHere() ? 0 : 96;
+            }
+            case "tuff", "andesite", "diorite", "granite" -> {
+                return baseBuiltHere() ? 0 : 64;
+            }
+            case "dirt" -> {
+                return baseBuiltHere() ? 0 : 48;
             }
             // 圆石只留 1 格（128 个）：它是世界上最好再挖的东西，
             // 实测囤到 700+ 个会占掉 12 格，合成产物直接没地方放（空槽=0 导致全科技树卡死）。
