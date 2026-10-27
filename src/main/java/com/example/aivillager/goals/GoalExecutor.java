@@ -3327,36 +3327,48 @@ public final class GoalExecutor {
         }
     }
 
-    /** 【fix82】床位扫描：候选（foot 格，床头朝向）北墙行优先（不挡门路）、南墙行兜底；命中写状态返回 true。 */
+    /** 【fix82/fix84】床位扫描：内室 = anchor ±1 的 3×3，脚位试两层
+     * （anchor.y 与 anchor.y-1——farm43 到场诊断实证屋内地面层在 anchor
+     * 下一层、站位 = anchor.y-1，原口径只试同层西列两对、层差一层即全灭），
+     * 东西/南北任意相邻两格皆空且脚下实心即命中（foot 取西/北格、facing
+     * 指向 head 格，与原版床 FACING 约定及 phase 2 放床一致）。命中写状态
+     * 返回 true；扫描面与层位双扩面后不再依赖单一几何假设。 */
     private boolean scanBedSpot(BlockPos anchor) {
-        BlockPos[] feet = {
-                anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
-                anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
-        net.minecraft.core.Direction[] dirs = {
-                net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST,
-                net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST};
-        for (int i = 0; i < feet.length; i++) {
-            if (bedCellFree(feet[i]) && bedCellFree(feet[i].relative(dirs[i]))) {
-                bedFootPos = feet[i];
-                bedFacing = dirs[i];
-                return true;
+        for (int dy = 0; dy >= -1; dy--) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    BlockPos cell = anchor.offset(dx, dy, dz);
+                    if (dx < 1 && bedCellFree(cell) && bedCellFree(cell.east())) {
+                        bedFootPos = cell;
+                        bedFacing = net.minecraft.core.Direction.EAST;
+                        return true;
+                    }
+                    if (dz < 1 && bedCellFree(cell) && bedCellFree(cell.south())) {
+                        bedFootPos = cell;
+                        bedFacing = net.minecraft.core.Direction.SOUTH;
+                        return true;
+                    }
+                }
             }
         }
         return false;
     }
 
-    /** 【fix82】选位失败诊断：逐候选格打 本格/脚下 物品 id——远端未加载读数与真占用靠此分辨。 */
+    /** 【fix82/fix84】选位失败诊断：双层全内室逐格打 本格/脚下 物品 id，
+     * 层位/占用/未加载三类原因靠此一次分辨（日志四问：出事留快照）。 */
     private void logBedScanDiagnostics(BlockPos anchor) {
-        BlockPos[] cells = {
-                anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
-                anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
         StringBuilder sb = new StringBuilder();
-        for (BlockPos cell : cells) {
-            BlockState state = npc.level().getBlockState(cell);
-            BlockState below = npc.level().getBlockState(cell.below());
-            sb.append(' ').append(cell.toShortString())
-                    .append('=').append(BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath())
-                    .append('/').append(BuiltInRegistries.BLOCK.getKey(below.getBlock()).getPath());
+        for (int dy = 0; dy >= -1; dy--) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    BlockPos cell = anchor.offset(dx, dy, dz);
+                    BlockState state = npc.level().getBlockState(cell);
+                    BlockState below = npc.level().getBlockState(cell.below());
+                    sb.append(' ').append(cell.toShortString())
+                            .append('=').append(BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath())
+                            .append('/').append(BuiltInRegistries.BLOCK.getKey(below.getBlock()).getPath());
+                }
+            }
         }
         LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 选位诊断（格=本格/脚下）:" + sb);
     }
