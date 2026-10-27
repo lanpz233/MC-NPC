@@ -311,7 +311,7 @@ public final class GoalExecutor {
                 || "dig".equals(action) || "smelt".equals(action) || "hunt".equals(action)
                 || "flint".equals(action) || "obsidian".equals(action) || "portal".equals(action)
                 || "enterportal".equals(action) || "slay".equals(action) || "travel".equals(action)
-                || "revisit".equals(action) || "farm".equals(action)
+                || "revisit".equals(action) || "farm".equals(action) || "base".equals(action)
                 || "endportal".equals(action) || "dragon".equals(action);
     }
 
@@ -396,6 +396,11 @@ public final class GoalExecutor {
                 // 缺省 auto：有田维护、无田开田，tickFarm 按账本现状分流。
                 farmMode = intent.param("mode", "auto");
                 newTarget = "farm:" + farmMode;
+                newCount = 1;
+            }
+            case "base" -> {
+                // 【fix51·D2 落脚点】建火柴盒小屋（选址→砌筑队列→自审落盘）。
+                newTarget = "base";
                 newCount = 1;
             }
             case "flint" -> {
@@ -499,6 +504,15 @@ public final class GoalExecutor {
         farmBaseSeeds = countItem("wheat_seeds");
         farmBaseCarrot = countItem("carrot");
         farmBasePotato = countItem("potato");
+        // 【fix51】落脚点状态机复位。
+        basePhase = 0;
+        baseQueue.clear();
+        baseCenter = null;
+        baseActionStuck = 0;
+        baseLastActionKey = "";
+        basePlacedCount = 0;
+        baseTotalCells = 0;
+        baseQueueBuilt = false;
         portalOrigin = null;
         portalPhase = 0;
         enterAttempts = 0;
@@ -525,6 +539,7 @@ public final class GoalExecutor {
             case "smelt" -> "熔炼 " + targetId + " x" + targetCount;
             case "hunt" -> "狩猎 " + targetCount + " 只动物";
             case "farm" -> "种田 " + farmMode;
+            case "base" -> "建落脚点（火柴盒小屋）";
             case "flint" -> "找燧石 x" + targetCount;
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
             case "portal" -> "建造并点燃下界传送门";
@@ -628,6 +643,7 @@ public final class GoalExecutor {
             case "smelt" -> tickSmelt();
             case "hunt" -> tickHunt();
             case "farm" -> tickFarm();
+            case "base" -> tickBase();
             case "flint" -> tickFlint();
             case "obsidian" -> tickObsidian();
             case "portal" -> tickPortal();
@@ -2813,6 +2829,391 @@ public final class GoalExecutor {
         }
     }
 
+    // ---------------------------------------------------------------- 落脚点（fix51·D2）
+
+    /** 小屋平面半径：外 5×5（dx,dz ∈ -2..2），内空 3×3，墙高 3、平顶。 */
+    private static final int BASE_HALF = 2;
+    /** 砌筑材料总需求上限估算：补地 ≤25 + 墙 46（留门洞 2）+ 顶 25 ≈ 96。 */
+    private static final int BASE_MATERIAL_NEED = 80;
+
+    private int basePhase;
+    /** 待砌格队列（自下而上：补地→墙三层→屋顶）。 */
+    private final java.util.List<BlockPos> baseQueue = new java.util.ArrayList<>();
+    /** 选中的中心列（地面顶格）；null=未选址。 */
+    private BlockPos baseCenter;
+    private int baseActionStuck;
+    private String baseLastActionKey = "";
+    private int basePlacedCount;
+    private int baseTotalCells;
+    private boolean baseQueueBuilt;
+
+    /**
+     * 建落脚点：选址 → 砌筑队列 → 完工自审 → 落盘 BaseMemory。
+     * 放置走 setBlockAndUpdate 直改 + 代码内校验（placeFurnace/种田同先例）：
+     * 目标格必须是空气/可替换植被、材料从背包真扣。
+     * 全部砌筑从屋内中心一个站位可达（最远角格水平 2.83、屋顶 dy=3，
+     * 在 farmInReach 同口径内），不需要脚手架。
+     */
+    private void tickBase() {
+        switch (basePhase) {
+            case 0 -> {
+                status = "落脚点：选址";
+                if (baseCenter == null) {
+                    baseCenter = findBaseSite();
+                    if (baseCenter == null) {
+                        finish("建屋放弃：附近没有合格地块（5×5 平整、无遮挡）");
+                        return;
+                    }
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BASE] 选址 | center="
+                            + baseCenter.toShortString() + "（评分：近水/近田/近树）");
+                }
+                if (!baseQueueBuilt) {
+                    buildBaseQueue();
+                    baseQueueBuilt = true;
+                    baseTotalCells = baseQueue.size();
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BASE] 砌筑队列 | 格数="
+                            + baseTotalCells + " 建材存量=" + countBuildMaterial());
+                }
+                basePhase = 1;
+            }
+            case 1 -> {
+                status = "落脚点：砌筑 " + basePlacedCount + "/" + baseTotalCells;
+                if (processBaseQueue()) {
+                    basePhase = 2;
+                }
+            }
+            case 2 -> {
+                // 完工自审：逐格复扫——墙/顶/补地格里是实心方块才算数，
+                // 达标才落盘（不许"队列跑完=建成"的假成功）。
+                int solid = 0;
+                for (BlockPos cell : baseAuditCells()) {
+                    BlockState state = npc.level().getBlockState(cell);
+                    if (!state.isAir() && state.getFluidState().isEmpty()
+                            && !isVegetation(state)) {
+                        solid++;
+                    }
+                }
+                int total = baseAuditCells().size();
+                if (total > 0 && solid * 100 >= total * 95) {
+                    BlockPos anchor = new BlockPos(baseCenter.getX(), baseCenter.getY() + 1,
+                            baseCenter.getZ());
+                    BaseMemory.bindWorld(npc.level());
+                    BaseMemory.save(npc.npcName(), anchor);
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BASE] 落脚点建成 | anchor="
+                            + anchor.toShortString() + " 自审实心=" + solid + "/" + total
+                            + " 用料=" + basePlacedCount);
+                    finish("落脚点建成：火柴盒小屋 自审 " + solid + "/" + total
+                            + "，锚点已落盘");
+                } else {
+                    finish("建屋未达标：自审实心 " + solid + "/" + total + "（要求 ≥95%）");
+                }
+            }
+            default -> finish("建屋阶段异常 " + basePhase);
+        }
+    }
+
+    /** 自审格清单：与砌筑队列同一批格（队列执行后已清空，按中心重建）。 */
+    private java.util.List<BlockPos> baseAuditCells() {
+        java.util.List<BlockPos> cells = new java.util.ArrayList<>();
+        if (baseCenter == null) {
+            return cells;
+        }
+        int cx = baseCenter.getX();
+        int cz = baseCenter.getZ();
+        int floor = baseCenter.getY();
+        for (int dx = -BASE_HALF; dx <= BASE_HALF; dx++) {
+            for (int dz = -BASE_HALF; dz <= BASE_HALF; dz++) {
+                // 只审墙与顶（结构主体）；补地格在队列里有计数兜底，
+                // 高度图会被新墙干扰、不适合复测补地。
+                if (Math.abs(dx) == BASE_HALF || Math.abs(dz) == BASE_HALF) {
+                    for (int level = 1; level <= 3; level++) {
+                        if (dx == 0 && dz == BASE_HALF && level <= 2) {
+                            continue; // 门洞（南墙中，2 高）
+                        }
+                        cells.add(new BlockPos(cx + dx, floor + level, cz + dz));
+                    }
+                }
+                cells.add(new BlockPos(cx + dx, floor + 4, cz + dz)); // 屋顶
+            }
+        }
+        return cells;
+    }
+
+    /** 生成砌筑队列：补地（原地面低 1 的列）→ 墙三层（南墙留门洞）→ 屋顶。 */
+    private void buildBaseQueue() {
+        baseQueue.clear();
+        int cx = baseCenter.getX();
+        int cz = baseCenter.getZ();
+        int floor = baseCenter.getY();
+        ServerLevel serverLevel = (ServerLevel) npc.level();
+        for (int dx = -BASE_HALF; dx <= BASE_HALF; dx++) {
+            for (int dz = -BASE_HALF; dz <= BASE_HALF; dz++) {
+                int top = serverLevel.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                        cx + dx, cz + dz);
+                if (top == floor - 1) {
+                    baseQueue.add(new BlockPos(cx + dx, floor, cz + dz));
+                }
+            }
+        }
+        for (int level = 1; level <= 3; level++) {
+            for (int dx = -BASE_HALF; dx <= BASE_HALF; dx++) {
+                for (int dz = -BASE_HALF; dz <= BASE_HALF; dz++) {
+                    if (Math.abs(dx) != BASE_HALF && Math.abs(dz) != BASE_HALF) {
+                        continue;
+                    }
+                    if (dx == 0 && dz == BASE_HALF && level <= 2) {
+                        continue; // 门洞
+                    }
+                    baseQueue.add(new BlockPos(cx + dx, floor + level, cz + dz));
+                }
+            }
+        }
+        for (int dx = -BASE_HALF; dx <= BASE_HALF; dx++) {
+            for (int dz = -BASE_HALF; dz <= BASE_HALF; dz++) {
+                baseQueue.add(new BlockPos(cx + dx, floor + 4, cz + dz));
+            }
+        }
+    }
+
+    /**
+     * 执行砌筑队列。返回 true = 队列处理完（成功/跳过都算）。
+     * 站位固定屋内中心：所有格都在够得着口径内（见 tickBase 注释）。
+     */
+    private boolean processBaseQueue() {
+        while (!baseQueue.isEmpty()) {
+            BlockPos cell = baseQueue.get(0);
+            BlockState state = npc.level().getBlockState(cell);
+            if (!state.isAir() && !isVegetation(state) && state.getFluidState().isEmpty()) {
+                // 已是实心（地形自带或已砌）：视为满足，不耗料。
+                baseQueue.remove(0);
+                basePlacedCount++;
+                continue;
+            }
+            break;
+        }
+        if (baseQueue.isEmpty()) {
+            return true;
+        }
+        BlockPos cell = baseQueue.get(0);
+        if (!farmInReach(cell)) {
+            // 去屋内中心站位；反复到不了位则换内圈邻格，再不行放弃这一格。
+            String key = "base-stand";
+            if (key.equals(baseLastActionKey)) {
+                baseActionStuck++;
+            } else {
+                baseLastActionKey = key;
+                baseActionStuck = 0;
+            }
+            if (baseActionStuck > 90) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [BASE] 站位到不了，跳过一格 | cell="
+                        + cell.toShortString());
+                baseQueue.remove(0);
+                baseActionStuck = 0;
+                return false;
+            }
+            BlockPos stand = new BlockPos(baseCenter.getX(), baseCenter.getY() + 1, baseCenter.getZ());
+            if (npc.blockPosition().distSqr(stand) > 1.0D) {
+                JsonObject params = new JsonObject();
+                params.addProperty("x", stand.getX() + 0.5D);
+                params.addProperty("z", stand.getZ() + 0.5D);
+                skills.run(new Intent("", "goto", params), "目标");
+            }
+            return false;
+        }
+        baseLastActionKey = "";
+        baseActionStuck = 0;
+        String material = pickBuildMaterial();
+        if (material == null) {
+            finish("建屋放弃：建材不足（已砌 " + basePlacedCount + "/" + baseTotalCells + "）");
+            return true;
+        }
+        Block block = blockOfItem(material);
+        if (block == null || !consume(material, 1)) {
+            baseQueue.remove(0);
+            return false;
+        }
+        npc.level().setBlockAndUpdate(cell, block.defaultBlockState());
+        baseQueue.remove(0);
+        basePlacedCount++;
+        return false;
+    }
+
+    /**
+     * 选址：半径 26 内找 5×5 地块——25 列顶高差 ≤1（只许低 1 待补，不许高）、
+     * 每列上方 1..4 格无实心遮挡、顶格非液体/非落沙类松散顶（沙/沙砾会塌）。
+     * 评分：近水（8 格内有水 -100）、近田锚点（距离）、近树（16 格内原木列 -2/棵）、
+     * 离 NPC 近（0.1/格）。洞口评分 v1 未含（无廉价可靠的洞口判定，宁缺）。
+     */
+    private BlockPos findBaseSite() {
+        if (!(npc.level() instanceof ServerLevel level)) {
+            return null;
+        }
+        BlockPos me = npc.blockPosition();
+        FarmMemory.bindWorld(npc.level());
+        FarmMemory.Farm farm = FarmMemory.farm(npc.npcName());
+        BlockPos best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int cx = me.getX() - 26; cx <= me.getX() + 26; cx += 1) {
+            for (int cz = me.getZ() - 26; cz <= me.getZ() + 26; cz += 1) {
+                if (level.getChunkIfLoaded(cx >> 4, cz >> 4) == null) {
+                    continue;
+                }
+                int floor = level.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, cx, cz);
+                if (floor <= level.getMinY() + 4) {
+                    continue;
+                }
+                if (!baseFootprintOk(level, cx, cz, floor)) {
+                    continue;
+                }
+                double score = me.distSqr(new BlockPos(cx, floor, cz)) * 0.01D;
+                if (farm != null) {
+                    score += farm.anchor().distSqr(new BlockPos(cx, floor, cz)) * 0.05D;
+                }
+                if (baseNearWater(level, cx, floor, cz, 8)) {
+                    score -= 100.0D;
+                }
+                score -= Math.min(10, baseTreeColumns(level, cx, cz, 16)) * 2.0D;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = new BlockPos(cx, floor, cz);
+                }
+            }
+        }
+        return best;
+    }
+
+    private boolean baseFootprintOk(ServerLevel level, int cx, int cz, int floor) {
+        for (int dx = -BASE_HALF; dx <= BASE_HALF; dx++) {
+            for (int dz = -BASE_HALF; dz <= BASE_HALF; dz++) {
+                int x = cx + dx;
+                int z = cz + dz;
+                if (level.getChunkIfLoaded(x >> 4, z >> 4) == null) {
+                    return false;
+                }
+                int top = level.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                if (top != floor && top != floor - 1) {
+                    return false;
+                }
+                BlockState topState = level.getBlockState(new BlockPos(x, top, z));
+                if (!topState.getFluidState().isEmpty()
+                        || topState.is(Blocks.SAND) || topState.is(Blocks.RED_SAND)
+                        || topState.is(Blocks.GRAVEL)) {
+                    return false;
+                }
+                for (int up = 1; up <= 4; up++) {
+                    BlockState above = level.getBlockState(new BlockPos(x, top + up, z));
+                    if (!above.isAir() && !isVegetation(above)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean baseNearWater(ServerLevel level, int cx, int floor, int cz, int radius) {
+        for (int x = cx - radius; x <= cx + radius; x++) {
+            for (int z = cz - radius; z <= cz + radius; z++) {
+                for (int y = floor - 1; y <= floor + 1; y++) {
+                    if (level.getBlockState(new BlockPos(x, y, z))
+                            .getFluidState().is(net.minecraft.world.level.material.Fluids.WATER)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 数半径内"地表有树"的列（口径同 findVisibleTreeColumn 的简化版）。 */
+    private int baseTreeColumns(ServerLevel level, int cx, int cz, int radius) {
+        int count = 0;
+        for (int x = cx - radius; x <= cx + radius; x += 2) {
+            for (int z = cz - radius; z <= cz + radius; z += 2) {
+                if (level.getChunkIfLoaded(x >> 4, z >> 4) == null) {
+                    continue;
+                }
+                int top = level.getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, x, z);
+                BlockState state = level.getBlockState(new BlockPos(x, top - 1, z));
+                if (state.is(net.minecraft.tags.BlockTags.LOGS)
+                        || state.is(net.minecraft.tags.BlockTags.LEAVES)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * 砌筑材料：按"最不心疼"排序挑背包里真有的方块物品。圆石是工具料，
+     * 只在存量 &gt;16 时用；花岗岩/闪长岩/安山岩是 Fong 定的第一档可弃杂石，
+     * 拿来砌墙正好废物利用；木板是棍料，存量 &gt;8 才用。
+     */
+    private String pickBuildMaterial() {
+        if (countItem("cobblestone") > 16) {
+            return "cobblestone";
+        }
+        for (String trash : new String[]{"andesite", "diorite", "granite", "cobbled_deepslate",
+                "dirt", "tuff", "stone"}) {
+            if (countItem(trash) > 0) {
+                return trash;
+            }
+        }
+        if (countItem("cobblestone") > 0) {
+            return "cobblestone";
+        }
+        String planks = firstPlanksPath();
+        if (planks != null && countItemsEndingWith("_planks") > 8) {
+            return planks;
+        }
+        return null;
+    }
+
+    /** 建材总存量（与规划层的触发口径一致）。 */
+    private int countBuildMaterial() {
+        return countItem("cobblestone") + countItem("cobbled_deepslate") + countItem("dirt")
+                + countItem("andesite") + countItem("diorite") + countItem("granite")
+                + countItem("tuff") + countItem("stone") + countItemsEndingWith("_planks");
+    }
+
+    private String firstPlanksPath() {
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (!stack.isEmpty() && pathOf(stack).endsWith("_planks")) {
+                return pathOf(stack);
+            }
+        }
+        return null;
+    }
+
+    /** 物品路径 → 对应方块（只认 BlockItem）。 */
+    private Block blockOfItem(String itemPath) {
+        Item item = BuiltInRegistries.ITEM.getValue(Identifier.parse("minecraft:" + itemPath));
+        if (item instanceof net.minecraft.world.item.BlockItem blockItem) {
+            return blockItem.getBlock();
+        }
+        return null;
+    }
+
+    /** 可替换的植被/薄层（与种田选址同口径的近似集合）。 */
+    private boolean isVegetation(BlockState state) {
+        return state.is(Blocks.SHORT_GRASS) || state.is(Blocks.TALL_GRASS)
+                || state.is(Blocks.FERN) || state.is(Blocks.LARGE_FERN)
+                || state.is(Blocks.SNOW) || state.is(Blocks.DEAD_BUSH)
+                || state.is(Blocks.DANDELION) || state.is(Blocks.POPPY)
+                || state.is(Blocks.AZURE_BLUET) || state.is(Blocks.OXEYE_DAISY)
+                || state.is(Blocks.CORNFLOWER) || state.is(Blocks.LILY_OF_THE_VALLEY)
+                || state.is(Blocks.RED_TULIP) || state.is(Blocks.ORANGE_TULIP)
+                || state.is(Blocks.WHITE_TULIP) || state.is(Blocks.PINK_TULIP)
+                || state.is(Blocks.ALLIUM) || state.is(Blocks.BLUE_ORCHID)
+                || state.is(Blocks.SUNFLOWER) || state.is(Blocks.LILAC)
+                || state.is(Blocks.ROSE_BUSH) || state.is(Blocks.PEONY);
+    }
+
     // ---------------------------------------------------------------- 狩猎
 
     private void tickHunt() {
@@ -3905,6 +4306,7 @@ public final class GoalExecutor {
             case "hunt" -> countHuntLoot();
             case "farm" -> countItem("wheat") + countItem("wheat_seeds")
                     + countItem("carrot") + countItem("potato") + countItem("bread");
+            case "base" -> basePlacedCount;
             case "slay" -> countItem(slayDrop);
             case "flint" -> countItem("flint");
             case "obsidian" -> countItem("obsidian");
@@ -3916,7 +4318,7 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "revisit", "endportal", "dragon", "farm" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }

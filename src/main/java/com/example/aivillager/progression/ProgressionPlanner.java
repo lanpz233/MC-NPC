@@ -133,6 +133,10 @@ public final class ProgressionPlanner {
      * gather↔craft 之间 ping-pong、每轮白烧 203 秒。与皮革/口粮同病同治：
      * 采集木头自己记账，其他阶段的成败不冲它；采集成功清零。 */
     private int woodGatherFailStreak;
+    /** 【fix51】建屋专属连败与退避：与开田同理——附近没平地的地形里建屋
+     * 注定连败，不能让它反复抢主线；退避到期再试。 */
+    private int baseFailStreak;
+    private long baseBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -331,6 +335,16 @@ public final class ProgressionPlanner {
                 } else {
                     farmFailStreak = 0;
                     farmBackoffUntil = 0L;
+                }
+            } else if ("建落脚点".equals(lastStage)) {
+                if (goalFailed) {
+                    baseFailStreak++;
+                    baseBackoffUntil = now + Math.min(300_000L, 60_000L * baseFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 建屋退避 | 连败=" + baseFailStreak
+                            + " 退避秒=" + (baseBackoffUntil - now) / 1000L);
+                } else {
+                    baseFailStreak = 0;
+                    baseBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -808,6 +822,28 @@ public final class ProgressionPlanner {
                             + foodNutrition() + "/" + MINING_FOOD_NUTRITION
                             + "（hunt 不稳，田是根治项）");
                     return goal("开垦农田", "farm", params("mode", "establish"));
+                }
+            }
+        }
+
+        // 6.75) 落脚点（fix51·D2）：有了田或铁器雏形、开始有"怕丢的东西"时
+        // 建火柴盒小屋作锚点（床/箱子/死后回程都挂它）。太早建拖主线、太晚
+        // 建没意义：触发 =（有田 || 铁锭≥8）+ 建材富余 ≥80 + 白天 + 地表。
+        // 已有落脚点（本世界账本）就永不再派。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
+                && System.currentTimeMillis() >= baseBackoffUntil) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            if (!com.example.aivillager.goals.BaseMemory.hasBase(npc.npcName())) {
+                int buildable = cobble + countItem("dirt") + countItem("andesite")
+                        + countItem("diorite") + countItem("granite")
+                        + countItem("cobbled_deepslate") + countItem("tuff")
+                        + countItem("stone") + countSuffix("_planks");
+                com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+                boolean hasFarm = com.example.aivillager.goals.FarmMemory.hasFarm(npc.npcName());
+                if (buildable >= 80 && (hasFarm || ingots >= 8)) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 建屋触发 | 建材=" + buildable
+                            + " hasFarm=" + hasFarm + " ingots=" + ingots);
+                    return goal("建落脚点", "base", params());
                 }
             }
         }
