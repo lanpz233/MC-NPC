@@ -144,6 +144,10 @@ public final class ProgressionPlanner {
     /** 【fix69】存箱专属连败与退避（与安置床同口径）。 */
     private int storeFailStreak;
     private long storeBackoffUntil;
+    /** 【fix70·D4】装水专属连败与退避：附近没水源时注定连败，不能让装水步
+     * 在地表反复抢钻石主线；退避到期再试。 */
+    private int bucketFillFailStreak;
+    private long bucketFillBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -384,6 +388,16 @@ public final class ProgressionPlanner {
                 } else {
                     storeFailStreak = 0;
                     storeBackoffUntil = 0L;
+                }
+            } else if ("装满水桶".equals(lastStage)) {
+                if (goalFailed) {
+                    bucketFillFailStreak++;
+                    bucketFillBackoffUntil = now + Math.min(300_000L, 60_000L * bucketFillFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 装水退避 | 连败=" + bucketFillFailStreak
+                            + " 退避秒=" + (bucketFillBackoffUntil - now) / 1000L);
+                } else {
+                    bucketFillFailStreak = 0;
+                    bucketFillBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -1262,6 +1276,25 @@ public final class ProgressionPlanner {
                 return gatherLogs("钻石剑缺木棍");
             }
             return goal("制作钻石剑", "craft", params("item", "diamond_sword", "count", 1));
+        }
+
+        // 13.05) 【fix70·D4】水桶常备：D4 规格是"下矿常带一桶水"（灭火/防
+        // 岩浆），不是等造下界门（13.5）才做桶——挖钻石阶段正贴着岩浆层，
+        // 没桶时着火只能硬烧。软向导口径：铁锭 ≥6 才做桶（花 3 留 ≥3 保底，
+        // 3~5 锭不硬凑、不为桶新开挖铁目标，13.5 自有补铁兜底）；装水只在
+        // 地表派（下矿前装满），地下不派（fillbucket 的挖路模式会打断矿线）。
+        // 不挂 StagePlan 门控：安稳模式同样要防岩浆。生存层的倒水自救见
+        // SurvivalController.douseWithWaterBucket（fix70 同版）。
+        if (!hasAny("bucket", "water_bucket")) {
+            if (ingots >= 6) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 水桶常备触发 | 铁锭=" + ingots
+                        + "（做桶 3 锭、留保底）");
+                return goal("制作铁桶", "craft", params("item", "bucket", "count", 1));
+            }
+        } else if (!hasAny("water_bucket") && !underground()
+                && System.currentTimeMillis() >= bucketFillBackoffUntil) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 装水常备触发 | 有空桶、地表、先装满再下矿");
+            return goal("装满水桶", "fillbucket", params());
         }
 
         // 13.1) 钻石甲（第三轮新增，StagePlan.DIAMOND_ARMOR）：镐和剑都有了之后，

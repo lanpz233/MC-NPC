@@ -127,6 +127,11 @@ public final class SurvivalController {
      */
     private net.minecraft.core.BlockPos stillAnchor;
     private int stillChecks;
+    /** 【fix70·D4】倒水自救上次触发的 tick（npc.tickCount 基准），冷却 80 tick 防连倒。 */
+    private int lastDouseTick = -1000;
+    /** 【fix70·D4】灭火倒水的位置与已过 tick：约 2.5 秒后把水收回桶（收不回不强求）。 */
+    private net.minecraft.core.BlockPos douseWaterPos;
+    private int douseAge;
     private boolean chasing;
     private int deadTicks;
     private boolean deathLogged;
@@ -252,6 +257,10 @@ public final class SurvivalController {
             unstuck();
         }
 
+        // 【fix70·D4】倒水自救：着火/泡岩浆时用水桶自救（灭火/换落脚），
+        // 与技能无关的生存保命线（照 fix67 窒息兜底的立线方式）。
+        douseWithWaterBucket();
+
         // 换甲/换武器必须在战斗之前：有威胁时 tick 会提前 return，
         // 如果把装备检查放在 eat 后面，NPC 会在被围攻时一直裸奔。
         if (++armorCheckTimer >= ARMOR_CHECK_INTERVAL) {
@@ -274,6 +283,128 @@ public final class SurvivalController {
         }
 
         eat(false);
+    }
+
+    /**
+     * 【fix70·D4】倒水自救：常带的水桶不只是造门工具——真人着火第一反应就是
+     * 脚下倒水灭火、掉进岩浆也会倒水换一块落脚地。实现照 castobsidian 的
+     * 确定性模拟（结果与玩家操作一致）：倒水=放水源格+水桶换空桶；灭火的
+     * 水过约 2.5 秒收回（原格还是水源、人在 3 格内才收）；浇岩浆的水被反应
+     * 消耗不收（源→黑曜石、流动→石头）。MLG 落地水不做（规格：进阶尽力
+     * 而为，不许为秀操作反而摔死）。
+     */
+    private void douseWithWaterBucket() {
+        // 先处理收水：到期的灭火水，能收就收回（省得满地流水、也保住常备水）。
+        if (douseWaterPos != null && ++douseAge >= 50) {
+            BlockPos pos = douseWaterPos;
+            douseWaterPos = null;
+            var state = npc.level().getBlockState(pos);
+            if (state.is(net.minecraft.world.level.block.Blocks.WATER)
+                    && state.getFluidState().isSource()
+                    && npc.blockPosition().distSqr(pos) <= 9.0D
+                    && swapInventoryItem("bucket", "water_bucket")) {
+                npc.level().setBlockAndUpdate(pos,
+                        net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 倒水自救：收回灭火水 | pos="
+                        + pos.toShortString());
+            }
+        }
+        if (npc.tickCount - lastDouseTick < 80) {
+            return;
+        }
+        boolean inLava = npc.isInLava();
+        boolean burning = npc.getRemainingFireTicks() > 0;
+        if ((!inLava && !burning) || npc.isInWater() || !hasInventoryItem("water_bucket")) {
+            return;
+        }
+        BlockPos feet = npc.blockPosition();
+        if (inLava) {
+            var state = npc.level().getBlockState(feet);
+            if (!state.is(net.minecraft.world.level.block.Blocks.LAVA)) {
+                return;
+            }
+            boolean source = state.getFluidState().isSource();
+            npc.level().setBlockAndUpdate(feet, source
+                    ? net.minecraft.world.level.block.Blocks.OBSIDIAN.defaultBlockState()
+                    : net.minecraft.world.level.block.Blocks.STONE.defaultBlockState());
+            swapInventoryItem("water_bucket", "bucket");
+            npc.clearFire();
+            lastDouseTick = npc.tickCount;
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 倒水自救（岩浆） | pos="
+                    + feet.toShortString() + " source=" + source + " 结果="
+                    + (source ? "obsidian" : "stone") + " hp=" + npc.getHealth());
+            return;
+        }
+        // 陆上着火：水只能倒在脚格可替换时（站地面时脚格即空气/火）。
+        var state = npc.level().getBlockState(feet);
+        if (!state.isAir() && !state.canBeReplaced()
+                && !state.is(net.minecraft.world.level.block.Blocks.FIRE)
+                && !state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)) {
+            return;
+        }
+        npc.level().setBlockAndUpdate(feet,
+                net.minecraft.world.level.block.Blocks.WATER.defaultBlockState());
+        swapInventoryItem("water_bucket", "bucket");
+        npc.clearFire();
+        douseWaterPos = feet.immutable();
+        douseAge = 0;
+        lastDouseTick = npc.tickCount;
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 倒水自救（灭火） | pos="
+                + feet.toShortString() + " hp=" + npc.getHealth());
+    }
+
+    private boolean hasInventoryItem(String path) {
+        var inventory = npc.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            var stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && path.equals(itemPath(stack))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 把背包里一个 from 换成一个 to（与 SkillRunner.replaceOneItem 同口径：缩 1 再补 1）。 */
+    private boolean swapInventoryItem(String from, String to) {
+        var inventory = npc.getInventory();
+        var id = net.minecraft.resources.Identifier.tryParse(to);
+        if (id == null) {
+            return false;
+        }
+        var toItem = net.minecraft.core.registries.BuiltInRegistries.ITEM.getOptional(id)
+                .orElse(net.minecraft.world.item.Items.AIR);
+        if (toItem == net.minecraft.world.item.Items.AIR) {
+            return false;
+        }
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            var stack = inventory.getItem(slot);
+            if (stack.isEmpty() || !from.equals(itemPath(stack))) {
+                continue;
+            }
+            stack.shrink(1);
+            if (stack.isEmpty()) {
+                inventory.setItem(slot, new net.minecraft.world.item.ItemStack(toItem, 1));
+                return true;
+            }
+            for (int free = 0; free < inventory.getContainerSize(); free++) {
+                var target = inventory.getItem(free);
+                if (target.isEmpty()) {
+                    inventory.setItem(free, new net.minecraft.world.item.ItemStack(toItem, 1));
+                    return true;
+                }
+                if (target.getItem() == toItem && target.getCount() < target.getMaxStackSize()) {
+                    target.grow(1);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    private String itemPath(net.minecraft.world.item.ItemStack stack) {
+        var key = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem());
+        return key == null ? "?" : key.getPath();
     }
 
     /**

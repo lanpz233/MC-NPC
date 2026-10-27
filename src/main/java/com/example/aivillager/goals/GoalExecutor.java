@@ -424,6 +424,11 @@ public final class GoalExecutor {
                 newTarget = "flint";
                 newCount = clamp(intent.intParam("count", 1), 1, 8);
             }
+            case "fillbucket" -> {
+                // 【fix70·D4】装满水桶（常备保命水）：技能层已有 fillbucket。
+                newTarget = "fillbucket";
+                newCount = 1;
+            }
             case "obsidian" -> {
                 newTarget = "obsidian";
                 newCount = clamp(intent.intParam("count", 10), 1, 32);
@@ -579,6 +584,7 @@ public final class GoalExecutor {
             case "sleep" -> "回床睡觉";
             case "store_loot" -> "回落脚点存贵重物（箱子）";
             case "flint" -> "找燧石 x" + targetCount;
+            case "fillbucket" -> "装满水桶（常备）";
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
             case "portal" -> "建造并点燃下界传送门";
             case "enterportal" -> "走进已点亮的传送门";
@@ -686,6 +692,7 @@ public final class GoalExecutor {
             case "sleep" -> tickSleep();
             case "store_loot" -> tickStoreLoot();
             case "flint" -> tickFlint();
+            case "fillbucket" -> tickFillBucket();
             case "obsidian" -> tickObsidian();
             case "portal" -> tickPortal();
             case "enterportal" -> tickEnterPortal();
@@ -4050,6 +4057,30 @@ public final class GoalExecutor {
     }
 
     /**
+     * 【fix70·D4】装满水桶（常备保命水）：转派技能层 fillbucket
+     * （64 格内找水源→走过去→舀水，照原版取水口径）。技能在跑时目标层
+     * tick 被全局守卫挡住，这里只在技能空闲时派单/收手。
+     */
+    private void tickFillBucket() {
+        status = "装满水桶";
+        if (countItem("water_bucket") > 0) {
+            finish("水桶已装满");
+            return;
+        }
+        if (countItem("bucket") <= 0) {
+            finish("没有空铁桶");
+            return;
+        }
+        if (skills.run(new Intent("", "fillbucket", new JsonObject()), "目标")) {
+            attempts = 0;
+            return;
+        }
+        if (++attempts >= 12) {
+            finish("装水连续没有进展（附近无水源）");
+        }
+    }
+
+    /**
      * 浇铸黑曜石：水桶浇岩浆源 → 钻石镐采集 → 收水回桶。
      * 附近没有岩浆时先阶梯下挖到 Y≈-52 的岩浆层。
      */
@@ -4925,6 +4956,7 @@ public final class GoalExecutor {
             case "base" -> basePlacedCount;
             case "slay" -> countItem(slayDrop);
             case "flint" -> countItem("flint");
+            case "fillbucket" -> countItem("water_bucket");
             case "obsidian" -> countItem("obsidian");
             default -> 0;
         };
