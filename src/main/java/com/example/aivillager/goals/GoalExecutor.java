@@ -2022,7 +2022,10 @@ public final class GoalExecutor {
                 return;
             }
             JsonObject stockParams = new JsonObject();
-            stockParams.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 24 : 12);
+            // 【第四十三轮】搜猎半径 12/24 → 32/48：五局群系合证半径 12 在动物
+            // 稀疏/斑块分布地形从未猎成（且技能层旧钳制把 24 也压回 16、从未生效）。
+            // 按“玩家目视”口径：常态 32、久猎无获 48，配 wanderForHunt 步幅放大。
+            stockParams.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 48 : 32);
             stockParams.addProperty("hits", 10);
             if (leatherNeed) {
                 stockParams.addProperty("filter", "leather");
@@ -2051,9 +2054,9 @@ public final class GoalExecutor {
             return;
         }
         JsonObject params = new JsonObject();
-        // 【第十五轮】久猎无获时把搜猎半径放大到 24：12 格外一步之遥的动物
-        // 旧版永远看不见、只能靠搬迁碰运气。
-        params.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 24 : 12);
+        // 【第十五轮】久猎无获时放大搜猎半径（旧版 12 格外一步之遥永远看不见）。
+        // 【第四十三轮】口径再放大：常态 32、久猎无获 48（见存量分支同注）。
+        params.addProperty("radius", huntAttempts >= 4 || huntFailStreak >= 1 ? 48 : 32);
         params.addProperty("hits", 10);
         // 【第十九轮】皮革不足 4 张时打猎优先牛：牛肉是顶级食物、皮革是皮靴
         // 材料，一举两得（Fong 口径）。攒够 4 张后恢复"最近优先"。
@@ -2071,9 +2074,11 @@ public final class GoalExecutor {
      * 【第十五轮】找猎专用搬迁：旧版所有"附近没有"都用通用 wander 小步随机
      * 4-9 格换位，在无动物区就是原地打转——长跑#6 实测 food=0 后连续 4 轮
      * 狩猎目标全失败、8 分钟只挪出 50 格，铁装/钻石主线被饥饿顶住饿死循环。
-     * 改为逐级放大：本轮前两次仍小步；之后沿一条固定航向走 18→32→48 格
+     * 改为逐级放大：本轮前两次仍小步；之后沿一条固定航向逐级远走
      * （航向在整轮失败期间保持，跨目标 streak 叠加升温），真正离开贫瘠区；
      * 打到猎物即清零复位。航向走不通时依次试 ±45° 与反向，都不通退回通用小步。
+     * 【第四十三轮】步幅随搜猎半径（32/48）同步放大：24→48→64 格——步幅小于
+     * 扫描半径时新扫区大半与旧区重叠，等于在贫瘠区里换个姿势盲走。
      */
     private void wanderForHunt() {
         int heat = huntAttempts + huntFailStreak * 2;
@@ -2081,7 +2086,7 @@ public final class GoalExecutor {
             wander();
             return;
         }
-        double distance = heat <= 4 ? 18.0D : heat <= 6 ? 32.0D : 48.0D;
+        double distance = heat <= 4 ? 24.0D : heat <= 6 ? 48.0D : 64.0D;
         if (Double.isNaN(huntHeading)) {
             huntHeading = java.util.concurrent.ThreadLocalRandom.current()
                     .nextDouble() * Math.PI * 2.0D;

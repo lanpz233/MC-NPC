@@ -2410,7 +2410,10 @@ public final class SkillRunner {
      * 只认 {@link Animal}，不会误伤村民、已驯服的狼或玩家。
      */
     private boolean runHunt(Intent intent, int id) {
-        double radius = Math.max(6.0D, Math.min(MAX_SEARCH_RADIUS, intent.doubleParam("radius", 12.0D)));
+        // 【第四十三轮】hunt 专用半径上限 48，不再走 MAX_SEARCH_RADIUS=16 的通用钳制：
+        // 五局群系合证旧钳制把上层传的 24 也压回 16，“放大搜猎半径”从未真正生效，
+        // 动物间距 30–80 格的稀疏地形里等于盲走（针叶林放弃 20 次、沙漠饿死）。
+        double radius = Math.max(6.0D, Math.min(48.0D, intent.doubleParam("radius", 12.0D)));
         int maxHits = Math.max(1, Math.min(12, intent.intParam("hits", 10)));
         List<Entity> candidates = npc.level().getEntities(npc, npc.getBoundingBox().inflate(radius),
                 entity -> entity instanceof Animal animal && animal.isAlive() && !animal.isBaby());
@@ -2453,24 +2456,46 @@ public final class SkillRunner {
                 candidates = cows;
             }
         }
-        LivingEntity target = (LivingEntity) candidates.stream()
-                .min((left, right) -> Double.compare(npc.distanceToSqr(left), npc.distanceToSqr(right)))
-                .orElseThrow();
-        BlockPos approach = PathFinder.standableGoal(npc.level(), target.blockPosition(), 3);
-        if (approach == null) {
-            lastOutcome = "hunt 目标附近没有可站立位置 target=" + target.getType();
+        // 【第四十三轮】半径放大后远处候选常隔河/隔崖不可达：按距离依次试接近
+        // 路径，前 4 个候选都走不通才报失败——免得最近一只不可达就整轮放弃、
+        // 更远处明明能打的动物被白白放过。
+        List<Entity> sorted = candidates.stream()
+                .sorted((left, right) -> Double.compare(npc.distanceToSqr(left), npc.distanceToSqr(right)))
+                .toList();
+        LivingEntity target = null;
+        PathFinder.Result approachPath = null;
+        int tried = 0;
+        for (Entity cand : sorted) {
+            if (tried >= 4) {
+                break;
+            }
+            tried++;
+            BlockPos approach = PathFinder.standableGoal(npc.level(), cand.blockPosition(), 3);
+            if (approach == null) {
+                continue;
+            }
+            PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), approach,
+                    !npc.wearingLeatherBoots());
+            logPath("hunt-approach", approach, path);
+            if (path.found()) {
+                target = (LivingEntity) cand;
+                approachPath = path;
+                break;
+            }
+        }
+        if (target == null) {
+            lastOutcome = "hunt 候选均不可达 tried=" + tried + " candidates=" + sorted.size()
+                    + " radius=" + radius;
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 候选均不可达 | tried=" + tried
+                    + " candidates=" + sorted.size() + " radius=" + radius);
             return false;
         }
-        PathFinder.Result approachPath = PathFinder.find(npc.level(), npc.blockPosition(), approach, !npc.wearingLeatherBoots());
-        logPath("hunt-approach", approach, approachPath);
-        if (!approachPath.found()) {
-            lastOutcome = "hunt 找不到接近路径 " + approachPath.detail();
-            return false;
-        }
+        final LivingEntity huntTarget = target;
+        final PathFinder.Result huntPath = approachPath;
         current = "hunt";
-        LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 开始 | target=" + target.getType()
-                + " hits=" + maxHits + " distance=" + String.format(Locale.ROOT, "%.1f", npc.distanceTo(target)));
-        npc.followPath(approachPath.path(), true, () -> {
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " hunt 开始 | target=" + huntTarget.getType()
+                + " hits=" + maxHits + " distance=" + String.format(Locale.ROOT, "%.1f", npc.distanceTo(huntTarget)));
+        npc.followPath(huntPath.path(), true, () -> {
             if (runId != id) {
                 return;
             }
@@ -2484,7 +2509,7 @@ public final class SkillRunner {
                         return;
                     }
                     attempts++;
-                    if (target.isRemoved() || !target.isAlive()) {
+                    if (huntTarget.isRemoved() || !huntTarget.isAlive()) {
                         finish(id, "hunt", "猎物已倒下 hits=" + hits);
                         return;
                     }
@@ -2492,10 +2517,10 @@ public final class SkillRunner {
                         finish(id, "hunt", "超时 hits=" + hits);
                         return;
                     }
-                    double distanceSq = npc.distanceToSqr(target);
+                    double distanceSq = npc.distanceToSqr(huntTarget);
                     if (distanceSq > 16.0D) {
                         if (!npc.isFollowingPath()) {
-                            BlockPos chaseGoal = PathFinder.standableGoal(npc.level(), target.blockPosition(), 3);
+                            BlockPos chaseGoal = PathFinder.standableGoal(npc.level(), huntTarget.blockPosition(), 3);
                             if (chaseGoal != null) {
                                 PathFinder.Result chase = PathFinder.find(npc.level(), npc.blockPosition(), chaseGoal, !npc.wearingLeatherBoots());
                                 if (chase.found()) {
@@ -2505,10 +2530,10 @@ public final class SkillRunner {
                         }
                         return;
                     }
-                    npc.attackTarget(target);
+                    npc.attackTarget(huntTarget);
                     hits++;
                     if (hits >= maxHits) {
-                        finish(id, "hunt", "达到攻击次数 hits=" + hits + " 存活=" + target.isAlive());
+                        finish(id, "hunt", "达到攻击次数 hits=" + hits + " 存活=" + huntTarget.isAlive());
                     }
                 }
             }, 20L, 20L));
