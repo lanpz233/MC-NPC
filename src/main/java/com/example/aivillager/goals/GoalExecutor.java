@@ -3045,6 +3045,37 @@ public final class GoalExecutor {
     }
 
     /**
+     * 【fix62】站位接近：近处平地用 goto；远（水平 >6 格）/高差大（>4 格）或 goto
+     * 连败 ≥6 tick 后改派 travel（能挖/搭/爬的长途手段，fix60 tend 同病同治）。
+     * 裸 goto 在屋顶/楼梯井/洼地起点必死——standableGoal 垂直窗口以 NPC 当前 Y
+     * 为锚够不着工地、A* 起点被困开放集 15~97 节点即耗尽、>16 格无兜底——建屋
+     * 三火（farm19/19b）from==to 全灭实锤，定案见 status-round17。travel 启动后
+     * 技能层接管（目标 tick 技能忙时提前返回），本方法只管发令。
+     */
+    private void moveToStand(BlockPos stand, int stuckTicks, String tag) {
+        double dxs = npc.getX() - (stand.getX() + 0.5D);
+        double dzs = npc.getZ() - (stand.getZ() + 0.5D);
+        double dys = npc.getY() - stand.getY();
+        boolean farOrElevated = dxs * dxs + dzs * dzs > 36.0D || Math.abs(dys) > 4.0D;
+        if (farOrElevated || stuckTicks >= 6) {
+            JsonObject tv = new JsonObject();
+            tv.addProperty("x", stand.getX() + 0.5D);
+            tv.addProperty("y", (double) stand.getY());
+            tv.addProperty("z", stand.getZ() + 0.5D);
+            tv.addProperty("tolerance", 2.0D);
+            if (skills.run(new Intent("", "travel", tv), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " " + tag + " goto 不通改 travel 接近站位 | "
+                        + stand.toShortString());
+            }
+            return;
+        }
+        JsonObject params = new JsonObject();
+        params.addProperty("x", stand.getX() + 0.5D);
+        params.addProperty("z", stand.getZ() + 0.5D);
+        skills.run(new Intent("", "goto", params), "目标");
+    }
+
+    /**
      * 执行砌筑队列。返回 true = 队列处理完（成功/跳过都算）。
      * 站位固定屋内中心：所有格都在够得着口径内（见 tickBase 注释）。
      */
@@ -3082,10 +3113,7 @@ public final class GoalExecutor {
             }
             BlockPos stand = new BlockPos(baseCenter.getX(), baseCenter.getY() + 1, baseCenter.getZ());
             if (npc.blockPosition().distSqr(stand) > 1.0D) {
-                JsonObject params = new JsonObject();
-                params.addProperty("x", stand.getX() + 0.5D);
-                params.addProperty("z", stand.getZ() + 0.5D);
-                skills.run(new Intent("", "goto", params), "目标");
+                moveToStand(stand, baseActionStuck, "[BASE]");
             }
             return false;
         }
@@ -3217,10 +3245,7 @@ public final class GoalExecutor {
                 }
                 BlockPos stand = base.anchor();
                 if (npc.blockPosition().distSqr(stand) > 1.0D) {
-                    JsonObject params = new JsonObject();
-                    params.addProperty("x", stand.getX() + 0.5D);
-                    params.addProperty("z", stand.getZ() + 0.5D);
-                    skills.run(new Intent("", "goto", params), "目标");
+                    moveToStand(stand, bedActionStuck, "[BED]");
                 }
             }
             case 2 -> {
@@ -3334,10 +3359,7 @@ public final class GoalExecutor {
                     finish("睡觉放弃：到不了床边");
                     return;
                 }
-                JsonObject params = new JsonObject();
-                params.addProperty("x", anchor.getX() + 0.5D);
-                params.addProperty("z", anchor.getZ() + 0.5D);
-                skills.run(new Intent("", "goto", params), "目标");
+                moveToStand(anchor, sleepActionStuck, "[BED]");
             }
             case 1 -> {
                 status = "睡觉：上床";
