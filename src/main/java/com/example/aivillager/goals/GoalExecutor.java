@@ -5766,6 +5766,10 @@ public final class GoalExecutor {
                 || path.endsWith("_leggings") || path.endsWith("_boots")
                 || path.equals("shield") || path.equals("bow") || path.equals("arrow")
                 || path.equals("bucket") || path.equals("water_bucket")
+                // 【fix75】火把是规划步 13.06 按常备 ≥8 维护的消耗品，不保护
+                // 就会被满包兜底当最小堆扔掉（farm33 实证：合成 8/8 后 23 秒
+                // 全数丢弃、规划又重派合成，烧煤烧棍空转）。
+                || path.equals("torch")
                 || path.equals("flint_and_steel") || path.equals("obsidian")
                 || path.equals("ender_eye") || path.equals("ender_pearl")
                 || path.equals("blaze_rod") || path.equals("blaze_powder")
