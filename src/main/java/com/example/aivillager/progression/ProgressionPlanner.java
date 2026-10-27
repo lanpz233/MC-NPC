@@ -1775,6 +1775,15 @@ public final class ProgressionPlanner {
         if (ok) {
             return null;
         }
+        // 【fix59】夜里地表没猎物：口粮门曾整夜派 hunt 空转（300s 看门狗超时连烧，
+        // boot-farm14 实锤）。照步 6.6 夜间闸先例：夜里且并不真饿（foodLevel>6）时
+        // 暂缓补猎、放行下潜——地下不分昼夜，储备 13 够用，饥饿升井链是硬兜底；
+        // 真饿（foodLevel≤6）夜里照旧先猎，不拿命赌。
+        if (isNight() && npc.getFoodData().getFoodLevel() > 6) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 下矿口粮门夜间暂缓 | foodNutrition=" + value
+                    + " foodLevel=" + npc.getFoodData().getFoodLevel() + "（夜里无猎物，天亮再补）");
+            return null;
+        }
         if (underground()) {
             return skill("下矿口粮不足：先回地表补给", "ascend");
         }
