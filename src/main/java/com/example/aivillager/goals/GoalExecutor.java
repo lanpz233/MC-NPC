@@ -258,7 +258,8 @@ public final class GoalExecutor {
 
     /**
      * 资源别名表。玩家说"挖铁"时，目标层要知道对应方块、掉落物和合理深度：
-     * 铁在 Y=16 附近最密集，钻石在 Y=-54，煤和铁同一层（Y=16），石头随处都是。
+     * 铁在 Y=16 附近最密集，钻石起始层 Y=-54（fix81 起按 NPC 渐进下探至 -59，
+     * 实际层位由 DigDepthMemory 在 accept 时覆盖），煤和铁同一层（Y=16），石头随处都是。
      */
     private static OreTarget oreTargetOf(String resource) {
         return switch (resource) {
@@ -362,9 +363,22 @@ public final class GoalExecutor {
                     lastOutcome = "dig 不支持的资源 " + newTarget;
                     return false;
                 }
+                if ("diamond_ore".equals(target.block())) {
+                    // 【fix81】钻石目标层渐进下探：深度按 NPC 持久化（DigDepthMemory），
+                    // 连败换区时下探、-59 封底；layerY/descend/strip 全链都读
+                    // oreTarget.y，在这里换掉 y 即全链生效。revisit 走记账点
+                    // 坐标、不经此覆盖。
+                    DigDepthMemory.bindWorld(npc.level());
+                    target = new OreTarget(target.block(), target.drop(),
+                            DigDepthMemory.depth(npc.npcName()));
+                }
                 oreTarget = target;
                 newTarget = target.block();
                 newCount = clamp(intent.intParam("count", 8), 1, 64);
+                if ("diamond_ore".equals(oreTarget.block())) {
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " 挖钻开工 | depth=" + oreTarget.y()
+                            + " 目标=" + newCount);
+                }
             }
             case "revisit" -> {
                 // 【fix40】记矿回访：参数带记账点坐标与矿种，oreTarget 复用

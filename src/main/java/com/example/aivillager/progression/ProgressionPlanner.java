@@ -435,6 +435,23 @@ public final class ProgressionPlanner {
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 挖矿连败换区 | resource="
                             + relocationResource + " 连弃=" + digAbandonStreak
                             + " 位置=" + npc.blockPosition().toShortString());
+                    // 【fix81】钻石换区即下探（Fong 拍板越挖越深）：换区=新开井群，
+                    // 目标层下探 2 层、-59 封底；进行中的井群已经收场，新深度只
+                    // 作用于换区后的下一次挖钻派单，不废弃任何在挖矿道。
+                    if ("diamond".equals(relocationResource)
+                            || "diamond_ore".equals(relocationResource)) {
+                        com.example.aivillager.goals.DigDepthMemory.bindWorld(npc.level());
+                        int[] deep = com.example.aivillager.goals.DigDepthMemory.deepen(npc.npcName());
+                        if (deep[1] < deep[0]) {
+                            LOG.info("[AIV][PLAN] " + npc.npcName() + " 深度下探 | from=" + deep[0]
+                                    + " to=" + deep[1] + " 触发=第" + deep[2] + "次钻石换区"
+                                    + " 封底=" + com.example.aivillager.goals.DigDepthMemory.FLOOR_DEPTH);
+                        } else {
+                            LOG.info("[AIV][PLAN] " + npc.npcName() + " 深度维持 | depth=" + deep[1]
+                                    + " 已封底（-59 为 Wiki 钻石最密层，再往下基岩混层、矿道不成形），"
+                                    + "本次换区只横移");
+                        }
+                    }
                 }
             } else if (!digFailed) {
                 // 挖矿目标正常完成：连败清零。
@@ -489,6 +506,7 @@ public final class ProgressionPlanner {
             case GOAL -> goals.start(step.intent);
             case SKILL -> skills.run(step.intent, "规划");
         };
+        com.example.aivillager.goals.DigDepthMemory.bindWorld(npc.level());
         LOG.info("[AIV][PLAN] " + npc.npcName() + " 下一步 | 阶段=" + step.stage
                 + " action=" + step.intent.action() + " params=" + step.intent.params()
                 + " accepted=" + accepted
@@ -502,6 +520,7 @@ public final class ProgressionPlanner {
                 + " rawIron=" + countItem("raw_iron")
                 + " ingots=" + countItem("iron_ingot")
                 + " diamonds=" + countItem("diamond")
+                + " depth=" + com.example.aivillager.goals.DigDepthMemory.depth(npc.npcName())
                 + " cobble=" + (countItem("cobblestone") + countItem("cobbled_deepslate"))
                 + " failStreak=" + failStreak
                 + " lastFailed=" + (lastFailedStage.isEmpty() ? "-" : lastFailedStage));
