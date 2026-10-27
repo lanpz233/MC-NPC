@@ -3327,6 +3327,40 @@ public final class GoalExecutor {
         }
     }
 
+    /** 【fix82】床位扫描：候选（foot 格，床头朝向）北墙行优先（不挡门路）、南墙行兜底；命中写状态返回 true。 */
+    private boolean scanBedSpot(BlockPos anchor) {
+        BlockPos[] feet = {
+                anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
+                anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
+        net.minecraft.core.Direction[] dirs = {
+                net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST,
+                net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST};
+        for (int i = 0; i < feet.length; i++) {
+            if (bedCellFree(feet[i]) && bedCellFree(feet[i].relative(dirs[i]))) {
+                bedFootPos = feet[i];
+                bedFacing = dirs[i];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 【fix82】选位失败诊断：逐候选格打 本格/脚下 物品 id——远端未加载读数与真占用靠此分辨。 */
+    private void logBedScanDiagnostics(BlockPos anchor) {
+        BlockPos[] cells = {
+                anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
+                anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
+        StringBuilder sb = new StringBuilder();
+        for (BlockPos cell : cells) {
+            BlockState state = npc.level().getBlockState(cell);
+            BlockState below = npc.level().getBlockState(cell.below());
+            sb.append(' ').append(cell.toShortString())
+                    .append('=').append(BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath())
+                    .append('/').append(BuiltInRegistries.BLOCK.getKey(below.getBlock()).getPath());
+        }
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 选位诊断（格=本格/脚下）:" + sb);
+    }
+
     private void tickPlaceBed() {
         BaseMemory.bindWorld(npc.level());
         BaseMemory.Base base = BaseMemory.base(npc.npcName());
@@ -3347,21 +3381,20 @@ public final class GoalExecutor {
                     return;
                 }
                 BlockPos anchor = base.anchor();
-                // 候选（foot 格, 床头朝向）：北墙行优先（不挡门路），南墙行兜底。
-                BlockPos[] feet = {
-                        anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
-                        anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
-                net.minecraft.core.Direction[] dirs = {
-                        net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST,
-                        net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST};
-                for (int i = 0; i < feet.length; i++) {
-                    if (bedCellFree(feet[i]) && bedCellFree(feet[i].relative(dirs[i]))) {
-                        bedFootPos = feet[i];
-                        bedFacing = dirs[i];
-                        break;
-                    }
+                // 【fix82】远端（>24 格、锚点区块未加载）不预扫：未加载读数会让 bedCellFree
+                // 的「脚下实心」判定恒假、四组候选全灭误报无空位（farm41 三度秒败实证）。
+                // 改先就位（phase 1 的 moveToStand），到站后在 phase 1 就地扫描。
+                double bdx = npc.getX() - (anchor.getX() + 0.5D);
+                double bdz = npc.getZ() - (anchor.getZ() + 0.5D);
+                double bedDistSqr = bdx * bdx + bdz * bdz;
+                if (bedDistSqr > 24.0D * 24.0D) {
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 远端派单：先就位后选位 | dist="
+                            + (int) Math.sqrt(bedDistSqr));
+                    bedPhase = 1;
+                    return;
                 }
-                if (bedFootPos == null) {
+                if (!scanBedSpot(anchor)) {
+                    logBedScanDiagnostics(anchor);
                     finish("安置床放弃：屋内没有空位（两格连排都被占）");
                     return;
                 }
@@ -3369,7 +3402,20 @@ public final class GoalExecutor {
             }
             case 1 -> {
                 status = "安置床：就位";
-                if (farmInReach(bedFootPos)) {
+                BlockPos stand = base.anchor();
+                // 【fix65】同 processBaseQueue：站位须精确到列 + 脚位差 ≤1.0。
+                boolean bedAtStand = npc.blockPosition().getX() == stand.getX()
+                        && npc.blockPosition().getZ() == stand.getZ()
+                        && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
+                if (bedFootPos == null && bedAtStand) {
+                    // 【fix82】远端派单到站后就地选位（此时区块已加载、读数真实）。
+                    if (!scanBedSpot(stand)) {
+                        logBedScanDiagnostics(stand);
+                        finish("安置床放弃：到场后确认屋内没有空位（见选位诊断）");
+                        return;
+                    }
+                }
+                if (bedFootPos != null && farmInReach(bedFootPos)) {
                     bedPhase = 2;
                     return;
                 }
@@ -3385,11 +3431,6 @@ public final class GoalExecutor {
                     finish("安置床放弃：到不了屋内站位");
                     return;
                 }
-                BlockPos stand = base.anchor();
-                // 【fix65】同 processBaseQueue：站位须精确到列 + 脚位差 ≤1.0。
-                boolean bedAtStand = npc.blockPosition().getX() == stand.getX()
-                        && npc.blockPosition().getZ() == stand.getZ()
-                        && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
                 if (!bedAtStand) {
                     moveToStand(stand, bedActionStuck, "[BED]");
                 }
