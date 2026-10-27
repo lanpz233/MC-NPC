@@ -85,6 +85,7 @@ public final class AiVillagerPlugin extends JavaPlugin {
         // 【fix49】农田账本落盘目录（farm-memory/<NPC>.json）。
         com.example.aivillager.goals.FarmMemory.init(getDataFolder());
         com.example.aivillager.goals.BaseMemory.init(getDataFolder());
+        com.example.aivillager.goals.DeathMemory.init(getDataFolder());
 
         router = LlmRouter.fromConfig(this);
         chatRadius = getConfig().getDouble("npc.chat-radius", 16.0D);

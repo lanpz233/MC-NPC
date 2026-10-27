@@ -230,6 +230,11 @@ public final class SurvivalController {
                 // 一条 [AIV][DEATH] 打全——不许再靠别的提交信息拼死因
                 //（掠夺者射杀 3 次靠事后拼凑是反面教材）。
                 LOG.info("[AIV][DEATH] " + npc.npcName() + " " + deathScene());
+                // 【fix79·D3】死亡点记账落盘：复活后规划层步 6.78 读账回现场
+                // 续干（物资不足先补给、夜里不跑尸，判定全在规划层）。
+                com.example.aivillager.goals.DeathMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.DeathMemory.saveDeath(
+                        npc.npcName(), npc.blockPosition());
                 // 死亡瞬间原版已经把背包掉在尸体周围；先清掉这些掉落物，
                 // 否则复活后再恢复背包就等于凭空复制了一套物品。
                 discardDeathDrops();

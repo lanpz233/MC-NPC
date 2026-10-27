@@ -987,6 +987,36 @@ public final class ProgressionPlanner {
             }
         }
 
+        // 6.78) 死后回程（fix79·D3）：死亡点有账就回现场续干，别把挖了一半
+        // 的矿洞扔下另起炉灶（第 6 死后它换到新区重挖整条竖井，实证浪费）。
+        // 物资门：夜里不跑尸（路上送命）、nutrition 不够不回（回程靠顺位实现
+        // "不足先补给"——口粮步 6.6 排在本步之前会先派活，本步再查硬线双
+        // 保险）、没镐回了也干不了活。到点销账在 decide 内就地判定；账本
+        // 2 小时过期（DeathMemory 读时失效），连败靠阶段跳过兜底。
+        com.example.aivillager.goals.DeathMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.DeathMemory.Death deathReturn =
+                com.example.aivillager.goals.DeathMemory.death(npc.npcName());
+        if (deathReturn != null) {
+            BlockPos deathPos = deathReturn.pos();
+            double deathDx = deathPos.getX() + 0.5D - npc.getX();
+            double deathDz = deathPos.getZ() + 0.5D - npc.getZ();
+            double deathDist = Math.sqrt(deathDx * deathDx + deathDz * deathDz);
+            if (deathDist <= 8.0D && Math.abs(deathPos.getY() - npc.getY()) <= 8.0D) {
+                com.example.aivillager.goals.DeathMemory.clear(npc.npcName());
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 死后回程销账 | 已回到死亡点 "
+                        + deathPos.toShortString() + " 附近，续干");
+            } else if (!isNight() && foodNutrition() >= 12
+                    && (stonePickaxes > 0 || countItem("iron_pickaxe") > 0
+                    || countItem("diamond_pickaxe") > 0)) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 死后回程触发 | 死亡点="
+                        + deathPos.toShortString() + " 距离=" + Math.round(deathDist)
+                        + " foodNutrition=" + foodNutrition());
+                return goal("死后回程", "travel",
+                        params("x", deathPos.getX(), "y", deathPos.getY(),
+                                "z", deathPos.getZ()));
+            }
+        }
+
         // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
         // 针叶林等细雪地带时，皮靴从"顺手做"升级为"优先做"——没皮靴在雪地
         // 里寸步难行（寻路已避开细雪，没靴寸步难行的是探索范围被雪原封死）。
