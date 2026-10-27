@@ -2845,6 +2845,10 @@ public final class SkillRunner {
         LOG.info("[AIV][SKILL] " + npc.npcName() + " fillbucket 挖路 | water="
                 + water.toShortString() + " stand=" + stand.toShortString());
         final int[] stepsDone = {0};
+        /** 【fix74】位移监测：每 40 步查一次脚位，连续两次没挪窝就诚实收手，
+         * 不再原地烧满 200 步（farm33 实证纯下挖自环 200 步零位移）。 */
+        final BlockPos[] lastCheckPos = {npc.blockPosition()};
+        final int[] stallChecks = {0};
         armWatchdog(id, "fillbucket");
         tasks.add(Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             if (runId != id || !"fillbucket".equals(current)) {
@@ -2879,6 +2883,29 @@ public final class SkillRunner {
             } else if (dz != 0) {
                 mz = (int) Math.signum(dz);
             }
+            if (mx == 0 && mz == 0 && my < 0) {
+                // 【fix74】纯下挖但脚正下方碰撞为空（空气/水/可替换）：身体多半被
+                // 邻列崖边块搭边撑住、脚位列悬空——继续下挖只是挖空气，walkTo
+                // 目标又是自身格（水平已达标），原地自环（farm33 坐标级实证）。
+                // 改朝水源水平主轴横移脱边：移出搭撑后身体自然下落，
+                // 落进水塘也算到达（feet==water 是本技能的完成判定）。
+                BlockPos below = feet.below();
+                if (npc.level().getBlockState(below).getCollisionShape(npc.level(), below).isEmpty()) {
+                    int wdx = water.getX() - feet.getX();
+                    int wdz = water.getZ() - feet.getZ();
+                    if (wdx == 0 && wdz == 0) {
+                        wdx = dx;
+                        wdz = dz;
+                    }
+                    if (Math.abs(wdx) >= Math.abs(wdz) && wdx != 0) {
+                        mx = (int) Math.signum(wdx);
+                        my = 0;
+                    } else if (wdz != 0) {
+                        mz = (int) Math.signum(wdz);
+                        my = 0;
+                    }
+                }
+            }
             if (mx == 0 && my == 0 && mz == 0) {
                 // 到了附近，找相邻格
                 for (int[] d : new int[][]{{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}}) {
@@ -2905,6 +2932,17 @@ public final class SkillRunner {
             npc.walkTo(new Vec3(targetFeet.getX() + 0.5D, targetFeet.getY(), targetFeet.getZ() + 0.5D),
                     false, null);
             stepsDone[0]++;
+            if (stepsDone[0] % 40 == 0) {
+                if (feet.distSqr(lastCheckPos[0]) < 1.0D) {
+                    if (++stallChecks[0] >= 2) {
+                        finish(id, "fillbucket", "挖路无位移（地形接近失败）");
+                        return;
+                    }
+                } else {
+                    stallChecks[0] = 0;
+                    lastCheckPos[0] = feet;
+                }
+            }
             if (stepsDone[0] > 200) {
                 finish(id, "fillbucket", "挖路步数用尽");
             }

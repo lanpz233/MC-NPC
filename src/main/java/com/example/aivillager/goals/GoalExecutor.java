@@ -103,6 +103,10 @@ public final class GoalExecutor {
     private String goalDimension = "";
     private int targetCount;
     private int attempts;
+    /** 【fix74】fillbucket 技能完整跑完一轮仍没装到水的次数。attempts 在派发成功时清零、
+     * 只数派发被拒，数不到这种失败——farm33 实证无限重派白站 300 秒。 */
+    private int fillFailedRuns;
+    private boolean fillSkillActive;
     private int outcomeCount;
     private int lastProgress = -1;
     /**
@@ -493,6 +497,8 @@ public final class GoalExecutor {
         targetId = newTarget;
         targetCount = newCount;
         attempts = 0;
+        fillFailedRuns = 0;
+        fillSkillActive = false;
         staleChecks = 0;
         lastProgress = -1;
         // 必须在 targetId 赋值之后算：gatherCount() 要看目标物品。
@@ -4127,6 +4133,18 @@ public final class GoalExecutor {
         if (countItem("bucket") <= 0) {
             finish("没有空铁桶");
             return;
+        }
+        // 【fix74】技能一轮跑完（fillbucket→idle）仍没装到水：计一次失败运行，
+        // 6 次诚实收手。旧版只有 attempts（派发被拒才计数、派发成功即清零），
+        // 技能每 20 秒正常收场就无限重派——farm33 实证靠 300 秒看门狗才收场。
+        if ("fillbucket".equals(skills.currentSkill())) {
+            fillSkillActive = true;
+        } else if (fillSkillActive) {
+            fillSkillActive = false;
+            if (++fillFailedRuns >= 6) {
+                finish("装水多次接近失败（地形到不了水源）");
+                return;
+            }
         }
         if (skills.run(new Intent("", "fillbucket", new JsonObject()), "目标")) {
             attempts = 0;
