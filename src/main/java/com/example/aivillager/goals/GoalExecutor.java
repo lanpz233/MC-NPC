@@ -4886,6 +4886,9 @@ public final class GoalExecutor {
             case "dirt", "sand", "clay_ball", "andesite", "diorite", "granite",
                  "polished_andesite", "polished_diorite", "polished_granite",
                  "tuff", "calcite", "deepslate", "cobbled_deepslate",
+                 // 【fix54】落叶层（leaf_litter）：森林地表装饰，打草/路过自动
+                 // 捡满包（实证囤到 215 个、3 格半），纯地形杂料不保留。
+                 "leaf_litter",
                  // 【fix38·Fong 04:17】沙砾列第一档地形杂料、不再保留：
                  // 旧版留 16 个筛燧石，但燧石有专门的"找燧石"目标按需重挖，
                  // 满包时先保格子；筛出的燧石本身在永不扔清单里，不受影响。
@@ -4903,6 +4906,12 @@ public final class GoalExecutor {
             // 沙砾保留量已按 Fong 04:17 改为 0（见上方第一档分组）。
             case "bamboo" -> {
                 return 32;
+            }
+            // 【fix54】小麦种子是田的命根子（D11），不再走下面 *_seeds 的
+            // 杂物口径：整组保留。fix49 短验实证旧口径保留=0，NPC 一边打草
+            // 一边把种子全扔了、攒种阶段永远攒不够（17 次拾取全被裁掉）。
+            case "wheat_seeds" -> {
+                return 64;
             }
             case "stick" -> {
                 return 16;
@@ -5000,6 +5009,9 @@ public final class GoalExecutor {
                 || path.equals("redstone") || path.equals("lapis_lazuli")
                 || path.equals("coal") || path.equals("charcoal") || path.equals("flint")
                 || path.equals("crafting_table") || path.equals("furnace")
+                // 【fix54】种田物资兜底保护：小麦种子（田的命根子）、骨粉
+                // （催熟料，堆小、最容易被"最小堆兜底"误杀）。
+                || path.equals("wheat_seeds") || path.equals("bone_meal")
                 // 木料类是整条科技树的根基（木棍→工具/箭、木板→工作台/木棍），
                 // 兜底清理时把它当关键材料保住，否则"背包满"会先把木棍丢掉。
                 || path.equals("stick") || path.equals("bamboo") || path.equals("bamboo_block")
