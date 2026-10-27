@@ -754,6 +754,14 @@ public final class ProgressionPlanner {
                 if (!isNight() && farmDistSq <= 48.0D * 48.0D) {
                     com.example.aivillager.goals.FarmMemory.Scan scan =
                             com.example.aivillager.goals.FarmMemory.scan(npc.level(), npc.npcName());
+                    // 骨粉先行：田里有在长的、口粮紧、手里有骨头没骨粉——先把
+                    // 骨头磨成骨粉（原版无序合成 1 骨=3 粉，不需工作台），
+                    // 下一轮 decide 的维护步才带得动催熟。
+                    if (scan.growing() > 0 && countItem("bone_meal") <= 0 && countItem("bone") > 0
+                            && foodNutrition() < MINING_FOOD_NUTRITION) {
+                        return goal("磨骨粉", "craft", params("item", "bone_meal",
+                                "count", countItem("bone") * 3));
+                    }
                     boolean canPlant = countItem("wheat_seeds") > 0
                             || countItem("carrot") > 0 || countItem("potato") > 0;
                     boolean bonemealCase = scan.growing() > 0 && countItem("bone_meal") > 0
