@@ -487,23 +487,57 @@ public final class SurvivalController {
         // 脚格=air 使 unstuck 在此早退、实心段零打挖，hp 19→0.3 窒息死。
         // 原设计注释假设"头被卡住原版能挤出去"已被证伪。玩家被墙卡头的第一
         // 反应是挖开头位块，这里同理：isInWall（原版窒息判定本体）为真就挖
-        // 眼位格、挖不动再挖眼位上一格，不看脚格、不看技能状态；正常站位
+        // 真窒息格（枚举口径见 fix72），不看脚格、不看技能状态；正常站位
         // （头顶有 2 格空间）isInWall 恒假，零误伤。
         if (npc.isInWall()) {
-            net.minecraft.core.BlockPos eye = net.minecraft.core.BlockPos.containing(
-                    npc.getEyePosition());
-            String eyeBlock = net.minecraft.core.registries.BuiltInRegistries.BLOCK
-                    .getKey(npc.level().getBlockState(eye).getBlock()).toString();
-            boolean dug = npc.mineWithBestTool(eye) || npc.mine(eye);
-            net.minecraft.core.BlockPos used = eye;
-            if (!dug) {
-                net.minecraft.core.BlockPos aboveEye = eye.above();
-                dug = npc.mineWithBestTool(aboveEye) || npc.mine(aboveEye);
-                used = aboveEye;
+            // 【fix72】脱困 v2：窒息块未必在眼位包含格里——身体包围盒宽 0.6
+            // 会横跨两列，压盒的墙格可能在邻列。farm30 实证：恢复点建屋时北墙
+            // 格压在包围盒眼高层，眼位格确为空气，fix67 对空气/屋顶空挖 32 次、
+            // 真窒息格没动，13 秒窒息致死。改枚举包围盒覆盖的全部格子（眼高
+            // 层优先），挖第一个 isSuffocating 的真窒息格；一格没有时打诊断行，
+            // 不再对空气格空转。
+            var box = npc.getBoundingBox();
+            int x0 = net.minecraft.util.Mth.floor(box.minX);
+            int x1 = net.minecraft.util.Mth.floor(box.maxX - 1.0E-7D);
+            int z0 = net.minecraft.util.Mth.floor(box.minZ);
+            int z1 = net.minecraft.util.Mth.floor(box.maxZ - 1.0E-7D);
+            int y0 = net.minecraft.util.Mth.floor(box.minY);
+            int y1 = net.minecraft.util.Mth.floor(box.maxY - 1.0E-7D);
+            int eyeY = net.minecraft.util.Mth.floor(npc.getEyeY());
+            java.util.List<Integer> yOrder = new java.util.ArrayList<>();
+            yOrder.add(eyeY);
+            for (int y = y0; y <= y1; y++) {
+                if (y != eyeY) {
+                    yOrder.add(y);
+                }
             }
-            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 窒息脱困：挖开头位块 | dug=" + dug
-                    + " eyeBlock=" + eyeBlock
-                    + " pos=" + used.toShortString()
+            net.minecraft.core.BlockPos target = null;
+            String targetBlock = null;
+            outer:
+            for (int y : yOrder) {
+                for (int x = x0; x <= x1; x++) {
+                    for (int z = z0; z <= z1; z++) {
+                        var p = new net.minecraft.core.BlockPos(x, y, z);
+                        var st = npc.level().getBlockState(p);
+                        if (!st.isAir() && st.isSuffocating(npc.level(), p)) {
+                            target = p;
+                            targetBlock = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                    .getKey(st.getBlock()).toString();
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (target == null) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                        + " 窒息脱困：包围盒内未找到窒息块 | box=" + box
+                        + " feet=" + feet.toShortString());
+                return;
+            }
+            boolean dug = npc.mineWithBestTool(target) || npc.mine(target);
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 窒息脱困：挖开窒息块 | dug=" + dug
+                    + " block=" + targetBlock
+                    + " pos=" + target.toShortString()
                     + " feet=" + feet.toShortString());
             return;
         }

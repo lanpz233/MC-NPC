@@ -4925,6 +4925,14 @@ public final class GoalExecutor {
                         continue;
                     }
                     BlockPos pos = base.offset(dx, dy, dz);
+                    // 【fix72】自封门：与身体包围盒相交的格子永不放块。恢复点
+                    // 醒来时身体常横跨两列（z=-219.89 横跨 -220/-221），墙格
+                    // 放进包围盒眼高层会 inWall 窒息（farm30 实证：建屋自封
+                    // 13 秒致死）。缺这一两块按「部分完成」既有口径接受。
+                    if (npc.getBoundingBox().intersects(
+                            new net.minecraft.world.phys.AABB(pos))) {
+                        continue;
+                    }
                     BlockState current = npc.level().getBlockState(pos);
                     if (!current.isAir() && !current.canBeReplaced()) {
                         continue;
