@@ -403,6 +403,16 @@ public final class GoalExecutor {
                 newTarget = "base";
                 newCount = 1;
             }
+            case "place_bed" -> {
+                // 【fix56·D1 床】把包里的床安置进落脚点屋内并登记重生点。
+                newTarget = "place_bed";
+                newCount = 1;
+            }
+            case "sleep" -> {
+                // 【fix56·D1 床】夜里回床真睡到天亮（原版睡眠跳夜、防幻翼）。
+                newTarget = "sleep";
+                newCount = 1;
+            }
             case "flint" -> {
                 newTarget = "flint";
                 newCount = clamp(intent.intParam("count", 1), 1, 8);
@@ -513,6 +523,18 @@ public final class GoalExecutor {
         basePlacedCount = 0;
         baseTotalCells = 0;
         baseQueueBuilt = false;
+        // 【fix56】床状态机复位。
+        bedPhase = 0;
+        bedFootPos = null;
+        bedFacing = null;
+        bedItemPath = null;
+        bedActionStuck = 0;
+        bedLastActionKey = "";
+        sleepPhase = 0;
+        sleepStartMillis = 0L;
+        sleepDayTime0 = -1L;
+        sleepActionStuck = 0;
+        sleepLastActionKey = "";
         portalOrigin = null;
         portalPhase = 0;
         enterAttempts = 0;
@@ -540,6 +562,8 @@ public final class GoalExecutor {
             case "hunt" -> "狩猎 " + targetCount + " 只动物";
             case "farm" -> "种田 " + farmMode;
             case "base" -> "建落脚点（火柴盒小屋）";
+            case "place_bed" -> "安置床（落脚点）";
+            case "sleep" -> "回床睡觉";
             case "flint" -> "找燧石 x" + targetCount;
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
             case "portal" -> "建造并点燃下界传送门";
@@ -644,6 +668,8 @@ public final class GoalExecutor {
             case "hunt" -> tickHunt();
             case "farm" -> tickFarm();
             case "base" -> tickBase();
+            case "place_bed" -> tickPlaceBed();
+            case "sleep" -> tickSleep();
             case "flint" -> tickFlint();
             case "obsidian" -> tickObsidian();
             case "portal" -> tickPortal();
@@ -3045,6 +3071,274 @@ public final class GoalExecutor {
         baseQueue.remove(0);
         basePlacedCount++;
         return false;
+    }
+
+    // ===== 【fix56·D1】床：安置与真睡 =====
+    private int bedPhase;
+    private BlockPos bedFootPos;
+    private net.minecraft.core.Direction bedFacing;
+    private String bedItemPath;
+    private int bedActionStuck;
+    private String bedLastActionKey = "";
+    private int sleepPhase;
+    private long sleepStartMillis;
+    private long sleepDayTime0 = -1L;
+    private int sleepActionStuck;
+    private String sleepLastActionKey = "";
+
+    /** 包里第一张床的物品路径（任意颜色）；没有返回 null。 */
+    private String firstBedItemPath() {
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (!stack.isEmpty() && pathOf(stack).endsWith("_bed")) {
+                return pathOf(stack);
+            }
+        }
+        return null;
+    }
+
+    /** 床格可放：本格空/植被无流体，且脚下是实心（屋内地面）。 */
+    private boolean bedCellFree(BlockPos pos) {
+        BlockState state = npc.level().getBlockState(pos);
+        if (!state.isAir() && !isVegetation(state)) {
+            return false;
+        }
+        if (!state.getFluidState().isEmpty()) {
+            return false;
+        }
+        BlockState below = npc.level().getBlockState(pos.below());
+        return !below.isAir() && below.getFluidState().isEmpty();
+    }
+
+    /** 在床边登记重生点（RespawnConfig 直接组装：维度+床脚格）。 */
+    private boolean registerRespawnAtBed(BlockPos bedPos) {
+        try {
+            npc.setRespawnPosition(new net.minecraft.server.level.ServerPlayer.RespawnConfig(
+                    net.minecraft.world.level.storage.LevelData.RespawnData.of(
+                            npc.level().dimension(), bedPos, 0.0F, 0.0F), false), false);
+            return true;
+        } catch (Throwable throwable) {
+            LOG.warning("[AIV][GOAL] " + npc.npcName() + " [BED] 重生点登记失败: " + throwable);
+            return false;
+        }
+    }
+
+    private void tickPlaceBed() {
+        BaseMemory.bindWorld(npc.level());
+        BaseMemory.Base base = BaseMemory.base(npc.npcName());
+        if (base == null) {
+            finish("安置床放弃：无落脚点账本");
+            return;
+        }
+        if (base.bedPos() != null) {
+            finish("床已安置（账本已有记录）");
+            return;
+        }
+        switch (bedPhase) {
+            case 0 -> {
+                status = "安置床：选位";
+                bedItemPath = firstBedItemPath();
+                if (bedItemPath == null) {
+                    finish("安置床放弃：包里没床");
+                    return;
+                }
+                BlockPos anchor = base.anchor();
+                // 候选（foot 格, 床头朝向）：北墙行优先（不挡门路），南墙行兜底。
+                BlockPos[] feet = {
+                        anchor.offset(-1, 0, -1), anchor.offset(0, 0, -1),
+                        anchor.offset(-1, 0, 1), anchor.offset(0, 0, 1)};
+                net.minecraft.core.Direction[] dirs = {
+                        net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST,
+                        net.minecraft.core.Direction.EAST, net.minecraft.core.Direction.WEST};
+                for (int i = 0; i < feet.length; i++) {
+                    if (bedCellFree(feet[i]) && bedCellFree(feet[i].relative(dirs[i]))) {
+                        bedFootPos = feet[i];
+                        bedFacing = dirs[i];
+                        break;
+                    }
+                }
+                if (bedFootPos == null) {
+                    finish("安置床放弃：屋内没有空位（两格连排都被占）");
+                    return;
+                }
+                bedPhase = 1;
+            }
+            case 1 -> {
+                status = "安置床：就位";
+                if (farmInReach(bedFootPos)) {
+                    bedPhase = 2;
+                    return;
+                }
+                // 去屋内中心站位（照 base 站位口径：goto + 同 key 反复计数）。
+                String key = "bed-stand";
+                if (key.equals(bedLastActionKey)) {
+                    bedActionStuck++;
+                } else {
+                    bedLastActionKey = key;
+                    bedActionStuck = 0;
+                }
+                if (bedActionStuck > 90) {
+                    finish("安置床放弃：到不了屋内站位");
+                    return;
+                }
+                BlockPos stand = base.anchor();
+                if (npc.blockPosition().distSqr(stand) > 1.0D) {
+                    JsonObject params = new JsonObject();
+                    params.addProperty("x", stand.getX() + 0.5D);
+                    params.addProperty("z", stand.getZ() + 0.5D);
+                    skills.run(new Intent("", "goto", params), "目标");
+                }
+            }
+            case 2 -> {
+                status = "安置床：放床";
+                Block block = blockOfItem(bedItemPath);
+                if (block == null) {
+                    finish("安置床放弃：床物品无对应方块 " + bedItemPath);
+                    return;
+                }
+                if (!bedCellFree(bedFootPos) || !bedCellFree(bedFootPos.relative(bedFacing))) {
+                    finish("安置床放弃：选位被占（选位后环境变化）");
+                    return;
+                }
+                if (!consume(bedItemPath, 1)) {
+                    finish("安置床放弃：扣床失败");
+                    return;
+                }
+                npc.level().setBlockAndUpdate(bedFootPos, block.defaultBlockState()
+                        .setValue(net.minecraft.world.level.block.BedBlock.PART,
+                                net.minecraft.world.level.block.state.properties.BedPart.FOOT)
+                        .setValue(net.minecraft.world.level.block.BedBlock.FACING, bedFacing));
+                npc.level().setBlockAndUpdate(bedFootPos.relative(bedFacing), block.defaultBlockState()
+                        .setValue(net.minecraft.world.level.block.BedBlock.PART,
+                                net.minecraft.world.level.block.state.properties.BedPart.HEAD)
+                        .setValue(net.minecraft.world.level.block.BedBlock.FACING, bedFacing));
+                BaseMemory.saveBed(npc.npcName(), bedFootPos);
+                boolean respawnSet = registerRespawnAtBed(bedFootPos);
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 安置床 | foot="
+                        + bedFootPos.toShortString() + " facing=" + bedFacing
+                        + " item=" + bedItemPath + " 重生点登记=" + respawnSet);
+                finish("床已安置：" + bedItemPath + " @ " + bedFootPos.toShortString()
+                        + (respawnSet ? "，重生点已登记" : "，重生点登记失败（见日志）"));
+            }
+            default -> finish("安置床阶段异常 " + bedPhase);
+        }
+    }
+
+    /** 门洞格里若是建材块，就是门塞：拆下回收（无状态幂等，防残留）。 */
+    private void clearDoorPlugs(BlockPos anchor) {
+        for (int level = 0; level <= 1; level++) {
+            BlockPos cell = anchor.offset(0, level, BASE_HALF);
+            BlockState state = npc.level().getBlockState(cell);
+            if (state.isAir() || isVegetation(state)) {
+                continue;
+            }
+            String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+            boolean isPlug = path.equals("cobblestone") || path.equals("cobbled_deepslate")
+                    || path.equals("dirt") || path.equals("andesite") || path.equals("diorite")
+                    || path.equals("granite") || path.equals("tuff") || path.equals("stone")
+                    || path.endsWith("_planks");
+            if (!isPlug) {
+                continue;
+            }
+            npc.level().setBlockAndUpdate(cell,
+                    net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
+            give(path, 1);
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 门塞拆除 | cell="
+                    + cell.toShortString() + " item=" + path);
+        }
+    }
+
+    /** 睡前堵门洞两格（门暂无门，玩家原味：塞块、晨起拆回）。 */
+    private void plugDoor(BlockPos anchor) {
+        for (int level = 0; level <= 1; level++) {
+            BlockPos cell = anchor.offset(0, level, BASE_HALF);
+            BlockState state = npc.level().getBlockState(cell);
+            if (!state.isAir() && !isVegetation(state)) {
+                continue;
+            }
+            String material = pickBuildMaterial();
+            if (material == null) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 门塞跳过：无建材");
+                return;
+            }
+            Block block = blockOfItem(material);
+            if (block == null || !consume(material, 1)) {
+                return;
+            }
+            npc.level().setBlockAndUpdate(cell, block.defaultBlockState());
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 门塞 | cell="
+                    + cell.toShortString() + " material=" + material);
+        }
+    }
+
+    private void tickSleep() {
+        BaseMemory.bindWorld(npc.level());
+        BaseMemory.Base base = BaseMemory.base(npc.npcName());
+        if (base == null || base.bedPos() == null) {
+            finish("睡觉放弃：无床账本");
+            return;
+        }
+        BlockPos bed = base.bedPos();
+        BlockPos anchor = base.anchor();
+        switch (sleepPhase) {
+            case 0 -> {
+                status = "睡觉：回床边";
+                clearDoorPlugs(anchor);
+                if (npc.blockPosition().distSqr(anchor) <= 1.0D) {
+                    plugDoor(anchor);
+                    sleepPhase = 1;
+                    return;
+                }
+                String key = "sleep-stand";
+                if (key.equals(sleepLastActionKey)) {
+                    sleepActionStuck++;
+                } else {
+                    sleepLastActionKey = key;
+                    sleepActionStuck = 0;
+                }
+                if (sleepActionStuck > 90) {
+                    finish("睡觉放弃：到不了床边");
+                    return;
+                }
+                JsonObject params = new JsonObject();
+                params.addProperty("x", anchor.getX() + 0.5D);
+                params.addProperty("z", anchor.getZ() + 0.5D);
+                skills.run(new Intent("", "goto", params), "目标");
+            }
+            case 1 -> {
+                status = "睡觉：上床";
+                var result = npc.startSleepInBed(bed, false);
+                if (result.left().isPresent()) {
+                    clearDoorPlugs(anchor);
+                    finish("睡不成：" + result.left().get() + "（原版判定）");
+                    return;
+                }
+                sleepStartMillis = System.currentTimeMillis();
+                sleepDayTime0 = npc.level().getDayTime();
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 入睡 | bed="
+                        + bed.toShortString() + " dayTime=" + sleepDayTime0);
+                sleepPhase = 2;
+            }
+            case 2 -> {
+                status = "睡觉中";
+                if (!npc.isSleeping()) {
+                    clearDoorPlugs(anchor);
+                    long dayTime = npc.level().getDayTime();
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 睡醒 | dayTime "
+                            + sleepDayTime0 + " → " + dayTime);
+                    finish("睡醒了（dayTime " + sleepDayTime0 + " → " + dayTime + "）");
+                    return;
+                }
+                if (System.currentTimeMillis() - sleepStartMillis > 20_000L) {
+                    npc.stopSleepInBed(false, true);
+                    clearDoorPlugs(anchor);
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " [BED] 睡眠超时 20 秒未跳夜，强制起床（跳夜未生效，如实记账）");
+                    finish("睡觉超时：跳夜未生效，强制起床");
+                }
+            }
+            default -> finish("睡觉阶段异常 " + sleepPhase);
+        }
     }
 
     /**

@@ -31,8 +31,9 @@ private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 private static Path folder;
 private static String boundWorldKey = "";
 
-/** 一座落脚点：anchor=屋内中心地板格（脚踩的那格），builtAt=建成时刻。 */
-public record Base(String world, BlockPos anchor, long builtAt) {
+/** 一座落脚点：anchor=屋内中心地板格（脚踩的那格），builtAt=建成时刻，
+ * bedPos=床脚格（fix56·D1，安置后才有，未安置为 null）。 */
+public record Base(String world, BlockPos anchor, long builtAt, BlockPos bedPos) {
 }
 
 /** 落盘 DTO（BlockPos 不直接交给 Gson）。 */
@@ -42,6 +43,11 @@ int anchorX;
 int anchorY;
 int anchorZ;
 long builtAt;
+/** 床脚格（fix56）：hasBed=false 时三个坐标无意义。 */
+boolean hasBed;
+int bedX;
+int bedY;
+int bedZ;
 }
 
 private BaseMemory() {
@@ -86,7 +92,8 @@ if (data == null ||!worldKey().equals(data.world)) {
 return null;
 }
 return new Base(data.world,
-new BlockPos(data.anchorX, data.anchorY, data.anchorZ), data.builtAt);
+new BlockPos(data.anchorX, data.anchorY, data.anchorZ), data.builtAt,
+data.hasBed ? new BlockPos(data.bedX, data.bedY, data.bedZ) : null);
 } catch (Exception exception) {
 LOG.warning("[AIV][BASE] 落脚点账本读取失败 " + npcName + ": " + exception.getMessage());
 return null;
@@ -97,17 +104,54 @@ public static boolean hasBase(String npcName) {
 return base(npcName)!= null;
 }
 
-/** 建成落盘。 */
+/** 建成落盘。已安置过床时保留床字段（防重存把床账冲掉）。 */
 public static void save(String npcName, BlockPos anchor) {
 if (folder == null) {
 return;
 }
-BaseData data = new BaseData();
+BaseData data = readData(npcName);
+if (data == null ||!worldKey().equals(data.world)) {
+data = new BaseData();
+}
 data.world = worldKey();
 data.anchorX = anchor.getX();
 data.anchorY = anchor.getY();
 data.anchorZ = anchor.getZ();
 data.builtAt = System.currentTimeMillis();
+writeData(npcName, data);
+}
+
+/** 安置床后落盘（fix56）：只更新床字段，锚点/世界沿用现有记录。 */
+public static void saveBed(String npcName, BlockPos bedFoot) {
+if (folder == null) {
+return;
+}
+BaseData data = readData(npcName);
+if (data == null ||!worldKey().equals(data.world)) {
+LOG.warning("[AIV][BASE] 安置床落盘失败：无本世界落脚点记录 " + npcName);
+return;
+}
+data.hasBed = true;
+data.bedX = bedFoot.getX();
+data.bedY = bedFoot.getY();
+data.bedZ = bedFoot.getZ();
+writeData(npcName, data);
+}
+
+private static BaseData readData(String npcName) {
+Path file = fileFor(npcName);
+if (!Files.isRegularFile(file)) {
+return null;
+}
+try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+return GSON.fromJson(reader, BaseData.class);
+} catch (Exception exception) {
+LOG.warning("[AIV][BASE] 落脚点账本读取失败 " + npcName + ": " + exception.getMessage());
+return null;
+}
+}
+
+private static void writeData(String npcName, BaseData data) {
 try (Writer writer = Files.newBufferedWriter(fileFor(npcName), StandardCharsets.UTF_8)) {
 GSON.toJson(data, writer);
 } catch (IOException exception) {

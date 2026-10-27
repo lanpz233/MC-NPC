@@ -137,6 +137,10 @@ public final class ProgressionPlanner {
      * 注定连败，不能让它反复抢主线；退避到期再试。 */
     private int baseFailStreak;
     private long baseBackoffUntil;
+    /** 【fix56】安置床专属连败与退避（与建屋同口径）：屋内没空位等环境问题
+     * 注定连败时不能让床务反复抢主线；退避到期再试。 */
+    private int bedFailStreak;
+    private long bedBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -345,6 +349,16 @@ public final class ProgressionPlanner {
                 } else {
                     baseFailStreak = 0;
                     baseBackoffUntil = 0L;
+                }
+            } else if ("安置床".equals(lastStage)) {
+                if (goalFailed) {
+                    bedFailStreak++;
+                    bedBackoffUntil = now + Math.min(300_000L, 60_000L * bedFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 安置床退避 | 连败=" + bedFailStreak
+                            + " 退避秒=" + (bedBackoffUntil - now) / 1000L);
+                } else {
+                    bedFailStreak = 0;
+                    bedBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -716,6 +730,20 @@ public final class ProgressionPlanner {
             return goal("补圆石做熔炉", "dig", params("resource", "stone", "count", 8));
         }
 
+        // 5.55) 【fix56·D1】有床就回床真睡：跳夜 + 防幻翼，强于下面的搭棚
+        // 蹲守。只在床已落盘、距床 ≤32 格（夜里赶远路反而送死，照旧走小屋
+        // 步/生存层）、血量在安全线以上时派；睡不睡得成（床边有怪/床被占）
+        // 由 startSleepInBed 的原版判定兜底，失败当晚照旧蹲守。
+        if (planHas(StagePlan.BASE) && isNight() && npc.getHealth() > 7.0D) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base baseForSleep =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (baseForSleep != null && baseForSleep.bedPos() != null
+                    && npc.blockPosition().distSqr(baseForSleep.bedPos()) <= 32.0D * 32.0D) {
+                return goal("回床睡觉", "sleep", params());
+            }
+        }
+
         // 5.6) 【fix39·夜晚总闸】夜里先搭棚再谈补给（审计第 3 环：长跑#12
         // 两死皆夜间地表补给——小屋原排第 14 步、主线没走完轮不到，夜里照样
         // 被派去地表打猎砍树）。与步 14 同条件、排位提前到木料/口粮补给步
@@ -844,6 +872,27 @@ public final class ProgressionPlanner {
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 建屋触发 | 建材=" + buildable
                             + " hasFarm=" + hasFarm + " ingots=" + ingots);
                     return goal("建落脚点", "base", params());
+                }
+            }
+        }
+
+        // 6.76) 床（fix56·D1）：落脚点建成后把床备齐——先有床才能谈真睡
+        // 与重生点。包里有床先安置；没床时同色羊毛 ≥3 才合床（原版各色床
+        // 独立配方、必须同色）。白天进行（夜里优先 5.55 睡觉/5.6 小屋）。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
+                && System.currentTimeMillis() >= bedBackoffUntil) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base baseForBed =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (baseForBed != null && baseForBed.bedPos() == null) {
+                if (countSuffix("_bed") > 0) {
+                    return goal("安置床", "place_bed", params());
+                }
+                String woolColor = woolColorWithThree();
+                if (woolColor != null) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 做床触发 | 同色羊毛="
+                            + woolColor + "_wool x" + countItem(woolColor + "_wool"));
+                    return goal("制作床", "craft", params("item", woolColor + "_bed", "count", 1));
                 }
             }
         }
@@ -1584,6 +1633,27 @@ public final class ProgressionPlanner {
             }
         }
         return total;
+    }
+
+    /** 同色羊毛 ≥3 的颜色前缀（fix56：原版床配方要 3 张同色羊毛）；没有返回 null。 */
+    private String woolColorWithThree() {
+        java.util.Map<String, Integer> byPath = new java.util.HashMap<>();
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = itemPath(stack);
+            if (path.endsWith("_wool")) {
+                byPath.merge(path, stack.getCount(), Integer::sum);
+            }
+        }
+        for (java.util.Map.Entry<String, Integer> entry : byPath.entrySet()) {
+            if (entry.getValue() >= 3) {
+                return entry.getKey().substring(0, entry.getKey().length() - "_wool".length());
+            }
+        }
+        return null;
     }
 
     private boolean hasAny(String... paths) {
