@@ -195,6 +195,8 @@ public final class GoalExecutor {
     private int farmSiteAttempts;
     /** 同一动作连续走不到位的次数：超限丢弃该动作，防一块田卡死整个目标。 */
     private int farmActionStuck;
+    /** 【fix60】本目标内被跳过的动作数：tend 全军覆没要如实报失败，不许冒充完成。 */
+    private int farmSkipped;
     private String farmLastActionKey = "";
     /** 本访已收获的土格（拾取阶段要挨个走过田面收掉落物）。 */
     private final java.util.List<BlockPos> farmHarvestedSoils = new java.util.ArrayList<>();
@@ -504,6 +506,7 @@ public final class GoalExecutor {
         farmSiteCells = null;
         farmSiteAttempts = 0;
         farmActionStuck = 0;
+        farmSkipped = 0;
         farmLastActionKey = "";
         farmHarvestedSoils.clear();
         farmPickupIndex = 0;
@@ -2452,6 +2455,21 @@ public final class GoalExecutor {
                         farm.establishedAt(), cells));
                 FarmMemory.Scan scan = FarmMemory.scan(npc.level(), npc.npcName());
                 InventorySnapshot.log(npc, "farm", "tend", true);
+                int harvestDelta = (countItem("wheat") - farmBaseWheat)
+                        + (countItem("carrot") - farmBaseCarrot)
+                        + (countItem("potato") - farmBasePotato);
+                // 【fix60】有动作被跳过且一点没收着 = 这趟白跑：如实报失败让规划退避，
+                // 不许再用「完成」把 90 秒连派空转洗成正常（boot-farm17 实锤）。
+                if (harvestDelta <= 0 && farmSkipped > 0) {
+                    finish("农田维护失败：动作走不到位跳过=" + farmSkipped
+                            + " | 收获Δ 小麦=" + (countItem("wheat") - farmBaseWheat)
+                            + " 种子=" + (countItem("wheat_seeds") - farmBaseSeeds)
+                            + " 胡萝卜=" + (countItem("carrot") - farmBaseCarrot)
+                            + " 土豆=" + (countItem("potato") - farmBasePotato)
+                            + " | 在田=" + scan.plantedTotal() + "（熟" + scan.mature()
+                            + "/长" + scan.growing() + "） 播种存量=" + plantStockTotal());
+                    return;
+                }
                 finish("农田维护完成 | 收获Δ 小麦=" + (countItem("wheat") - farmBaseWheat)
                         + " 种子=" + (countItem("wheat_seeds") - farmBaseSeeds)
                         + " 胡萝卜=" + (countItem("carrot") - farmBaseCarrot)
@@ -2607,6 +2625,7 @@ public final class GoalExecutor {
                 if (key.equals(farmLastActionKey) && ++farmActionStuck > 6) {
                     LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 动作跳过（反复走不到位） | "
                             + key);
+                    farmSkipped++;
                     farmActions.remove(0);
                     farmActionStuck = 0;
                     farmLastActionKey = "";
@@ -2686,6 +2705,21 @@ public final class GoalExecutor {
             }
         }
         BlockPos target = best != null ? best : soil;
+        // 【fix60】纯 A* goto 在贴水田边会只展开几个节点就无路（PathFinder 第六轮
+        // 注释同款）：同一动作 goto 连败 ≥2 次后改派 travel（能挖/搭/爬的接近手段，
+        // 回访线同款参数），别在原地把 7 格熟麦全跳过（boot-farm17 实锤 Δ=0）。
+        if (farmActionStuck >= 2) {
+            JsonObject tv = new JsonObject();
+            tv.addProperty("x", target.getX() + 0.5D);
+            tv.addProperty("y", (double) target.getY());
+            tv.addProperty("z", target.getZ() + 0.5D);
+            tv.addProperty("tolerance", 4.0D);
+            if (skills.run(new Intent("", "travel", tv), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] goto 连败改 travel 接近 | "
+                        + target.toShortString());
+                return;
+            }
+        }
         JsonObject go = new JsonObject();
         go.addProperty("x", target.getX() + 0.5D);
         go.addProperty("z", target.getZ() + 0.5D);

@@ -340,6 +340,18 @@ public final class ProgressionPlanner {
                     farmFailStreak = 0;
                     farmBackoffUntil = 0L;
                 }
+            } else if ("农田维护".equals(lastStage)) {
+                // 【fix60】与开田共用 farm 退避字段：tend 空转（动作全跳过）也要退避，
+                // 不许 90 秒连派三次（boot-farm17 实锤）。
+                if (goalFailed) {
+                    farmFailStreak++;
+                    farmBackoffUntil = now + Math.min(300_000L, 60_000L * farmFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 农田维护退避 | 连败=" + farmFailStreak
+                            + " 退避秒=" + (farmBackoffUntil - now) / 1000L);
+                } else {
+                    farmFailStreak = 0;
+                    farmBackoffUntil = 0L;
+                }
             } else if ("建落脚点".equals(lastStage)) {
                 if (goalFailed) {
                     baseFailStreak++;
@@ -828,8 +840,9 @@ public final class ProgressionPlanner {
                             || countItem("carrot") > 0 || countItem("potato") > 0;
                     boolean bonemealCase = scan.growing() > 0 && countItem("bone_meal") > 0
                             && foodNutrition() < MINING_FOOD_NUTRITION;
-                    if (scan.mature() > 0 || (canPlant && (scan.emptyFarmland() > 0
-                            || scan.lost() > 0)) || bonemealCase) {
+                    if ((scan.mature() > 0 || (canPlant && (scan.emptyFarmland() > 0
+                            || scan.lost() > 0)) || bonemealCase)
+                            && System.currentTimeMillis() >= farmBackoffUntil) {
                         LOG.info("[AIV][PLAN] " + npc.npcName() + " 农田维护触发 | 熟=" + scan.mature()
                                 + " 空=" + scan.emptyFarmland() + " 坏=" + scan.lost()
                                 + " 长=" + scan.growing());
