@@ -1400,6 +1400,15 @@ public final class SkillRunner {
     private BlockPos lastBridgePos;
     private long lastBridgeTick = Long.MIN_VALUE;
 
+    /** 【fix61】自放方块登记表（pos→放置 tick）：生存层实心自救靠它豁免刚放下的台阶/桥块。 */
+    private static final java.util.Map<BlockPos, Long> SELF_PLACED = new java.util.HashMap<>();
+
+    /** 【fix61】该格是否在 windowTicks 内由本插件放块（搭桥/台阶/垫柱统一口 placeBuildingBlockAt）。 */
+    public static boolean wasSelfPlacedRecently(BlockPos pos, long nowTick, long windowTicks) {
+        Long placed = SELF_PLACED.get(pos);
+        return placed != null && nowTick - placed < windowTicks;
+    }
+
     /** 放一块垫脚方块（优先圆石/下界岩这类廉价方块）。 */
     private boolean placeBuildingBlockAt(BlockPos pos) {
         // 【fix57】落地时禁止往身体脚格/头格放块：ascend 台阶与 travel 搭桥曾在同一格
@@ -1430,6 +1439,9 @@ public final class SkillRunner {
         npc.level().setBlockAndUpdate(pos, block.defaultBlockState());
         lastBridgePos = pos;
         lastBridgeTick = nowTick;
+        // 【fix61】登记自放块供生存层豁免（40 tick 窗口在生存层侧）；顺手清 400 tick 前的旧登记防表膨胀。
+        SELF_PLACED.put(pos, nowTick);
+        SELF_PLACED.values().removeIf(t -> nowTick - t > 400L);
         LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 搭桥 | block=" + path
                 + " pos=" + pos.toShortString());
         return true;

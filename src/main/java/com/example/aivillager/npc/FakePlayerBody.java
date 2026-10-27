@@ -273,8 +273,12 @@ public final class FakePlayerBody extends ServerPlayer {
 
         if (this.jumpCooldown > 0) {
             this.jumpCooldown--;
-        } else if (this.onGround && this.horizontalCollision) {
+        } else if (this.onGround && (this.horizontalCollision
+                || (this.walkTarget.y - this.getY() > 0.5D && distanceSq < 4.0D))) {
             // 撞到一格高的障碍就起跳，模拟玩家自动跳跃。
+            // 【fix61】补路径模式早有的主动起跳：目标就在高一格处且已贴近时不等撞墙先跳——
+            // ascend/travel 搭桥后靠直线行走上台阶，纯被动撞墙跳时机太晚，身体贴着台阶块
+            // 磨蹭期间脚部格=台阶块本身，会被生存层实心自救当成"卡在方块里"挖掉（farm18 同格同秒实锤）。
             this.jumpFromGround();
             this.jumpCooldown = 5;
         }

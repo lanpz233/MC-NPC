@@ -473,12 +473,28 @@ public final class SurvivalController {
         // 脚部实在挖不开（基岩级硬度）就试头顶格。挖开后身体自然落回/走出空格。
         // 代价：若困住他的是 ascend 刚垫的台阶石，挖掉会毁一级台阶——但玩家被方块
         // 卡住时也会挖开它，诚实脱困优先于保台阶，ascend 之后会自己重新垫。
-        boolean dug = npc.mineWithBestTool(feet) || npc.mine(feet);
+        // 【fix61】例外收窄：只看脚部格形状分不清"真嵌入"与"正跳上台阶"——起跳后约 9 tick 内
+        // 身体仍与台阶块纵向交叠、脚部格就是台阶块本身，旧逻辑把刚放的台阶当场挖掉
+        // （farm18 行 1902/1908 同格同秒实锤，此挖 93~98 次/局）。40 tick 内自放的块不挖：
+        // 跳台阶约 1 秒完成，真卡住超 2 秒豁免过期照旧挖，诚实脱困不废；
+        // 沙砾等自然块不在自放登记内，不受影响。
+        long nowTick = npc.level().getGameTime();
+        boolean feetExempt = SkillRunner.wasSelfPlacedRecently(feet, nowTick, 40L);
+        boolean dug = false;
         net.minecraft.core.BlockPos used = feet;
+        if (!feetExempt) {
+            dug = npc.mineWithBestTool(feet) || npc.mine(feet);
+        }
         if (!dug) {
             net.minecraft.core.BlockPos head = feet.above();
-            dug = npc.mineWithBestTool(head) || npc.mine(head);
-            used = head;
+            if (!SkillRunner.wasSelfPlacedRecently(head, nowTick, 40L)) {
+                dug = npc.mineWithBestTool(head) || npc.mine(head);
+                used = head;
+            }
+        }
+        if (!dug && feetExempt) {
+            // 脚下是刚放的台阶/桥块且头顶无可挖：多半正在跳上台阶，静默放行等身体落位。
+            return;
         }
         if (dug) {
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 卡在方块里，挖开脱困 | block="
