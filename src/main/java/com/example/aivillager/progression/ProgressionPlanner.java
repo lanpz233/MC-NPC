@@ -1308,6 +1308,19 @@ public final class ProgressionPlanner {
             return goal("制作火把", "craft", params("item", "torch", "count", 8));
         }
 
+        // 13.07) 【fix76·D6】盾：规格=材料富余且已有武器才做（盾是武器的搭档，
+        // 空手举盾没意义）。铁锭 ≥6 时做一块（耗 1 锭+6 木板，不动工具/护甲的
+        // 需求冶炼优先级）；副手装备与格挡在生存层（equipShieldOffhand/defend）。
+        // hasAny 按 41 格全扫（含副手），盾在副手也算"有"，不会重复合成。
+        if (!hasAny("shield")
+                && hasAny("wooden_sword", "stone_sword", "iron_sword", "golden_sword",
+                        "diamond_sword", "netherite_sword")
+                && ingots >= 6) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 盾常备触发 | 铁锭=" + ingots
+                    + "（有武器、材料富余，做盾）");
+            return goal("制作盾牌", "craft", params("item", "shield", "count", 1));
+        }
+
         // 13.1) 钻石甲（第三轮新增，StagePlan.DIAMOND_ARMOR）：镐和剑都有了之后，
         // 继续挖钻石凑齐四件甲（头盔 5 + 胸甲 8 + 护腿 7 + 靴子 4 = 24 颗），再走下界线。
         // 原版路线里钻石只预算了镐(3)+剑(2)，长跑验收因此判定"钻石套不可能"——这里补齐。

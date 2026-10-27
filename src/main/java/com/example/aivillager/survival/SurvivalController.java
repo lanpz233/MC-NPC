@@ -266,6 +266,7 @@ public final class SurvivalController {
         if (++armorCheckTimer >= ARMOR_CHECK_INTERVAL) {
             armorCheckTimer = 0;
             equipBetterArmor();
+            equipShieldOffhand();
             ensureBestWeaponInHand();
             // 换完武器再算评分，生存层要用它判断"现在打得过还是该跑"。
             cachedWeaponScore = weaponScore(npc.getMainHandItem());
@@ -280,6 +281,12 @@ public final class SurvivalController {
             // 但饿到 0 会持续掉血，所以在没有 5 格内贴身威胁的间隙补一口。
             eat(true);
             return;
+        }
+
+        // 【fix76】威胁解除就放下盾：别举着盾过日子（走路、干活都碍事）。
+        if (usingShield()) {
+            npc.stopUsingItem();
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 放下盾（威胁解除）");
         }
 
         eat(false);
@@ -1070,13 +1077,17 @@ public final class SurvivalController {
             skills.stop();
         }
 
-        if (npc.isUsingItem()) {
+        // 【fix76】举着盾时不停：格挡由 defend 的举盾/放盾逻辑专门管理；
+        // 吃食等其他使用态照旧停（要腾出手来攻击）。
+        if (npc.isUsingItem() && !usingShield()) {
             npc.stopUsingItem();
         }
 
         if (distanceSq > ATTACK_RANGE_SQ) {
             // 惜命逃跑没跑掉时只许贴脸还手，绝不追击（追击=恋战，低血必死）。
             if (desperateDefense) {
+                // 【fix76】原地自卫：举盾等威胁贴脸，先挡一下再还手。
+                raiseShield(threat);
                 return true;
             }
             // 超出攻击距离：走 A* 接近，正在走就不要每 0.5 秒重建路径。
@@ -1100,11 +1111,22 @@ public final class SurvivalController {
                     chasing = false;
                 }
             }
+            // 【fix76】追击远程威胁（骷髅/掠夺者）时举盾顶箭接近；近战威胁不举
+            // （没箭可挡），等进了攻击距离走冷却间隙的格挡节奏。
+            if (isRangedThreat(threat)) {
+                raiseShield(threat);
+            }
             return true;
         }
 
         if (npc.tickCount < nextAttackTick) {
+            // 【fix76】武器冷却间隙举盾（原版盾斗节奏：挡一下、再砍一刀）。
+            raiseShield(threat);
             return true;
+        }
+        // 出手前放下盾，别让举盾状态吞掉这一击的节奏。
+        if (usingShield()) {
+            npc.stopUsingItem();
         }
         // 进入攻击距离后先把最好的武器换到主手：空手 0.94 点伤害打不死怪，自己会先死。
         ensureBestWeaponInHand();
@@ -1537,6 +1559,60 @@ public final class SurvivalController {
     // ---------------------------------------------------------------- AutoArmor
 
     /** 从背包里挑防御值更高的护甲换上，旧护甲放回原格。 */
+    /**
+     * 【fix76·D6】盾的副手装备：副手空着、包里有盾、且有剑类武器在包（D6 口径：
+     * 有武器才配盾）→ 把盾挪到副手。挂在装备检查周期里（与 equipBetterArmor 并列），
+     * 做盾的规划步只管合成，装备在这里统一收尾——和护甲的 AutoArmor 同一个分工。
+     */
+    private void equipShieldOffhand() {
+        if (!npc.getOffhandItem().isEmpty()) {
+            return;
+        }
+        Inventory inventory = npc.getInventory();
+        int shieldSlot = -1;
+        boolean hasSword = false;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            if (stack.is(Items.SHIELD)) {
+                shieldSlot = slot;
+            } else if (net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getKey(stack.getItem()).getPath().endsWith("_sword")) {
+                hasSword = true;
+            }
+        }
+        if (shieldSlot < 0 || !hasSword) {
+            return;
+        }
+        ItemStack shield = inventory.getItem(shieldSlot);
+        ItemStack old = npc.getItemBySlot(EquipmentSlot.OFFHAND);
+        npc.setItemSlot(EquipmentSlot.OFFHAND, shield);
+        inventory.setItem(shieldSlot, old);
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 装备盾牌（副手）| D6 盾就位");
+    }
+
+    /** 【fix76】当前举着的是盾（而不是在吃东西/喝药）。 */
+    private boolean usingShield() {
+        return npc.isUsingItem() && npc.getUseItem().is(Items.SHIELD);
+    }
+
+    /**
+     * 【fix76·D6】举盾格挡：副手有盾且手空着时举起。放下由三处负责——
+     * 出手攻击前（defend 近战段）、逃跑分支既有的 stopUsingItem、
+     * 威胁解除时（tick）。举盾中不重复调（startUsingItem 会重置举盾计时，
+     * 原版盾有 5 tick 抬起延迟，反复重举等于永远挡不住）。
+     */
+    private void raiseShield(LivingEntity threat) {
+        if (!npc.getOffhandItem().is(Items.SHIELD) || npc.isUsingItem()) {
+            return;
+        }
+        npc.startUsingItem(InteractionHand.OFF_HAND);
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 举盾格挡 | threat=" + threat.getType()
+                + " hp=" + npc.getHealth());
+    }
+
     private void equipBetterArmor() {
         Inventory inventory = npc.getInventory();
         for (int slot = 0; slot < 36; slot++) {
