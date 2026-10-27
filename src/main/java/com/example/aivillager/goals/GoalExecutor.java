@@ -2212,6 +2212,12 @@ public final class GoalExecutor {
             case 1 -> {
                 // 攒种子：打草 1/8 掉小麦种子（Wiki），攒够一田（8）再开田；
                 // 草就长在地表，mine 技能半径内有草就打、没有就扩围换位。
+                // 【fix52】放弃口径修正：旧版 attempts 把"附近没草"的轮次累计
+                // 6 次就放弃——可种子期望要打 32~64 株草、草是一片片长的，
+                // 每换一片草地就白扣一次，实证 72 株草/2 种子时被误杀放弃。
+                // 改：技能成功启动（=附近有草）即清零 attempts；只有连续 12 个
+                // "没草"轮次（期间扩围换位 12 次仍无草）才判这片地真没草。
+                // 半径 8→24：与选址半径同量级，少走冤枉路。
                 status = "种田：打草攒种子 " + plantStockTotal() + "/" + FARM_PLOT_CELLS;
                 if (plantStockTotal() >= FARM_PLOT_CELLS) {
                     farmPhase = 2;
@@ -2222,18 +2228,20 @@ public final class GoalExecutor {
                 }
                 JsonObject grass = new JsonObject();
                 grass.addProperty("block", "short_grass");
-                grass.addProperty("radius", GATHER_RADIUS);
+                grass.addProperty("radius", 24);
                 if (skills.run(new Intent("", "mine", grass), "目标")) {
+                    attempts = 0;
                     return;
                 }
                 JsonObject tall = new JsonObject();
                 tall.addProperty("block", "tall_grass");
-                tall.addProperty("radius", GATHER_RADIUS);
+                tall.addProperty("radius", 24);
                 if (skills.run(new Intent("", "mine", tall), "目标")) {
+                    attempts = 0;
                     return;
                 }
                 attempts++;
-                if (attempts >= MAX_GATHER_FAILS) {
+                if (attempts >= 12) {
                     if (plantStockTotal() >= 4) {
                         LOG.info("[AIV][GOAL] " + npc.npcName()
                                 + " [FARM] 种子只攒到 " + plantStockTotal() + "，开小块田");
