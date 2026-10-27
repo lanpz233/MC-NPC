@@ -459,6 +459,15 @@ public final class SurvivalController {
         fluidStuckChecks = 0;
         fluidEscapeDir = null;
         // === 实心方块自救：挖开脱困 ===
+        // 【fix66】耕地/小径豁免：farmland 与 dirt_path 的碰撞盒高 15/16≈0.9375，
+        // 人立于其上时脚部格就是它们本身（身体底面 y=62.94 → 脚格=62），会被下面
+        // ≥0.9 的"整格实心"判定误杀——farm22 收获时段连挖 3 格耕地实证
+        // （15:58:29–37），田里普查长期"坏=1"同源。站在这种块上是正常站位、
+        // 能自行走出，绝不挖。
+        if (state.is(net.minecraft.world.level.block.Blocks.FARMLAND)
+                || state.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)) {
+            return;
+        }
         // 草、花、火把、告示牌这类方块不是空气，但碰撞盒是空的：站在上面是正常站位。
         // 注意 VoxelShape.bounds() 对空形状会直接抛异常（实测站在草丛里每 0.5 秒抛一次），
         // 必须先判 isEmpty() 再取 bounds()。

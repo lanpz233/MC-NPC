@@ -5442,6 +5442,12 @@ public final class GoalExecutor {
                 // 【fix54】种田物资兜底保护：小麦种子（田的命根子）、骨粉
                 // （催熟料，堆小、最容易被"最小堆兜底"误杀）。
                 || path.equals("wheat_seeds") || path.equals("bone_meal")
+                // 【fix66】主粮与床料兜底保护：wheat 在原版没有 FOOD 组件
+                // （不能直接吃）、不在名单就会被兜底当最小堆扔掉（farm22
+                // 收获后 wheat×3 被扔实证）——它是面包原料、种田产出的主粮；
+                // 羊毛是 D1 床料（同色 3 张靠猎羊零散攒），farm24 实证拾到
+                // 即被兜底扔掉（x1/x2 两笔），不护住床链永远攒不齐。
+                || path.equals("wheat") || path.endsWith("_wool")
                 // 木料类是整条科技树的根基（木棍→工具/箭、木板→工作台/木棍），
                 // 兜底清理时把它当关键材料保住，否则"背包满"会先把木棍丢掉。
                 || path.equals("stick") || path.equals("bamboo") || path.equals("bamboo_block")
