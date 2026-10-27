@@ -90,6 +90,45 @@ public final class FakePlayerBody extends ServerPlayer {
     /** 工具使用取证日志（第十八轮）：上次记录的工具名 + 抽样计数。 */
     private String lastToolLogName = "";
     private int toolLogCounter;
+    /** fix44 守卫拒挖日志节流：技能收场前会反复试挖，10 秒最多打一行。 */
+    private long lastTierGuardLogTick = -100000L;
+    /** 【第四十五轮】逃生后岩浆位置记忆：生存层接触岩浆时写入的最后一格 + tick。 */
+    private BlockPos recentLavaCell;
+    private long recentLavaTick = -100000L;
+    private long lastLavaGuardLogTick = -100000L;
+
+    /** 生存层在岩浆里/脱困时调用：记住这口池的位置，防逃生后立刻又被带回去。 */
+    public void rememberLava(BlockPos cell) {
+        this.recentLavaCell = cell;
+        this.recentLavaTick = this.tickCount;
+    }
+
+    /**
+     * 移动目标是否正朝记忆中的岩浆格收敛（接触后 90 秒内）：目标点离岩浆 ≤3 格
+     * 且比我当前更近——是"又往池里走"；目标在远离岩浆（上岸后离开池边）不拦。
+     */
+    private boolean headingIntoRecentLava(double tx, double tz) {
+        if (recentLavaCell == null || this.tickCount - recentLavaTick > 1800) {
+            return false;
+        }
+        double lx = recentLavaCell.getX() + 0.5D;
+        double lz = recentLavaCell.getZ() + 0.5D;
+        double targetDist = Math.hypot(tx - lx, tz - lz);
+        if (targetDist > 3.0D) {
+            return false;
+        }
+        double myDist = Math.hypot(this.getX() - lx, this.getZ() - lz);
+        return targetDist < myDist;
+    }
+
+    private void logLavaGuard(String mode, double tx, double tz) {
+        if (this.tickCount - lastLavaGuardLogTick >= 100) {
+            lastLavaGuardLogTick = this.tickCount;
+            log(npcName, "lava-memory-guard", "逃生后岩浆记忆拦截（" + mode + "）| lava="
+                    + recentLavaCell.toShortString() + " target="
+                    + String.format(Locale.ROOT, "%.1f,%.1f", tx, tz) + " " + this.describe());
+        }
+    }
     private double lastDistanceSq = Double.MAX_VALUE;
     private int noProgressTicks;
     /** 连续卡住自救次数：只有路径真正走完、或离开上次卡住的区域，才清零。 */
@@ -212,6 +251,16 @@ public final class FakePlayerBody extends ServerPlayer {
             if (callback != null) {
                 callback.run();
             }
+            return;
+        }
+
+        // 【第四十五轮】逃生后岩浆记忆：直线行走不经 A*，同样的收敛拦截——
+        // 取消本次行走，交上层按新位置重新决策（口径同 walk-stuck 的放弃）。
+        if (headingIntoRecentLava(this.walkTarget.x, this.walkTarget.z)) {
+            logLavaGuard("walk", this.walkTarget.x, this.walkTarget.z);
+            this.walkTarget = null;
+            this.walkCallback = null;
+            this.setSprinting(false);
             return;
         }
 
@@ -403,6 +452,14 @@ public final class FakePlayerBody extends ServerPlayer {
         double dx = tx - this.getX();
         double dz = tz - this.getZ();
         distanceSq = dx * dx + dz * dz;
+
+        // 【第四十五轮】逃生后岩浆记忆：这条路径的当前航点正朝刚逃出的池收敛，
+        // 取消路径交技能层重规划（A* 已会绕开贴岩浆格），别再同点复入。
+        if (headingIntoRecentLava(tx, tz)) {
+            logLavaGuard("path", tx, tz);
+            finishPath(false);
+            return;
+        }
 
         // 面朝目标；MC 的 yaw 0 指向 +Z，需要减 90 度。
         float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0D);
@@ -864,6 +921,34 @@ public final class FakePlayerBody extends ServerPlayer {
                     + state.getBlock() + "（不烧高级镐） " + pos.toShortString());
             return mineBareHand(pos);
         }
+        // 【第四十四轮】技能中段分级守卫（雨林/沙漠两局定量成案）：上面的结构规则
+        // 只防"有石镐时不用铁镐"；石镐在长掘进中途退役后，默认路径
+        // （allowLastResort=true，descend/strip/mine 都走它）落回评分，唯一合法
+        // 候选就是铁镐——技能不中断、规划层补镐保障步只在目标边界 decide 时
+        // 才跑，够不着技能中段，铁镐就这样一格格烧穿（雨林 250→34、抽样 45 条
+        // 里 7 条铁镐挖石档块≈16%；沙漠 250→141 同型）。守卫：方块石镐能采、
+        // 包里又没有可用石镐/木镐（评分必然顺位选到铁镐以上）时不许顺位烧——
+        // 圆石 ≥3（够做一把石镐）直接返回 false 让技能收场，规划层保障步下一
+        // 秒就补造石镐再续挖；圆石 <3 只放行当块（落回下面评分挖这一块补圆石，
+        // 玩家也会先花 1 点高级镐耐久凑出做石镐的圆石），防"没圆石→做不了石镐
+        // →又不许挖石"的死角。需高级镐的方块（钻石/金等，石镐探针为假）不受
+        // 影响、照常评分。每次触发都打 mine-tier-guard 流水可审计。
+        if (stoneSlot < 0 && allowLastResort
+                && new ItemStack(Items.STONE_PICKAXE).isCorrectToolForDrops(state)
+                && !hasUsableCheapPick(inventory, state)) {
+            int cobble = countInventoryItem(inventory, Items.COBBLESTONE);
+            if (cobble >= 3) {
+                if (this.tickCount - lastTierGuardLogTick >= 200) {
+                    lastTierGuardLogTick = this.tickCount;
+                    log(npcName, "mine-tier-guard", "无可用石镐/木镐，拒绝用高级镐挖 "
+                            + state.getBlock() + "（圆石 " + cobble + "≥3，交规划层补造石镐） "
+                            + pos.toShortString());
+                }
+                return false;
+            }
+            log(npcName, "mine-tier-guard", "无可用石镐/木镐且圆石 " + cobble
+                    + "<3，准用高级镐挖当块补圆石（做石镐用） " + pos.toShortString());
+        }
         int bestSlot = stoneSlot;
         int bestScore = stoneSlot >= 0 ? Integer.MAX_VALUE : -1;
         // 第一遍：优先选耐久充足的（留最后 1 点不用，避免工具瞬间碎掉后无可用工具）。
@@ -930,6 +1015,37 @@ public final class FakePlayerBody extends ServerPlayer {
         // 挖完把选中格还原，理由同上面空手挖的分支：否则生存层每次检查都会切回武器。
         inventory.setSelectedSlot(selected);
         return mined;
+    }
+
+    /** 是否有可用的低档镐（木/金镐，未退役且能采当前方块）——fix44 守卫判定用。 */
+    private static boolean hasUsableCheapPick(Inventory inventory, BlockState state) {
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()
+                    || (!stack.is(Items.WOODEN_PICKAXE) && !stack.is(Items.GOLDEN_PICKAXE))) {
+                continue;
+            }
+            if (stack.getDamageValue() >= stack.getMaxDamage() - 1) {
+                continue; // 退役规则同全插件：留最后 1 点不用
+            }
+            if (stack.isCorrectToolForDrops(state)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 背包 36 格内某物品总数——fix44 守卫数圆石用。 */
+    private static int countInventoryItem(Inventory inventory,
+                                          net.minecraft.world.item.Item item) {
+        int total = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && stack.is(item)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
     }
 
     /**

@@ -125,6 +125,10 @@ public final class GoalExecutor {
     private double gatherSearchAngle = -1;
     private int gatherSearchTier = 0;
     private BlockPos gatherSearchAnchor;
+    /** 【第四十六轮】扩围扇区记账：8 个罗盘扇区各派过几跳 + 本轮盲跳计数，
+     * 给 escalateSearch 的罗盘收敛用（恶地局盆地空转 40 分钟的对症药）。 */
+    private final int[] gatherSectorHops = new int[8];
+    private int gatherEscalateHops;
     /** dryland 连续失败次数：失败 3 次后跳过，避免无限重试泡在水里 20 秒又 20 秒。 */
     private int drylandFailures;
     private boolean exploreStarted;
@@ -134,6 +138,8 @@ public final class GoalExecutor {
      * （实测 105,19,61 ↔ 112,19,61 往返 7 轮，步数凑满 24 但一块矿都没有）。
      */
     private boolean relocateBeforeStrip;
+    /** 【第四十七轮】挖石头时 strip 连败计数：沼泽式地表无石时改下挖取石的触发量。 */
+    private int stoneStripFails;
     /** 已经处理过的 strip 结果：同一个结果字符串不要每 tick 重复触发"换点"。 */
     private String handledStripOutcome = "-";
     /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
@@ -643,6 +649,8 @@ public final class GoalExecutor {
             gatherSearchAngle = -1;
             gatherSearchTier = 0;
             gatherSearchAnchor = null;
+            gatherEscalateHops = 0;
+            java.util.Arrays.fill(gatherSectorHops, 0);
             attempts = 0;
             return;
         }
@@ -711,13 +719,42 @@ public final class GoalExecutor {
                     + String.format(Locale.ROOT, "%.0f", Math.sqrt(me.distSqr(tree))));
             return true;
         }
+        // 【第四十六轮补2】分段推进：整跳在台地地形里必死——落点回退到 24~32 格后
+        // A* 仍要跨断崖，节点/时间预算内找不到路（恶地复跑实证：树在 93 格外、
+        // 高出 40 格的台顶，整跳与回退跳全灭）。改沿同一射线只走 16 格一小段：
+        // 小范围 A* 在台地坡面通常有路（escalate 的 8 格跳在本局能走动为证），
+        // 采集失败轮次会反复调用本步、逐轮向树收敛，进 mine 半径后技能接管。
+        double hopLen = Math.min(12.0D, len - 3.0D);
+        if (hopLen > 4.0D) {
+            JsonObject hop = new JsonObject();
+            hop.addProperty("x", me.getX() + 0.5D - dx / len * hopLen);
+            hop.addProperty("z", me.getZ() + 0.5D - dz / len * hopLen);
+            if (skills.run(new Intent("", "goto", hop), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " trek-to-tree 分段推进 | tree="
+                        + tree.toShortString() + " dist="
+                        + String.format(Locale.ROOT, "%.0f", Math.sqrt(me.distSqr(tree)))
+                        + " hop=" + String.format(Locale.ROOT, "%.0f", hopLen));
+                return true;
+            }
+        }
+        // 瞄到了树但走不过去也要留痕，否则日志上和"没找到树"分不出来
+        // （恶地复跑靠 goto 侧流水才定位到落点判死）。
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " trek-to-tree 未能出发 | tree="
+                + tree.toShortString() + " dist="
+                + String.format(Locale.ROOT, "%.0f", Math.sqrt(me.distSqr(tree)))
+                + " outcome=" + skills.lastOutcome());
         return false;
     }
 
     /**
      * 在已加载区块里找最近的"地表有树"列：高度图（WORLD_SURFACE，含树冠）
-     * 顶格是原木或树叶即是。采样步长 3 格、半径上限由参数给；
-     * 未加载区块一律跳过——绝不为了找树去加载/生成新区块。
+     * 顶格是原木或树叶即是；未加载区块一律跳过——绝不为了找树去加载/生成新区块。
+     *
+     * <p>【第四十六轮】采样步长 3→2、顶格下探放宽到 3 格：林地恶地的橡树稀疏
+     * 矮小，步长 3 的采样网格大概率整棵漏过（恶地局实证：树在 45 格外、
+     * trek 全程 0 命中、41 分钟卡死木头线）；顶格偶被藤蔓等盖住时，
+     * 下探范围内的原木/树叶也算树列。半径 80、步长 2 约 6.5k 列采样/次，
+     * 只在采集失败轮次调用，高度图读已加载区块，成本可控。
      */
     private BlockPos findVisibleTreeColumn(int maxRadius) {
         if (!(npc.level() instanceof ServerLevel serverLevel)) {
@@ -726,8 +763,8 @@ public final class GoalExecutor {
         BlockPos center = npc.blockPosition();
         BlockPos best = null;
         double bestSq = Double.MAX_VALUE;
-        for (int dx = -maxRadius; dx <= maxRadius; dx += 3) {
-            for (int dz = -maxRadius; dz <= maxRadius; dz += 3) {
+        for (int dx = -maxRadius; dx <= maxRadius; dx += 2) {
+            for (int dz = -maxRadius; dz <= maxRadius; dz += 2) {
                 int x = center.getX() + dx;
                 int z = center.getZ() + dz;
                 if (serverLevel.getChunkIfLoaded(x >> 4, z >> 4) == null) {
@@ -738,10 +775,14 @@ public final class GoalExecutor {
                 if (topY <= serverLevel.getMinY() + 4) {
                     continue;
                 }
-                net.minecraft.world.level.block.state.BlockState top =
-                        serverLevel.getBlockState(new BlockPos(x, topY - 1, z));
-                if (!top.is(net.minecraft.tags.BlockTags.LOGS)
-                        && !top.is(net.minecraft.tags.BlockTags.LEAVES)) {
+                boolean treeTop = false;
+                for (int dy = 1; dy <= 3 && !treeTop; dy++) {
+                    net.minecraft.world.level.block.state.BlockState st =
+                            serverLevel.getBlockState(new BlockPos(x, topY - dy, z));
+                    treeTop = st.is(net.minecraft.tags.BlockTags.LOGS)
+                            || st.is(net.minecraft.tags.BlockTags.LEAVES);
+                }
+                if (!treeTop) {
                     continue;
                 }
                 BlockPos cand = new BlockPos(x, topY, z);
@@ -771,6 +812,26 @@ public final class GoalExecutor {
         // 未加载/未生成区块的高度图会返回世界底线值（-64）：不排除的话它永远"最低"，
         // NPC 会一路朝没生成的地形狂奔（短验实测 10 分钟跑出 100 多格还没找到树）。
         int invalidY = npc.level().getMinY() + 4;
+        // 【第四十六轮】罗盘收敛（恶地局定因）：旧逻辑只有"下坡首跳 + 惯性保持/
+        // 中断转 45°"，在盆地里"走得动"会被惯性判为方向可行、绕着盆地空转，
+        // 40 分钟活动范围没出出生点 ±120 格（航向角一路累加到 3465°）。
+        // 改：盲跳满 6 跳仍无果，强制把航向换到"累计派跳最少的扇区"（扇区记账
+        // 跨目标保留、找到资源才清零）——8 个扇区轮着搜，最多 48 跳必扫完一圈，
+        // 杜绝在同一片空地里重复兜圈。下坡首跳与惯性仍管前 6 跳的玩家式直觉。
+        if (gatherEscalateHops >= 6) {
+            int bestSector = 0;
+            for (int s = 1; s < 8; s++) {
+                if (gatherSectorHops[s] < gatherSectorHops[bestSector]) {
+                    bestSector = s;
+                }
+            }
+            gatherSearchAngle = bestSector * Math.PI / 4.0D;
+            gatherSearchAnchor = null;
+            gatherEscalateHops = 0;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " search-compass | 扩围盲跳 6 次无果，"
+                    + "强制换向最少搜过扇区 heading=" + (bestSector * 45) + "° sectorHops="
+                    + java.util.Arrays.toString(gatherSectorHops));
+        }
         // 方向惯性（fix18）：先结算上一跳的实际水平位移——走够 8 格说明这个
         // 方向可行，保持航向并升一档走更远；没走动（路径中断/目标不可站立）
         // 就把航向转 45° 换方向。玩家找树就是这么干的：认准一个方向走到底，
@@ -825,6 +886,10 @@ public final class GoalExecutor {
             params.addProperty("x", npc.getX() + Math.cos(angle) * distance);
             params.addProperty("z", npc.getZ() + Math.sin(angle) * distance);
             if (skills.run(new Intent("", "goto", params), "目标")) {
+                // 【第四十六轮】扇区记账：这一跳派给了哪个罗盘扇区。
+                gatherEscalateHops++;
+                double norm = ((angle % (Math.PI * 2.0D)) + Math.PI * 2.0D) % (Math.PI * 2.0D);
+                gatherSectorHops[(int) Math.round(norm / (Math.PI / 4.0D)) % 8]++;
                 LOG.info("[AIV][GOAL] " + npc.npcName() + " 找不到 " + targetId
                         + "，扩围找资源 | 第" + attempts + "次 距离=" + distance
                         + " 航向=" + Math.round(Math.toDegrees(angle)) + "° 档位=" + gatherSearchTier
@@ -1363,6 +1428,7 @@ public final class GoalExecutor {
             } else {
                 lastProgress = have;
                 staleChecks = 0;
+                stoneStripFails = 0;
             }
         }
 
@@ -1454,6 +1520,25 @@ public final class GoalExecutor {
             }
         }
 
+        // 【第四十七轮】沼泽式地表无石兜底（沼泽局实证：strip 41 次圆石恒 0）：
+        // 目标是石头、strip 已连败 ≥2 次、人还在地表附近时，水平掘进永远穿不过
+        // 土层——改原地向下挖 6 格穿土找石（玩家解法）。石头的层位口径取当前
+        // 深度，下挖后自动跟随，strip 在石层里就能出圆石；计数靠 noteStripOutcome
+        // 记账、出任何进度即清零。下挖途中遇流体 descend 自有防护，失败了下一轮
+        // 还在地表附近会再触发、逐次换位下探（relocate 换区也在并行）。
+        if ("stone".equals(oreTarget.block()) && stoneStripFails >= 2
+                && npc.blockPosition().getY() >= surfaceY - 3) {
+            JsonObject params = new JsonObject();
+            params.addProperty("y", npc.blockPosition().getY() - 6);
+            if (skills.run(new Intent("", "descend", params), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " dig-down-for-stone | strip 连败 "
+                        + stoneStripFails + " 次，地表无石，改为向下挖穿土层找石");
+                stoneStripFails = 0;
+                attempts = 0;
+                return;
+            }
+        }
+
         // 3) 已经在资源层：水平掘进，矿道壁上暴露的矿会顺手挖掉。
         //    上一轮挖空了就先挪 4-9 格再开新矿道：原地再下发 strip 只会把
         //    同一条空矿道再走一遍。goto 发不出去（封闭矿道很常见）就照常掘进。
@@ -1499,6 +1584,10 @@ public final class GoalExecutor {
                 && ((outcome.contains("未发现") && outcome.contains("已挖=0"))
                 || outcome.contains("前方无路可掘"))) {
             relocateBeforeStrip = true;
+            // 【第四十七轮】挖石头连败单独记账，给 tickDig 的下挖取石兜底当触发量。
+            if (oreTarget != null && "stone".equals(oreTarget.block())) {
+                stoneStripFails++;
+            }
         }
     }
 
@@ -2414,6 +2503,7 @@ public final class GoalExecutor {
         if (oreTarget == null) {
             return;
         }
+        OreMemory.bindWorld(npc.level());
         BlockPos seen = scanExposedOre(oreTarget.block(), 16);
         if (seen != null) {
             OreMemory.record(npc.npcName(), oreTarget.block(), seen);
@@ -2428,6 +2518,7 @@ public final class GoalExecutor {
      * 满 2 次自动销账防死锁。
      */
     private void tickRevisit() {
+        OreMemory.bindWorld(npc.level());
         status = "回访记账矿 " + oreTarget.block() + " @ " + revisitX + "," + revisitY + "," + revisitZ;
         if (!hasHarvestPickaxe(oreTarget.block())) {
             finish("回访中止：又没有能挖 " + oreTarget.block() + " 的镐了");

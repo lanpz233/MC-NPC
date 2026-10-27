@@ -772,6 +772,35 @@ public final class ProgressionPlanner {
             }
         }
 
+        // 7.9) 【fix48】记矿回访前置——"下潜之前必查"（fix40 的 12.9 顺位后置
+        // 被两局实证架空：针叶林/沙漠局账本条目 attempts 恒 0——12.9 排在全部
+        // 主线步之后，而铁器时代主线永远有活（挖铁→合成→再挖），回访永远轮
+        // 不到；等主线真空档时条目又多半已过 2 小时有效期）。现前置到步 8
+        // （铁装备）之前：步 8 起全是会下潜/远行的挖矿步，每轮 decide 先查账
+        // 本——有工具够得着的记账矿就先去收了再下潜；步 7 冶炼与更早的合成/
+        // 采集步不下潜、仍排在回访前面（回访一趟远行不该打断手头冶炼）。
+        // 账本已按世界打标（OreMemory.bindWorld），异世界串账条目读时剔除。
+        com.example.aivillager.goals.OreMemory.bindWorld(npc.level());
+        for (com.example.aivillager.goals.OreMemory.Entry oreEntry
+                : com.example.aivillager.goals.OreMemory.entries(npc.npcName())) {
+            int ironTierPicks = countUsableItem(
+                    "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
+            boolean tierOk = switch (oreEntry.needTier()) {
+                case 2 -> ironTierPicks > 0;
+                case 1 -> stonePickaxes > 0 || ironTierPicks > 0;
+                default -> true;
+            };
+            if (!tierOk) {
+                continue;
+            }
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 回访记账矿 | " + oreEntry.block()
+                    + " @ " + oreEntry.x() + "," + oreEntry.y() + "," + oreEntry.z()
+                    + " needTier=" + oreEntry.needTier());
+            return goal("回访记账矿", "revisit",
+                    params("x", oreEntry.x(), "y", oreEntry.y(), "z", oreEntry.z(),
+                            "resource", oreEntry.block().replace("_ore", "")));
+        }
+
         // 8) 铁制装备（原第 10 步，【第三十四轮】随冶炼一并提前到挖煤/挖铁之前）：
         // 剑 → 镐 → 胸甲 → 头盔 → 护腿 → 靴子。本块是阻塞式的（缺锭自己炼/挖），
         // 只要轮得到就能自驱走完铁线；原排序下被挖煤常驻目标挡在后面，贫瘠群系
@@ -1007,27 +1036,7 @@ public final class ProgressionPlanner {
         // 13.0) 弓与箭挪到传送门准备之后（见 13.2）：
         // 蜘蛛只在夜晚出没，先凑弓弦会让白天的整条下线主链（下界→末影珍珠）全堵在后面。
 
-        // 12.9) 【fix40】记矿回访（Fong 亲提）：账本里有当时挖不了的矿、
-        // 现在工具级别够了，就回去收账。排在主线之后、储备之前——主线
-        // 优先、空档收账；级别还不够的条目跳过，等工具齐了再说。
-        for (com.example.aivillager.goals.OreMemory.Entry oreEntry
-                : com.example.aivillager.goals.OreMemory.entries(npc.npcName())) {
-            boolean tierOk = switch (oreEntry.needTier()) {
-                case 2 -> usableIronPickaxes > 0 || hasAny("diamond_pickaxe", "netherite_pickaxe");
-                case 1 -> stonePickaxes > 0 || usableIronPickaxes > 0
-                        || hasAny("diamond_pickaxe", "netherite_pickaxe");
-                default -> true;
-            };
-            if (!tierOk) {
-                continue;
-            }
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 回访记账矿 | " + oreEntry.block()
-                    + " @ " + oreEntry.x() + "," + oreEntry.y() + "," + oreEntry.z()
-                    + " needTier=" + oreEntry.needTier());
-            return goal("回访记账矿", "revisit",
-                    params("x", oreEntry.x(), "y", oreEntry.y(), "z", oreEntry.z(),
-                            "resource", oreEntry.block().replace("_ore", "")));
-        }
+        // （原 12.9 记矿回访已由 fix48 前置到步 8 之前——"下潜之前必查"，见彼处。）
 
         // 13) 食物储备（顺路型软向导，【fix38】目标改常备口径）：有剑以后打猎，
         // 把储备补到"熟食为主、总营养 FOOD_RESERVE_NUTRITION 且份数

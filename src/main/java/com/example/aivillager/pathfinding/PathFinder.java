@@ -120,8 +120,7 @@ public final class PathFinder {
         // 【第十九轮】细雪规避（Fong 拍板，推翻第三轮"细雪可走、只是贵"）：
         // 没穿皮靴时细雪按"避开"处理——终点本身落在细雪里就近挪到雪外落脚点，
         // 挪不到就如实失败让上层换目标，绝不规划一条趟雪的路。
-        if (avoidPowderSnow && isPowderSnow(level, safeGoal)) {
-            BlockPos outside = null;
+        if (avoidPowderSnow && isPowderSnow(level, safeGoal)) {            BlockPos outside = null;
             outer:
             for (int r = 1; r <= 3 && outside == null; r++) {
                 for (int dx = -r; dx <= r; dx++) {
@@ -141,6 +140,33 @@ public final class PathFinder {
             safeGoal = outside;
         }
 
+        // 【第四十五轮】岩浆池移动回避（雨林局实证：Y=15 洞穴池移动中两度落入、
+        // 脱险点与再入点只差 1 格）：isPassable 只禁"脚格是流体"，贴池边格本身
+        // 干燥可站，A* 就会沿池边贴行，身体物理一滑就进池。这里把"贴岩浆格"
+        // （同层或下一层四正方向有岩浆）整体当禁区：过路不踩；终点贴岩浆时按
+        // 细雪同口径就近挪到不贴岩浆的落点，挪不到如实失败让上层换候选。
+        // 与 fix37（挖矿邻接拦截）分工：那件管下镐，这件管走路。
+        if (isLavaAdjacent(level, safeGoal)) {
+            BlockPos outside = null;
+            outer:
+            for (int r = 1; r <= 3 && outside == null; r++) {
+                for (int dx = -r; dx <= r; dx++) {
+                    for (int dz = -r; dz <= r; dz++) {
+                        BlockPos cand = nearestStandable(level, safeGoal.offset(dx, 0, dz), 2);
+                        if (cand != null && !isLavaAdjacent(level, cand)) {
+                            outside = cand;
+                            break outer;
+                        }
+                    }
+                }
+            }
+            if (outside == null) {
+                return new Result(List.of(), 0, elapsedMillis(begin),
+                        "终点贴岩浆且无可替代落点 " + goal.toShortString());
+            }
+            safeGoal = outside;
+        }
+
         long startKey = safeStart.asLong();
         long goalKey = safeGoal.asLong();
         if (startKey == goalKey) {
@@ -149,6 +175,7 @@ public final class PathFinder {
 
         // 一次搜索内共享的落脚缓存：邻居枚举会反复问到同一批格子。
         Map<Long, Boolean> standCache = new HashMap<>();
+        Map<Long, Boolean> lavaCache = new HashMap<>();
         Map<Long, Double> gScore = new HashMap<>();
         Map<Long, Long> parent = new HashMap<>();
         Set<Long> closed = new HashSet<>();
@@ -191,6 +218,12 @@ public final class PathFinder {
                 // 【第十九轮】规避模式下细雪格直接不踩（宁可绕远/无路）；
                 // 穿皮靴时按原版机制正常踩过，不加任何代价。
                 if (isPowderSnow(level, next) && avoidPowderSnow) {
+                    continue;
+                }
+                // 【第四十五轮】贴岩浆格一律不踩（无条件，岩浆没有"穿什么能踩"
+                // 的例外）：起点本身贴岩浆不受影响（起点不经邻格展开加入），
+                // 刚逃出池时仍能朝不贴岩浆的方向离开。
+                if (isLavaAdjacentCached(level, next, lavaCache)) {
                     continue;
                 }
                 double stepCost = (diagonal ? DIAGONAL_COST : 1.0D) + verticalCost(next.getY() - current.pos().getY());
@@ -326,6 +359,35 @@ public final class PathFinder {
      */
     private static boolean isPowderSnow(BlockGetter level, BlockPos pos) {
         return level.getBlockState(pos).is(Blocks.POWDER_SNOW);
+    }
+
+    /**
+     * 这一格是否"贴岩浆"（第四十五轮）：同层或下一层的四正方向任一格是岩浆。
+     * 站位格本身干燥可站，但身体有 0.6 格宽、行走带惯性，贴着池边走一滑就进池
+     * （雨林局两次落入都是贴边移动）；下一层岩浆算贴，是因为池面常比岸低 1 格，
+     * 脚边就是池面时同理。岩浆源与流动岩浆是同一个方块（Blocks.LAVA），
+     * 直接查方块即可。
+     */
+    private static boolean isLavaAdjacent(BlockGetter level, BlockPos pos) {
+        for (int[] dir : CARDINAL_DIRECTIONS) {
+            if (level.getBlockState(pos.offset(dir[0], 0, dir[1])).is(Blocks.LAVA)
+                    || level.getBlockState(pos.offset(dir[0], -1, dir[1])).is(Blocks.LAVA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isLavaAdjacentCached(BlockGetter level, BlockPos pos,
+                                                 Map<Long, Boolean> cache) {
+        long key = pos.asLong();
+        Boolean known = cache.get(key);
+        if (known != null) {
+            return known;
+        }
+        boolean adjacent = isLavaAdjacent(level, pos);
+        cache.put(key, adjacent);
+        return adjacent;
     }
 
     /**

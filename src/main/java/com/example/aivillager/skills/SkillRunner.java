@@ -131,6 +131,35 @@ public final class SkillRunner {
                 // goto 只给 x/z；y 以当前高度为基准，再上下找最近的合法落脚点（洞穴和地表都能用）。
                 BlockPos desired = BlockPos.containing(x, npc.getY(), z);
                 BlockPos goal = PathFinder.standableGoal(npc.level(), desired, 6);
+                if (goal == null && distance > 16.0D) {
+                    // 【第四十六轮补3】远途落点先放宽垂直扫描：台地崖面列的地表常在
+                    // 当前 Y ±6 之外（树在 +43 高的台顶、12 格外坡面已高出 10 格），
+                    // ±12 扫到坡面落点后 A* 逐列爬台阶；近途仍用 ±6 防洞穴串层。
+                    goal = PathFinder.standableGoal(npc.level(), desired, 12);
+                }
+                if (goal == null && distance > 16.0D) {
+                    // 【第四十六轮补】远途落点回退：截断/全程落点列在台地陡坡上时
+                    // ±6 格内常常没有落脚格，旧行为整跳判死（恶地复跑实证：trek 瞄到
+                    // 55 格外树列、48 格截断落点不可站立、连续 12 次全灭、一步没挪）。
+                    // 沿原射线按 32/24/16 格逐档缩短，取第一个有落脚格的落点先走一段，
+                    // 上层下一轮会接着往原目标推进；全档无落点才走原判死路径。
+                    double ux = offsetX / distance;
+                    double uz = offsetZ / distance;
+                    for (double hop : new double[]{32.0D, 24.0D, 16.0D}) {
+                        if (hop >= Math.min(distance, MAX_GOTO_DISTANCE)) {
+                            continue;
+                        }
+                        BlockPos hopPos = BlockPos.containing(
+                                npc.getX() + ux * hop, npc.getY(), npc.getZ() + uz * hop);
+                        BlockPos hopGoal = PathFinder.standableGoal(npc.level(), hopPos, 6);
+                        if (hopGoal != null) {
+                            goal = hopGoal;
+                            LOG.info("[AIV][SKILL] " + npc.npcName() + " goto 落点回退 | 原目标不可站立，"
+                                    + "先走 " + (int) hop + " 格到 " + hopGoal.toShortString());
+                            break;
+                        }
+                    }
+                }
                 if (goal == null) {
                     // 短距离兜底（第六轮补充3）：终点列没有落脚格（水中树岛的树干列等），
                     // 且距离 ≤16 格时直接朝目标点直线走——见 walkStraightTo 的说明。
@@ -142,8 +171,10 @@ public final class SkillRunner {
                     return false;
                 }
 
-                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, !npc.wearingLeatherBoots());
-                logPath("goto", goal, result);
+                // goal 经落点回退后可能被重赋值，lambda 捕获需要快照。
+                final BlockPos pathGoal = goal;
+                PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), pathGoal, !npc.wearingLeatherBoots());
+                logPath("goto", pathGoal, result);
                 if (!result.found()) {
                     // 短距离兜底（第六轮补充3）：A* 把流体判不可通行，沼泽/河口地形里
                     // 出生在一小块干岛上时四周全是水，A* 只展开几个节点就无路可走，
@@ -151,7 +182,7 @@ public final class SkillRunner {
                     // ≤16 格改直线走：身体会自己蹚浅水/游泳（生存层游泳脱困接管），
                     // 撞墙有 stuck-rescue 挖路，80 tick 无进展自动放弃、技能看门狗兜底，
                     // 不会无限硬走；长距离 goto 行为不变，仍只认 A*。
-                    if (horizontalDistanceTo(goal) <= 16.0D && walkStraightTo(id, goal)) {
+                    if (horizontalDistanceTo(pathGoal) <= 16.0D && walkStraightTo(id, pathGoal)) {
                         return true;
                     }
                     lastOutcome = "goto 找不到路径 " + result.detail();
@@ -159,11 +190,11 @@ public final class SkillRunner {
                 }
 
                 current = "goto";
-                LOG.info("[AIV][SKILL] " + npc.npcName() + " goto 开始 | goal=" + goal.toShortString()
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " goto 开始 | goal=" + pathGoal.toShortString()
                         + " 节点=" + result.path().size());
                 npc.followPath(result.path(), false,
-                        () -> finish(id, "goto", "到达 " + goal.toShortString()),
-                        () -> finish(id, "goto", "路径中断 " + goal.toShortString()));
+                        () -> finish(id, "goto", "到达 " + pathGoal.toShortString()),
+                        () -> finish(id, "goto", "路径中断 " + pathGoal.toShortString()));
                 armWatchdog(id, "goto");
                 return true;
             }
@@ -2287,6 +2318,7 @@ public final class SkillRunner {
                 // 回访（只记 2 格内真扫到的裸露矿、不占本 tick 动作、不
                 // return）。有铁镐时不记——顺手挖与主线会处理。
                 if (!hasPickTier(2)) {
+                    OreMemory.bindWorld(npc.level());
                     BlockPos seenGold = findVariantNear(feet, oreVariants("gold_ore"), 2);
                     if (seenGold != null && !touchesLava(seenGold)) {
                         OreMemory.record(npc.npcName(), variantPath(seenGold), seenGold);

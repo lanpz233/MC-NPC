@@ -42,13 +42,29 @@ public final class OreMemory {
     private static final Set<String> TRACKED = Set.of(
             "diamond_ore", "gold_ore", "iron_ore", "lapis_ore");
 
-    /** 一条记账：矿种（归一后的方块路径）、坐标、所需镐级别、记下时间、回访失败次数。 */
-    public record Entry(String block, int x, int y, int z, int needTier, long seenAt, int attempts) {
+    /** 一条记账：矿种（归一后的方块路径）、坐标、所需镐级别、记下时间、回访失败次数、
+     * 所属世界标识（【第四十八轮】种子+维度；旧账本无此字段=null，绑定世界后按串账清掉）。 */
+    public record Entry(String block, int x, int y, int z, int needTier, long seenAt, int attempts,
+                        String world) {
     }
 
     private static File dataDir;
     private static final Map<String, List<Entry>> BY_NPC = new HashMap<>();
     private static final Set<String> LOADED = new HashSet<>();
+    /** 【第四十八轮】当前世界标识：账本文件在插件目录、跨世界共用（测试服换世界
+     * 不换插件目录），沙漠局实证针叶林的 gold 条目串进沙漠账本。条目按世界
+     * 打标、读时剔除异世界条目；真实服务器只有一个世界，绑定后恒等、无副作用。 */
+    private static volatile String currentWorld;
+
+    /** 由持有 NPC 的调用方在记账/读账前绑定当前世界（每 JVM 只会有一个世界）。 */
+    public static void bindWorld(net.minecraft.world.level.Level level) {
+        if (level == null || currentWorld != null) {
+            return;
+        }
+        long seed = level instanceof net.minecraft.server.level.ServerLevel serverLevel
+                ? serverLevel.getSeed() : 0L;
+        currentWorld = seed + "/" + level.dimension();
+    }
 
     private OreMemory() {
     }
@@ -89,7 +105,8 @@ public final class OreMemory {
             if (e.block().equals(base)
                     && Math.max(Math.abs(e.x() - pos.getX()),
                         Math.max(Math.abs(e.y() - pos.getY()), Math.abs(e.z() - pos.getZ()))) <= 4) {
-                entries.set(i, new Entry(base, e.x(), e.y(), e.z(), e.needTier(), now, e.attempts()));
+                entries.set(i, new Entry(base, e.x(), e.y(), e.z(), e.needTier(), now, e.attempts(),
+                        e.world()));
                 save(npcName, entries);
                 return false;
             }
@@ -99,7 +116,7 @@ public final class OreMemory {
             entries.remove(0);
         }
         entries.add(new Entry(base, pos.getX(), pos.getY(), pos.getZ(),
-                needTierFor(base), now, 0));
+                needTierFor(base), now, 0, currentWorld));
         save(npcName, entries);
         LOG.info("[AIV][GOAL] " + npcName + " 记矿 | " + base + " @ "
                 + pos.getX() + "," + pos.getY() + "," + pos.getZ()
@@ -107,12 +124,13 @@ public final class OreMemory {
         return true;
     }
 
-    /** 当前有效账本（已剔除过期与失败满额的），按记录时间升序。 */
+    /** 当前有效账本（已剔除过期、失败满额与异世界串账条目），按记录时间升序。 */
     public static synchronized List<Entry> entries(String npcName) {
         List<Entry> entries = load(npcName);
         long now = System.currentTimeMillis();
         boolean purged = entries.removeIf(
-                e -> now - e.seenAt() > EXPIRY_MILLIS || e.attempts() >= MAX_ATTEMPTS);
+                e -> now - e.seenAt() > EXPIRY_MILLIS || e.attempts() >= MAX_ATTEMPTS
+                        || (currentWorld != null && !currentWorld.equals(e.world())));
         if (purged) {
             save(npcName, entries);
         }
@@ -143,7 +161,8 @@ public final class OreMemory {
                     LOG.info("[AIV][GOAL] " + npcName + " 记矿销账（回访失败 " + attempts + " 次放弃） | "
                             + base + " @ " + x + "," + y + "," + z);
                 } else {
-                    entries.set(i, new Entry(base, x, y, z, e.needTier(), e.seenAt(), attempts));
+                    entries.set(i, new Entry(base, x, y, z, e.needTier(), e.seenAt(), attempts,
+                            e.world()));
                     LOG.info("[AIV][GOAL] " + npcName + " 回访失败计次 " + attempts + "/" + MAX_ATTEMPTS
                             + " | " + base + " @ " + x + "," + y + "," + z);
                 }
