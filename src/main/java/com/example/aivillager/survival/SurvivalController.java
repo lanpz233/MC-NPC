@@ -350,6 +350,32 @@ public final class SurvivalController {
             fluidEscapeDir = null;
             return;
         }
+        // 【fix67】窒息兜底（保命线，必须排在下面空气早退之前）：头位块嵌进
+        // 窒息块时原版按 inWall 每半秒掉血，但楔死几何里脚格常是空气（身体挂在
+        // 建筑叠层边缘、头嵌墙里）——farm21 实证：屋顶 descend 楔住 73 秒、
+        // 脚格=air 使 unstuck 在此早退、实心段零打挖，hp 19→0.3 窒息死。
+        // 原设计注释假设"头被卡住原版能挤出去"已被证伪。玩家被墙卡头的第一
+        // 反应是挖开头位块，这里同理：isInWall（原版窒息判定本体）为真就挖
+        // 眼位格、挖不动再挖眼位上一格，不看脚格、不看技能状态；正常站位
+        // （头顶有 2 格空间）isInWall 恒假，零误伤。
+        if (npc.isInWall()) {
+            net.minecraft.core.BlockPos eye = net.minecraft.core.BlockPos.containing(
+                    npc.getEyePosition());
+            String eyeBlock = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                    .getKey(npc.level().getBlockState(eye).getBlock()).toString();
+            boolean dug = npc.mineWithBestTool(eye) || npc.mine(eye);
+            net.minecraft.core.BlockPos used = eye;
+            if (!dug) {
+                net.minecraft.core.BlockPos aboveEye = eye.above();
+                dug = npc.mineWithBestTool(aboveEye) || npc.mine(aboveEye);
+                used = aboveEye;
+            }
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 窒息脱困：挖开头位块 | dug=" + dug
+                    + " eyeBlock=" + eyeBlock
+                    + " pos=" + used.toShortString()
+                    + " feet=" + feet.toShortString());
+            return;
+        }
         if ((state.isAir() || state.is(net.minecraft.world.level.block.Blocks.BEDROCK))
                 && !npc.isInWater() && !npc.isInLava()) {
             // 【第十四轮】真离水（身体包围盒也不沾水）连续 2 次检查才清零泡水计数：
