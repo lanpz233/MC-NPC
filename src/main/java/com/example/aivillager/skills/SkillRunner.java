@@ -427,6 +427,16 @@ public final class SkillRunner {
                 finish(id, "mine", "拒绝自埋 目标在正下方 pos=" + mineTarget.toShortString());
                 return;
             }
+            // 【第七十八轮】钟乳石防护扩面（fix77 只护了 ascend/strip 上挖，
+            // farm37 实证 descend 同样挖断链砸死）：目标块是悬挂链的支撑/链身
+            // 就不挖，挖断了正砸在站位上（检查与 ascend/strip 同用 stalactiteHazard）。
+            BlockPos mineDrip = stalactiteHazard(mineTarget);
+            if (mineDrip != null) {
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " mine 钟乳石回避 | target="
+                        + mineTarget.toShortString() + " 钟乳石=" + mineDrip.toShortString());
+                finish(id, "mine", "目标块连着钟乳石，不挖 pos=" + mineTarget.toShortString());
+                return;
+            }
             // AutoTool：石头/矿石必须手持正确镐子才有掉落，空手挖等于白干。
             boolean success = npc.mineWithBestTool(mineTarget);
             finish(id, "mine", "success=" + success + " pos=" + mineTarget.toShortString());
@@ -1783,9 +1793,13 @@ public final class SkillRunner {
                 BlockState aheadHeadState = npc.level().getBlockState(aheadHead);
                 BlockState nextFeetState = npc.level().getBlockState(nextFeet);
                 // 流体 / 基岩 / 悬空：这一级不安全，转向。悬空会直接掉进洞穴或岩浆湖。
+                // 【第七十八轮】下一格的落脚支撑若是尖滴石锥也不安全：锥尖有碰撞
+                // 会被下面的"碰撞为空"检查误放行，但锥尖根本不是落脚面，踩上去
+                // 只会顺着锥列滑进大厅（farm37 死链一环）。
                 if (nextFeetState.is(Blocks.BEDROCK) || aheadState.is(Blocks.BEDROCK)
                         || aheadHeadState.is(Blocks.BEDROCK)
                         || isFluid(nextFeetState) || isFluid(aheadState) || isFluid(aheadHeadState)
+                        || npc.level().getBlockState(nextFeet.below()).is(Blocks.POINTED_DRIPSTONE)
                         || npc.level().getBlockState(nextFeet.below()).getCollisionShape(
                                 npc.level(), nextFeet.below()).isEmpty()) {
                     // 【fix73】同层横移步：本方向被判不安全时先看台面——ahead
@@ -1845,6 +1859,19 @@ public final class SkillRunner {
                                 + feet.getY());
                         return;
                     }
+                    // 【第七十八轮】垂直下挖同样查钟乳石：脚下块是悬挂链的支撑
+                    // 就不挖——farm37 实证 descend 挖断链、坠落钟乳石砸死（第 6 死）。
+                    BlockPos belowDrip = stalactiteHazard(belowFeet);
+                    if (belowDrip != null) {
+                        failedSteps++;
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 垂直下挖钟乳石回避 | 脚下="
+                                + belowState.getBlock() + " 钟乳石=" + belowDrip.toShortString()
+                                + " 连续失败=" + failedSteps + " Y=" + feet.getY());
+                        if (failedSteps >= 6) {
+                            finish(id, "descend", "脚下连着钟乳石，四周也不安全 Y=" + feet.getY());
+                        }
+                        return;
+                    }
                     stepStartY = feet.getY();
                     npc.mineWithBestTool(belowFeet);
                     lastTarget = belowFeet;
@@ -1854,6 +1881,35 @@ public final class SkillRunner {
                 }
                 unsafeTurns = 0;
 
+                // 【第七十八轮】主步三格开挖前查钟乳石断链（fix77 扩面到 descend）：
+                // farm37 实证 descend 主步挖掉同列两块滴石块后被坠落钟乳石满血
+                // 砸死——凡是挖块入口都得查，不止 ascend 的上挖路径。
+                BlockPos stepDrip = stalactiteHazard(ahead);
+                BlockPos stepPos = ahead;
+                String stepCell = "前方格";
+                if (stepDrip == null) {
+                    stepDrip = stalactiteHazard(aheadHead);
+                    stepPos = aheadHead;
+                    stepCell = "前方头格";
+                }
+                if (stepDrip == null) {
+                    stepDrip = stalactiteHazard(nextFeet);
+                    stepPos = nextFeet;
+                    stepCell = "下一格";
+                }
+                if (stepDrip != null) {
+                    dirIndex++;
+                    failedSteps++;
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 钟乳石回避，转向 | "
+                            + stepCell + "=" + stepPos.toShortString()
+                            + " 钟乳石=" + stepDrip.toShortString()
+                            + " 连续失败=" + failedSteps);
+                    if (failedSteps >= 6) {
+                        finish(id, "descend", "连续 " + failedSteps + " 级被钟乳石挡住 Y="
+                                + Math.round(npc.getY()));
+                    }
+                    return;
+                }
                 // 一次挖掉三格：新站位脚部（y-1）、新站位头部（y）、以及当前头部高度的 y+1。
                 // 少挖 y+1 的话，身体还在一层高的位置时脑袋会撞上左侧的方块，
                 // walkTo 会一直卡住等 4 秒超时，下矿速度只有每分钟十几格。
@@ -2415,6 +2471,15 @@ public final class SkillRunner {
                             + variantPath(ore) + " " + ore.toShortString());
                     ore = null;
                 }
+                BlockPos oreDrip = ore != null ? stalactiteHazard(ore) : null;
+                if (oreDrip != null) {
+                    // 【第七十八轮】钟乳石支撑矿不挖（fix77 扩面，与岩浆跳过同口径）：
+                    // 这块矿是悬挂链的支撑/链身，挖掉链就砸在掘进面上。
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 跳过钟乳石支撑矿 | "
+                            + variantPath(ore) + " " + ore.toShortString()
+                            + " 钟乳石=" + oreDrip.toShortString());
+                    ore = null;
+                }
                 if (ore != null) {
                     // 必须在挖掉之前取方块名：挖完再读坐标只会拿到 air，
                     // 日志里全变成「挖到矿石 | air」，没法判断真正挖到的是哪种矿。
@@ -2439,6 +2504,12 @@ public final class SkillRunner {
                 if (!variants.contains("coal_ore")) {
                     BlockPos coalOre = countItemStock("coal", "charcoal") < COAL_OPPORTUNISTIC_CAP
                             ? findVariantNear(feet, oreVariants("coal_ore"), 2) : null;
+                    if (coalOre != null && stalactiteHazard(coalOre) != null) {
+                        // 【第七十八轮】钟乳石支撑煤同样不挖（fix77 扩面）。
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 跳过钟乳石支撑煤 | "
+                                + variantPath(coalOre) + " " + coalOre.toShortString());
+                        coalOre = null;
+                    }
                     if (coalOre != null && !touchesLava(coalOre)) {
                         if (npc.mineWithBestTool(coalOre)) {
                             LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 顺手挖煤 | "
