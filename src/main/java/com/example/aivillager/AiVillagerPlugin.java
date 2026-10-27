@@ -86,6 +86,7 @@ public final class AiVillagerPlugin extends JavaPlugin {
         com.example.aivillager.goals.FarmMemory.init(getDataFolder());
         com.example.aivillager.goals.BaseMemory.init(getDataFolder());
         com.example.aivillager.goals.DeathMemory.init(getDataFolder());
+        com.example.aivillager.goals.LootMemory.init(getDataFolder());
 
         router = LlmRouter.fromConfig(this);
         chatRadius = getConfig().getDouble("npc.chat-radius", 16.0D);

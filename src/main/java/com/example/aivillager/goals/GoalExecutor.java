@@ -426,6 +426,16 @@ public final class GoalExecutor {
                 newTarget = "store_loot";
                 newCount = 1;
             }
+            case "loot_chest" -> {
+                // 【fix80·D12】搜刮世界箱子（规划层扫到的未搜箱位）。
+                newTarget = "loot_chest";
+                newCount = 1;
+                lootX = intent.intParam("x", 0);
+                lootY = intent.intParam("y", 0);
+                lootZ = intent.intParam("z", 0);
+                lootStuck = 0;
+                lootStandPos = null;
+            }
             case "flint" -> {
                 newTarget = "flint";
                 newCount = clamp(intent.intParam("count", 1), 1, 8);
@@ -591,6 +601,7 @@ public final class GoalExecutor {
             case "place_bed" -> "安置床（落脚点）";
             case "sleep" -> "回床睡觉";
             case "store_loot" -> "回落脚点存贵重物（箱子）";
+            case "loot_chest" -> "搜刮箱子（村庄/结构）";
             case "flint" -> "找燧石 x" + targetCount;
             case "fillbucket" -> "装满水桶（常备）";
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
@@ -699,6 +710,7 @@ public final class GoalExecutor {
             case "place_bed" -> tickPlaceBed();
             case "sleep" -> tickSleep();
             case "store_loot" -> tickStoreLoot();
+            case "loot_chest" -> tickLootChest();
             case "flint" -> tickFlint();
             case "fillbucket" -> tickFillBucket();
             case "obsidian" -> tickObsidian();
@@ -3885,6 +3897,13 @@ public final class GoalExecutor {
     private int storeActionStuck;
     private String storeLastActionKey = "";
 
+    // ===== 【fix80·D12】搜刮世界箱子（村庄/结构，只拿用得上的） =====
+    private int lootX;
+    private int lootY;
+    private int lootZ;
+    private int lootStuck;
+    private BlockPos lootStandPos;
+
     /** 存入名单（草案定版）：死了怕丢、平时不用的贵重物 + 第二档杂物（存箱优先于扔）。 */
     private static final java.util.Set<String> STORE_LOOT = java.util.Set.of(
             "diamond", "emerald", "netherite_ingot", "netherite_scrap", "ancient_debris",
@@ -4063,6 +4082,142 @@ public final class GoalExecutor {
                 stack.shrink(move);
             }
         }
+    }
+
+    /**
+     * 【fix80·D12】搜刮世界箱子：走到箱边 → 按清单拿 → 记账销账。
+     * 只拿用得上的（口粮/床料/贵重物/原料），不动箱子本身、不拆任何东西、
+     * 不碰床和铁傀儡（Fong 拍板边界）。搜完与到不了都进 LootMemory 账本，
+     * 同一箱子不重复派单（到不了多半是永久几何，记下别再试）。
+     */
+    private void tickLootChest() {
+        BlockPos chestPos = new BlockPos(lootX, lootY, lootZ);
+        status = "搜刮箱子 " + chestPos.toShortString();
+        LootMemory.bindWorld(npc.level());
+        net.minecraft.world.level.block.state.BlockState chestState =
+                npc.level().getBlockState(chestPos);
+        if (!chestState.is(net.minecraft.world.level.block.Blocks.CHEST)
+                && !chestState.is(net.minecraft.world.level.block.Blocks.TRAPPED_CHEST)) {
+            LootMemory.markLooted(npc.npcName(), chestPos);
+            finish("搜箱放弃：箱子已不在 " + chestPos.toShortString());
+            return;
+        }
+        double dx = chestPos.getX() + 0.5D - npc.getX();
+        double dz = chestPos.getZ() + 0.5D - npc.getZ();
+        boolean atChest = Math.sqrt(dx * dx + dz * dz) <= 2.2D
+                && Math.abs(npc.getY() - chestPos.getY()) <= 2.0D;
+        if (!atChest) {
+            if (lootStandPos == null) {
+                lootStandPos = pickLootStand(chestPos);
+                if (lootStandPos == null) {
+                    LootMemory.markLooted(npc.npcName(), chestPos);
+                    finish("搜箱放弃：箱子四周没有可站的格 " + chestPos.toShortString());
+                    return;
+                }
+            }
+            lootStuck++;
+            if (lootStuck > 240) {
+                LootMemory.markLooted(npc.npcName(), chestPos);
+                finish("搜箱放弃：多次推进仍未到达箱子边 " + chestPos.toShortString());
+                return;
+            }
+            moveToStand(lootStandPos, lootStuck, "[LOOT]");
+            return;
+        }
+        if (!"idle".equals(skills.currentSkill())) {
+            return;
+        }
+        net.minecraft.world.level.block.entity.BlockEntity blockEntity =
+                npc.level().getBlockEntity(chestPos);
+        if (!(blockEntity instanceof net.minecraft.world.Container container)) {
+            LootMemory.markLooted(npc.npcName(), chestPos);
+            finish("搜箱放弃：箱子容器不可用 " + chestPos.toShortString());
+            return;
+        }
+        int kinds = 0;
+        int total = 0;
+        for (int slot = 0; slot < container.getContainerSize(); slot++) {
+            ItemStack stack = container.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = pathOf(stack);
+            if (!lootWorthTaking(path)) {
+                continue;
+            }
+            ItemStack moving = stack.copy();
+            int before = moving.getCount();
+            npc.getInventory().add(moving);
+            int taken = before - moving.getCount();
+            if (taken <= 0) {
+                continue;
+            }
+            if (taken >= stack.getCount()) {
+                container.setItem(slot, ItemStack.EMPTY);
+            } else {
+                stack.shrink(taken);
+                container.setItem(slot, stack);
+            }
+            kinds++;
+            total += taken;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [LOOT] " + path + " x" + taken
+                    + " | 箱=" + chestPos.toShortString());
+        }
+        container.setChanged();
+        LootMemory.markLooted(npc.npcName(), chestPos);
+        finish(total > 0
+                ? "搜箱完成：拿到 " + kinds + " 种共 " + total + " 件 @ " + chestPos.toShortString()
+                : "搜箱完成：箱里没有用得上的东西 @ " + chestPos.toShortString());
+    }
+
+    /** 箱边站位：四个水平邻格里挑能站的（脚格可替换、脚下有实心），离 NPC 最近优先。 */
+    private BlockPos pickLootStand(BlockPos chestPos) {
+        BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] d : dirs) {
+            BlockPos cell = chestPos.offset(d[0], 0, d[1]);
+            net.minecraft.world.level.block.state.BlockState cellState =
+                    npc.level().getBlockState(cell);
+            net.minecraft.world.level.block.state.BlockState belowState =
+                    npc.level().getBlockState(cell.below());
+            if (!(cellState.isAir() || cellState.canBeReplaced())
+                    || belowState.getCollisionShape(npc.level(), cell.below()).isEmpty()) {
+                continue;
+            }
+            double sq = cell.distSqr(npc.blockPosition());
+            if (sq < bestSq) {
+                bestSq = sq;
+                best = cell;
+            }
+        }
+        return best;
+    }
+
+    /** 搜箱拿取清单（D12 定版）：食物（含生肉，回去烤）+ 床料 + 功能料 + 贵重物。 */
+    private static final java.util.Set<String> LOOT_TAKE = java.util.Set.of(
+            "bread", "apple", "golden_apple", "enchanted_golden_apple",
+            "carrot", "golden_carrot", "potato", "baked_potato", "beetroot",
+            "melon_slice", "sweet_berries", "glow_berries", "pumpkin_pie",
+            "dried_kelp", "cookie", "honey_bottle", "wheat",
+            "cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton",
+            "cooked_cod", "cooked_salmon", "cooked_rabbit",
+            "beef", "porkchop", "chicken", "mutton", "cod", "salmon", "rabbit",
+            "rabbit_stew", "mushroom_stew", "beetroot_soup",
+            "string", "bone", "arrow", "bucket", "torch", "coal",
+            "iron_ingot", "gold_ingot", "diamond", "emerald", "lapis_lazuli",
+            "ender_pearl", "blaze_rod", "gold_nugget", "iron_nugget");
+
+    /** 这件东西值不值得从箱子里拿（干草块另有小麦当量上限口径）。 */
+    private boolean lootWorthTaking(String path) {
+        if (path.endsWith("_wool") || LOOT_TAKE.contains(path)) {
+            return true;
+        }
+        if (path.equals("hay_block")) {
+            // 干草块=面包原料：一块顶 9 小麦，小麦当量满一组（64）就停手。
+            return countItem("wheat") + countItem("hay_block") * 9 < 64;
+        }
+        return false;
     }
 
     private void tickFlint() {
@@ -5049,7 +5204,7 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base", "store_loot" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base", "store_loot", "loot_chest" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }

@@ -1017,6 +1017,54 @@ public final class ProgressionPlanner {
             }
         }
 
+        // 6.79) 搜箱（fix80·D12）：地表白天活动时，16 格内有没搜过的世界
+        // 箱子就顺路搜（Fong 拍板：村庄只搜箱子、只拿用得上的）。感知口径
+        // （status-round21 D12 定案）：规划层扫方块只作"瞥见"，执行层必须
+        // 真走到箱边（寻路门）——隔墙封死的箱子到不了就放弃记账。自家存箱
+        // （BaseMemory chestPos）显式排除，防它搜自己刚存的东西。
+        if (!underground() && !isNight()) {
+            com.example.aivillager.goals.LootMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base baseForLoot =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            BlockPos ownChest = baseForLoot != null ? baseForLoot.chestPos() : null;
+            BlockPos feetPos = npc.blockPosition();
+            BlockPos foundChest = null;
+            double foundSq = Double.MAX_VALUE;
+            for (int scanDx = -16; scanDx <= 16; scanDx++) {
+                for (int scanDz = -16; scanDz <= 16; scanDz++) {
+                    for (int scanDy = -2; scanDy <= 3; scanDy++) {
+                        BlockPos scanPos = feetPos.offset(scanDx, scanDy, scanDz);
+                        net.minecraft.world.level.block.state.BlockState scanState =
+                                npc.level().getBlockState(scanPos);
+                        if (!scanState.is(net.minecraft.world.level.block.Blocks.CHEST)
+                                && !scanState.is(
+                                        net.minecraft.world.level.block.Blocks.TRAPPED_CHEST)) {
+                            continue;
+                        }
+                        if (scanPos.equals(ownChest)
+                                || com.example.aivillager.goals.LootMemory.isLooted(
+                                        npc.npcName(), scanPos)) {
+                            continue;
+                        }
+                        double scanSq = scanPos.distSqr(feetPos);
+                        if (scanSq < foundSq) {
+                            foundSq = scanSq;
+                            foundChest = scanPos;
+                        }
+                    }
+                }
+            }
+            if (foundChest != null) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 搜箱触发 | 箱="
+                        + foundChest.toShortString() + " 距离="
+                        + Math.round(Math.sqrt(foundSq)));
+                return goal("搜刮箱子", "loot_chest",
+                        params("x", foundChest.getX(), "y", foundChest.getY(),
+                                "z", foundChest.getZ()));
+            }
+        }
+
         // 6.8) 细雪地带皮靴驱动（第十九轮，Fong 拍板）：出生/活动区在雪原、
         // 针叶林等细雪地带时，皮靴从"顺手做"升级为"优先做"——没皮靴在雪地
         // 里寸步难行（寻路已避开细雪，没靴寸步难行的是探索范围被雪原封死）。
