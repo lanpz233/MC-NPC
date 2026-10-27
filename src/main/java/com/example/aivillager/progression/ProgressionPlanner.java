@@ -911,6 +911,23 @@ public final class ProgressionPlanner {
                             + woolColor + "_wool x" + countItem(woolColor + "_wool"));
                     return goal("制作床", "craft", params("item", woolColor + "_bed", "count", 1));
                 }
+                // 【fix68·Fong 指示】线折算床料：蜘蛛掉的线 ×4（2×2）原版可合
+                // 1 张白羊毛，一张床 = 白羊毛×3 = 线×12。白羊毛与线混算够 3
+                // 即视为料齐：先派合成把线折成白羊毛（合成系统查原版配方表，
+                // 无需加表），下一轮规划自然走上面的白床分支。其他颜色羊毛
+                // 不与线混算（线只能合白羊毛），仍走同色规则。只做折算/合成，
+                // 不为凑线新开打蜘蛛目标（夜闸/惜命优先，线靠自卫击杀自然攒）。
+                int whiteWool = countItem("white_wool");
+                int stringCount = countItem("string");
+                int stringWool = stringCount / 4;
+                if (whiteWool + stringWool >= 3) {
+                    int craftWool = Math.min(3 - whiteWool, stringWool);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 线折算床料触发 | 白羊毛="
+                            + whiteWool + " 线=" + stringCount + " 可折=" + stringWool
+                            + " 本次合白羊毛=" + craftWool);
+                    return goal("线合成白羊毛", "craft",
+                            params("item", "white_wool", "count", craftWool));
+                }
             }
         }
 

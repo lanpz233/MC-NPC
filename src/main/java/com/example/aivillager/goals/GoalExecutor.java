@@ -5046,7 +5046,8 @@ public final class GoalExecutor {
     private static final java.util.Set<String> TERRAIN_JUNK = java.util.Set.of(
             "sand", "gravel");
 
-    /** 第二档（Fong 04:17）：蜘蛛眼/骨头/线——怪掉落、假人当前用不上；满包压力下才扔。 */
+    /** 第二档（Fong 04:17）：蜘蛛眼/骨头/线——怪掉落、假人当前用不上；满包压力下才扔。
+     * 例外（fix68）：线在床链挂起期间是床料，dropTier2Junk 与兜底都护住。 */
     private static final java.util.Set<String> TIER2_JUNK = java.util.Set.of(
             "spider_eye", "bone", "string");
 
@@ -5089,6 +5090,10 @@ public final class GoalExecutor {
         for (int slot = 0; slot < MAIN_SLOTS && freed < needed; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (stack.isEmpty() || !TIER2_JUNK.contains(pathOf(stack))) {
+                continue;
+            }
+            // 【fix68】床链挂起期间线是床料，第二档也不许扔（床成后恢复）。
+            if (pathOf(stack).equals("string") && bedChainPending()) {
                 continue;
             }
             dropItems(slot, stack.getCount(), "第二档丢弃 " + pathOf(stack));
@@ -5295,6 +5300,17 @@ public final class GoalExecutor {
         return BaseMemory.hasBase(npc.npcName());
     }
 
+    /**
+     * 床链是否挂起（fix68）：本世界有落脚点、但床位还没安置落盘。
+     * 这段时间线是床料（线×4 合 1 白羊毛，规划步 6.76 折算），丢弃路径要
+     * 把线护住；床安置落盘后自动恢复第二档原口径（存箱优先、没箱才扔）。
+     */
+    private boolean bedChainPending() {
+        BaseMemory.bindWorld(npc.level());
+        BaseMemory.Base base = BaseMemory.base(npc.npcName());
+        return base != null && base.bedPos() == null;
+    }
+
     private int junkKeepLimit(String path) {
         switch (path) {
             case "sand", "clay_ball",
@@ -5448,6 +5464,10 @@ public final class GoalExecutor {
                 // 羊毛是 D1 床料（同色 3 张靠猎羊零散攒），farm24 实证拾到
                 // 即被兜底扔掉（x1/x2 两笔），不护住床链永远攒不齐。
                 || path.equals("wheat") || path.endsWith("_wool")
+                // 【fix68】床链挂起期间线是床料（线×4 合白羊毛）：兜底不许扔，
+                // 否则自卫杀蜘蛛攒的线被满包实时清零、床链永远齐不了（与
+                // fix66 羊毛同病）。床安置后 bedChainPending 转假、自动恢复。
+                || (path.equals("string") && bedChainPending())
                 // 木料类是整条科技树的根基（木棍→工具/箭、木板→工作台/木棍），
                 // 兜底清理时把它当关键材料保住，否则"背包满"会先把木棍丢掉。
                 || path.equals("stick") || path.equals("bamboo") || path.equals("bamboo_block")
