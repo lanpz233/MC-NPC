@@ -3126,8 +3126,10 @@ public final class GoalExecutor {
         for (int x = cx - radius; x <= cx + radius; x++) {
             for (int z = cz - radius; z <= cz + radius; z++) {
                 for (int y = floor - 1; y <= floor + 1; y++) {
-                    if (level.getBlockState(new BlockPos(x, y, z))
-                            .getFluidState().is(net.minecraft.world.level.material.Fluids.WATER)) {
+                    // 用方块判定不用 FluidState.is(Fluids.WATER)：后者在
+                    // 编译/运行时映射下签名对不齐、类加载 VerifyError
+                    // （fix52 首跑实证，auto-npc 生成直接失败）。
+                    if (level.getBlockState(new BlockPos(x, y, z)).is(Blocks.WATER)) {
                         return true;
                     }
                 }
