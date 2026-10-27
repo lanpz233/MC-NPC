@@ -1396,8 +1396,27 @@ public final class SkillRunner {
         return true;
     }
 
+    /** 【fix57】上次放块的格子与时刻：断「放块→身体卡入→被生存层挖掉→再放」紧循环。 */
+    private BlockPos lastBridgePos;
+    private long lastBridgeTick = Long.MIN_VALUE;
+
     /** 放一块垫脚方块（优先圆石/下界岩这类廉价方块）。 */
     private boolean placeBuildingBlockAt(BlockPos pos) {
+        // 【fix57】落地时禁止往身体脚格/头格放块：ascend 台阶与 travel 搭桥曾在同一格
+        // 互相打架——块放进身体所在格，生存层「卡在方块里」当场挖掉再放再挖，
+        // 108 秒烧掉 194 块、整组圆石清零（boot-farm12）。垫柱是腾空 0.55 格后放脚下，
+        // 放块时 onGround=false，不受此闸影响。
+        if (npc.onGround) {
+            BlockPos feet = npc.blockPosition();
+            if (pos.equals(feet) || pos.equals(feet.above())) {
+                return false;
+            }
+        }
+        // 【fix57】同格 60 tick 内不重复放块：正常搭桥/垫柱都是逐格推进、不回头同格。
+        long nowTick = npc.level().getGameTime();
+        if (pos.equals(lastBridgePos) && nowTick - lastBridgeTick < 60L) {
+            return false;
+        }
         String path = pickBuildingBlock();
         if (path == null) {
             return false;
@@ -1409,6 +1428,8 @@ public final class SkillRunner {
         }
         consumeItem(path, 1);
         npc.level().setBlockAndUpdate(pos, block.defaultBlockState());
+        lastBridgePos = pos;
+        lastBridgeTick = nowTick;
         LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 搭桥 | block=" + path
                 + " pos=" + pos.toShortString());
         return true;

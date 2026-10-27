@@ -463,7 +463,7 @@ public final class ProgressionPlanner {
                 + " rawIron=" + countItem("raw_iron")
                 + " ingots=" + countItem("iron_ingot")
                 + " diamonds=" + countItem("diamond")
-                + " cobble=" + countItem("cobblestone")
+                + " cobble=" + (countItem("cobblestone") + countItem("cobbled_deepslate"))
                 + " failStreak=" + failStreak
                 + " lastFailed=" + (lastFailedStage.isEmpty() ? "-" : lastFailedStage));
         // 【第二十三轮】阶段切换盘点：阶段变了打一张家底快照（节流在盘点类内）。
@@ -533,7 +533,10 @@ public final class ProgressionPlanner {
         int sticks = countItem("stick");
         int bamboo = countItem("bamboo");
         int bambooBlocks = countItem("bamboo_block");
-        int cobble = countItem("cobblestone");
+        // 【fix57】石材口径与合成配方组对齐：圆石与深板岩圆石在石器/熔炉配方里
+        // 完全等价，只数 cobblestone 会让包里躺着 55 块深板岩圆石却判定「没石头」
+        // 在地表无限重派挖石头（boot-farm12 实锤）。黑石仅下界产出、不入此口径。
+        int cobble = countItem("cobblestone") + countItem("cobbled_deepslate");
         int coal = countItem("coal") + countItem("charcoal");
         int rawIron = countItem("raw_iron");
         int ingots = countItem("iron_ingot");
@@ -862,9 +865,10 @@ public final class ProgressionPlanner {
                 && System.currentTimeMillis() >= baseBackoffUntil) {
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
             if (!com.example.aivillager.goals.BaseMemory.hasBase(npc.npcName())) {
+                // 【fix57】cobbled_deepslate 已并入 cobble 口径，这里不再单加防双算。
                 int buildable = cobble + countItem("dirt") + countItem("andesite")
                         + countItem("diorite") + countItem("granite")
-                        + countItem("cobbled_deepslate") + countItem("tuff")
+                        + countItem("tuff")
                         + countItem("stone") + countSuffix("_planks");
                 com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
                 boolean hasFarm = com.example.aivillager.goals.FarmMemory.hasFarm(npc.npcName());
