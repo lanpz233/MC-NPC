@@ -4485,7 +4485,10 @@ public final class GoalExecutor {
 
     private String pickBuildingMaterial(int needed) {
         // 顺序即优先级：圆石最结实，木板其次，泥土最后。
-        String[] candidates = {"cobblestone", "stone", "dirt", "oak_planks", "spruce_planks",
+        // 【fix58】补深板岩圆石/黑石：深挖时代包里最多的就是深板岩圆石，选料表不认它
+        // 会在泥土耗尽后整夜瞬间失败「建筑方块不足」（boot-farm13 实锤），与 fix57 同病。
+        String[] candidates = {"cobblestone", "cobbled_deepslate", "blackstone", "stone", "dirt",
+                "oak_planks", "spruce_planks",
                 "birch_planks", "jungle_planks", "acacia_planks", "dark_oak_planks",
                 "mangrove_planks", "cherry_planks", "bamboo_planks", "pale_oak_planks",
                 "oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log",
