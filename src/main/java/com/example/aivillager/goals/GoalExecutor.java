@@ -415,6 +415,11 @@ public final class GoalExecutor {
                 newTarget = "sleep";
                 newCount = 1;
             }
+            case "store_loot" -> {
+                // 【fix69·箱子】回落脚点把贵重物存进箱子（v1 只存不取）。
+                newTarget = "store_loot";
+                newCount = 1;
+            }
             case "flint" -> {
                 newTarget = "flint";
                 newCount = clamp(intent.intParam("count", 1), 1, 8);
@@ -538,6 +543,11 @@ public final class GoalExecutor {
         sleepDayTime0 = -1L;
         sleepActionStuck = 0;
         sleepLastActionKey = "";
+        // 【fix69】存箱状态机复位。
+        storePhase = 0;
+        storeChestPos = null;
+        storeActionStuck = 0;
+        storeLastActionKey = "";
         portalOrigin = null;
         portalPhase = 0;
         enterAttempts = 0;
@@ -567,6 +577,7 @@ public final class GoalExecutor {
             case "base" -> "建落脚点（火柴盒小屋）";
             case "place_bed" -> "安置床（落脚点）";
             case "sleep" -> "回床睡觉";
+            case "store_loot" -> "回落脚点存贵重物（箱子）";
             case "flint" -> "找燧石 x" + targetCount;
             case "obsidian" -> "浇铸黑曜石 x" + targetCount;
             case "portal" -> "建造并点燃下界传送门";
@@ -673,6 +684,7 @@ public final class GoalExecutor {
             case "base" -> tickBase();
             case "place_bed" -> tickPlaceBed();
             case "sleep" -> tickSleep();
+            case "store_loot" -> tickStoreLoot();
             case "flint" -> tickFlint();
             case "obsidian" -> tickObsidian();
             case "portal" -> tickPortal();
@@ -3797,6 +3809,192 @@ public final class GoalExecutor {
      * "把已有的沙砾放下再挖掉"，反复刷到燧石为止。这里优先用这个办法，
      * 背包里没有沙砾时才去附近找天然沙砾。
      */
+    // ===== 【fix69·箱子】回落脚点存贵重物（v1 只存不取，草案见 status-round14） =====
+    private int storePhase;
+    private BlockPos storeChestPos;
+    private int storeActionStuck;
+    private String storeLastActionKey = "";
+
+    /** 存入名单（草案定版）：死了怕丢、平时不用的贵重物 + 第二档杂物（存箱优先于扔）。 */
+    private static final java.util.Set<String> STORE_LOOT = java.util.Set.of(
+            "diamond", "emerald", "netherite_ingot", "netherite_scrap", "ancient_debris",
+            "blaze_rod", "ender_pearl", "gold_ingot",
+            "bone", "string", "spider_eye");
+
+    /** 落脚点箱子是否已安置且在 range 格内（第二档"存箱优先"的判定口）。 */
+    private boolean hasChestWithin(double range) {
+        BaseMemory.bindWorld(npc.level());
+        BaseMemory.Base base = BaseMemory.base(npc.npcName());
+        return base != null && base.chestPos() != null
+                && npc.blockPosition().distSqr(base.chestPos()) <= range * range;
+    }
+
+    private void tickStoreLoot() {
+        BaseMemory.bindWorld(npc.level());
+        BaseMemory.Base base = BaseMemory.base(npc.npcName());
+        if (base == null) {
+            finish("存箱放弃：无落脚点账本");
+            return;
+        }
+        switch (storePhase) {
+            case 0 -> {
+                status = "存箱：定箱位";
+                BlockPos recorded = base.chestPos();
+                if (recorded != null && npc.level().getBlockState(recorded)
+                        .is(net.minecraft.world.level.block.Blocks.CHEST)) {
+                    storeChestPos = recorded;
+                } else {
+                    if (recorded != null) {
+                        LOG.info("[AIV][GOAL] " + npc.npcName() + " [STORE] 账本箱位块已不在（"
+                                + recorded.toShortString() + "），重新选位");
+                    }
+                    BlockPos anchor = base.anchor();
+                    BlockPos[] candidates = {
+                            anchor.offset(1, 0, 1), anchor.offset(1, 0, -1),
+                            anchor.offset(-1, 0, 1), anchor.offset(1, 0, 0),
+                            anchor.offset(-1, 0, 0), anchor.offset(0, 0, 1)};
+                    storeChestPos = null;
+                    for (BlockPos cell : candidates) {
+                        // bedCellFree 要求空/植被+脚下实心：床格是实体块天然被排除，
+                        // 锚点本身不在候选内（留作站位）。
+                        if (bedCellFree(cell)) {
+                            storeChestPos = cell;
+                            break;
+                        }
+                    }
+                    if (storeChestPos == null) {
+                        finish("存箱放弃：屋内没有放箱子的空位");
+                        return;
+                    }
+                    if (countItem("chest") == 0) {
+                        finish("存箱放弃：包里没箱子");
+                        return;
+                    }
+                }
+                storePhase = 1;
+            }
+            case 1 -> {
+                status = "存箱：就位";
+                BlockPos stand = base.anchor();
+                boolean atStand = npc.blockPosition().getX() == stand.getX()
+                        && npc.blockPosition().getZ() == stand.getZ()
+                        && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
+                if (atStand) {
+                    storePhase = 2;
+                    return;
+                }
+                String key = "store-stand";
+                if (key.equals(storeLastActionKey)) {
+                    storeActionStuck++;
+                } else {
+                    storeLastActionKey = key;
+                    storeActionStuck = 0;
+                }
+                if (storeActionStuck > 90) {
+                    finish("存箱放弃：到不了屋内站位");
+                    return;
+                }
+                moveToStand(stand, storeActionStuck, "[STORE]");
+            }
+            case 2 -> {
+                status = "存箱：存入";
+                if (!npc.level().getBlockState(storeChestPos)
+                        .is(net.minecraft.world.level.block.Blocks.CHEST)) {
+                    if (!consume("chest", 1)) {
+                        finish("存箱放弃：扣箱子失败");
+                        return;
+                    }
+                    npc.level().setBlockAndUpdate(storeChestPos,
+                            net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState());
+                    BaseMemory.saveChest(npc.npcName(), storeChestPos);
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [STORE] 放箱 | pos="
+                            + storeChestPos.toShortString());
+                }
+                net.minecraft.world.level.block.entity.BlockEntity blockEntity =
+                        npc.level().getBlockEntity(storeChestPos);
+                if (!(blockEntity instanceof net.minecraft.world.Container container)) {
+                    finish("存箱放弃：箱子容器不可用");
+                    return;
+                }
+                int ironExcess = Math.max(0, countItem("iron_ingot") - 32);
+                int kinds = 0;
+                int total = 0;
+                for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+                    ItemStack stack = npc.getInventory().getItem(slot);
+                    if (stack.isEmpty()) {
+                        continue;
+                    }
+                    String path = pathOf(stack);
+                    int want;
+                    if (STORE_LOOT.contains(path)) {
+                        want = stack.getCount();
+                    } else if (path.equals("iron_ingot")) {
+                        // 铁锭只存超出常备 32 的部分（Fong 常备口径，草案定版）。
+                        want = Math.min(stack.getCount(), ironExcess);
+                    } else {
+                        continue;
+                    }
+                    if (want <= 0) {
+                        continue;
+                    }
+                    ItemStack moving = stack.copy();
+                    moving.setCount(want);
+                    addToContainer(container, moving);
+                    int moved = want - moving.getCount();
+                    if (moved <= 0) {
+                        continue;
+                    }
+                    stack.shrink(moved);
+                    if (stack.isEmpty()) {
+                        npc.getInventory().setItem(slot, ItemStack.EMPTY);
+                    }
+                    if (path.equals("iron_ingot")) {
+                        ironExcess -= moved;
+                    }
+                    kinds++;
+                    total += moved;
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [STORE] 存入 | item="
+                            + path + " x" + moved + " 箱位=" + storeChestPos.toShortString());
+                }
+                blockEntity.setChanged();
+                if (total == 0) {
+                    finish("存箱完成：无可存物品（或箱已满）");
+                } else {
+                    finish("存箱完成：存入 " + kinds + " 种共 " + total + " 个 @ "
+                            + storeChestPos.toShortString());
+                }
+            }
+            default -> finish("存箱阶段异常 " + storePhase);
+        }
+    }
+
+    /** 把一堆物品放进容器：先合并同物品堆、再填空槽（原版箱子放入口径）。 */
+    private void addToContainer(net.minecraft.world.Container container, ItemStack stack) {
+        for (int i = 0; i < container.getContainerSize() && !stack.isEmpty(); i++) {
+            ItemStack cur = container.getItem(i);
+            if (!cur.isEmpty() && ItemStack.isSameItemSameComponents(cur, stack)) {
+                int room = Math.min(cur.getMaxStackSize(), container.getMaxStackSize())
+                        - cur.getCount();
+                if (room > 0) {
+                    int move = Math.min(room, stack.getCount());
+                    cur.grow(move);
+                    stack.shrink(move);
+                    container.setItem(i, cur);
+                }
+            }
+        }
+        for (int i = 0; i < container.getContainerSize() && !stack.isEmpty(); i++) {
+            if (container.getItem(i).isEmpty()) {
+                int move = Math.min(stack.getCount(),
+                        Math.min(stack.getMaxStackSize(), container.getMaxStackSize()));
+                ItemStack put = stack.copy();
+                put.setCount(move);
+                container.setItem(i, put);
+                stack.shrink(move);
+            }
+        }
+    }
+
     private void tickFlint() {
         int have = countItem("flint");
         status = "找燧石 " + have + "/" + targetCount;
@@ -4736,7 +4934,7 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base", "store_loot" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }
@@ -5086,6 +5284,12 @@ public final class GoalExecutor {
      * P2 落脚点箱子落地后，本档改为"先存箱、箱满/无箱才扔"，在此挂钩。
      */
     private int dropTier2Junk(int needed) {
+        // 【fix69】落脚点箱子在 48 格内时，第二档整档先存箱不扔——靠规划层
+        // 存箱步（6.77）回落脚点时批量收尾；离箱子远/没箱子时照旧扔（草案
+        // v1 简化口径，如实记：不是逐趟折返存，是"在家附近不扔、存箱步收"）。
+        if (hasChestWithin(48.0D)) {
+            return 0;
+        }
         int freed = 0;
         for (int slot = 0; slot < MAIN_SLOTS && freed < needed; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);

@@ -141,6 +141,9 @@ public final class ProgressionPlanner {
      * 注定连败时不能让床务反复抢主线；退避到期再试。 */
     private int bedFailStreak;
     private long bedBackoffUntil;
+    /** 【fix69】存箱专属连败与退避（与安置床同口径）。 */
+    private int storeFailStreak;
+    private long storeBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -371,6 +374,16 @@ public final class ProgressionPlanner {
                 } else {
                     bedFailStreak = 0;
                     bedBackoffUntil = 0L;
+                }
+            } else if ("回箱存物".equals(lastStage)) {
+                if (goalFailed) {
+                    storeFailStreak++;
+                    storeBackoffUntil = now + Math.min(300_000L, 60_000L * storeFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 存箱退避 | 连败=" + storeFailStreak
+                            + " 退避秒=" + (storeBackoffUntil - now) / 1000L);
+                } else {
+                    storeFailStreak = 0;
+                    storeBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -927,6 +940,35 @@ public final class ProgressionPlanner {
                             + " 本次合白羊毛=" + craftWool);
                     return goal("线合成白羊毛", "craft",
                             params("item", "white_wool", "count", craftWool));
+                }
+            }
+        }
+
+        // 6.77) 存箱（fix69·P2 箱子）：回落脚点附近时把贵重物存进屋里箱子
+        // （v1 只存不取）——玩家回家先存东西再出门，顺路办不专程跑：只在
+        // 距锚点 ≤48 格、白天地表时触发。没箱先做箱（8 木板）；有箱（已安置
+        // 或包里有）且包里有存入名单物才派存箱目标。名单与执行层 STORE_LOOT
+        // 同步（贵重物 + 第二档杂物 + 铁锭超 32 的部分）。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
+                && System.currentTimeMillis() >= storeBackoffUntil) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base baseForStore =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (baseForStore != null
+                    && npc.blockPosition().distSqr(baseForStore.anchor()) <= 48.0D * 48.0D) {
+                if (baseForStore.chestPos() == null && countItem("chest") == 0
+                        && countSuffix("_planks") >= 8) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 做箱子触发 | 木板="
+                            + countSuffix("_planks"));
+                    return goal("制作箱子", "craft", params("item", "chest", "count", 1));
+                }
+                if ((baseForStore.chestPos() != null || countItem("chest") > 0)
+                        && hasStorableLoot()) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 存箱触发 | 钻石="
+                            + countItem("diamond") + " 珍珠=" + countItem("ender_pearl")
+                            + " 骨头=" + countItem("bone") + " 线=" + countItem("string")
+                            + " 铁锭=" + countItem("iron_ingot"));
+                    return goal("回箱存物", "store_loot", params());
                 }
             }
         }
@@ -1669,9 +1711,18 @@ public final class ProgressionPlanner {
         return total;
     }
 
+    /** 包里有没有值得存箱的东西（fix69 步 6.77 触发量；名单与执行层 STORE_LOOT 同步）。 */
+    private boolean hasStorableLoot() {
+        return countItem("diamond") > 0 || countItem("emerald") > 0
+                || countItem("netherite_ingot") > 0 || countItem("netherite_scrap") > 0
+                || countItem("ancient_debris") > 0 || countItem("blaze_rod") > 0
+                || countItem("ender_pearl") > 0 || countItem("gold_ingot") > 0
+                || countItem("bone") > 0 || countItem("string") > 0
+                || countItem("spider_eye") > 0 || countItem("iron_ingot") > 32;
+    }
+
     /** 同色羊毛 ≥3 的颜色前缀（fix56：原版床配方要 3 张同色羊毛）；没有返回 null。 */
-    private String woolColorWithThree() {
-        java.util.Map<String, Integer> byPath = new java.util.HashMap<>();
+    private String woolColorWithThree() {        java.util.Map<String, Integer> byPath = new java.util.HashMap<>();
         for (int slot = 0; slot < COUNT_SLOTS; slot++) {
             ItemStack stack = npc.getInventory().getItem(slot);
             if (stack.isEmpty()) {

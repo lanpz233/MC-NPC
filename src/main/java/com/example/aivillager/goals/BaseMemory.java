@@ -32,8 +32,10 @@ private static Path folder;
 private static String boundWorldKey = "";
 
 /** 一座落脚点：anchor=屋内中心地板格（脚踩的那格），builtAt=建成时刻，
- * bedPos=床脚格（fix56·D1，安置后才有，未安置为 null）。 */
-public record Base(String world, BlockPos anchor, long builtAt, BlockPos bedPos) {
+ * bedPos=床脚格（fix56·D1，安置后才有，未安置为 null），
+ * chestPos=箱子格（fix69，安置后才有，未安置为 null）。 */
+public record Base(String world, BlockPos anchor, long builtAt, BlockPos bedPos,
+BlockPos chestPos) {
 }
 
 /** 落盘 DTO（BlockPos 不直接交给 Gson）。 */
@@ -48,6 +50,11 @@ boolean hasBed;
 int bedX;
 int bedY;
 int bedZ;
+/** 箱子格（fix69）：hasChest=false 时三个坐标无意义；旧账本无此字段默认 false。 */
+boolean hasChest;
+int chestX;
+int chestY;
+int chestZ;
 }
 
 private BaseMemory() {
@@ -93,7 +100,8 @@ return null;
 }
 return new Base(data.world,
 new BlockPos(data.anchorX, data.anchorY, data.anchorZ), data.builtAt,
-data.hasBed ? new BlockPos(data.bedX, data.bedY, data.bedZ) : null);
+data.hasBed ? new BlockPos(data.bedX, data.bedY, data.bedZ) : null,
+data.hasChest ? new BlockPos(data.chestX, data.chestY, data.chestZ) : null);
 } catch (Exception exception) {
 LOG.warning("[AIV][BASE] 落脚点账本读取失败 " + npcName + ": " + exception.getMessage());
 return null;
@@ -135,6 +143,23 @@ data.hasBed = true;
 data.bedX = bedFoot.getX();
 data.bedY = bedFoot.getY();
 data.bedZ = bedFoot.getZ();
+writeData(npcName, data);
+}
+
+/** 安置箱子后落盘（fix69）：只更新箱子字段，锚点/床/世界沿用现有记录。 */
+public static void saveChest(String npcName, BlockPos chestPos) {
+if (folder == null) {
+return;
+}
+BaseData data = readData(npcName);
+if (data == null ||!worldKey().equals(data.world)) {
+LOG.warning("[AIV][BASE] 安置箱子落盘失败：无本世界落脚点记录 " + npcName);
+return;
+}
+data.hasChest = true;
+data.chestX = chestPos.getX();
+data.chestY = chestPos.getY();
+data.chestZ = chestPos.getZ();
 writeData(npcName, data);
 }
 
