@@ -2678,6 +2678,21 @@ public final class GoalExecutor {
         return dx * dx + dz * dz <= 10.24D && dy >= -1.0D && dy <= 3.0D;
     }
 
+    /**
+     * 【fix65】建造够格（与种田 farmInReach 分开）：种田口径（水平 3.2 格、
+     * 上够 1 格）是按作物在脚边设计的，套到砌筑上结构性够不着——屋内中心
+     * 到角柱水平 dist²=12.5＞10.24、屋顶在脚上 3 层 dy=-3＜-1，火柴盒按
+     * 原口径永远砌不完（boot-farm22/23 双实证：放置 0、逐格跳过）。
+     * 建造口径按原版眼高 1.62＋手臂够格 ~4.5 格核算：水平 ≤3.6 格
+     * （角柱 12.5≤12.96）、向上够 4 层（站屋内砌屋顶 dy=-3）、向下 2 层。
+     */
+    private boolean buildInReach(BlockPos pos) {
+        double dx = npc.getX() - (pos.getX() + 0.5D);
+        double dz = npc.getZ() - (pos.getZ() + 0.5D);
+        double dy = npc.getY() - pos.getY();
+        return dx * dx + dz * dz <= 12.96D && dy >= -4.0D && dy <= 2.0D;
+    }
+
     /** 走到动作格旁边的落脚格（优先土格四邻的实心非田格；没有就直奔土格，goto 自己找落点）。 */
     private void farmGotoStandFor(FarmAction action) {
         BlockPos soil = ("harvest".equals(action.kind()) || "bonemeal".equals(action.kind()))
@@ -3107,7 +3122,7 @@ public final class GoalExecutor {
             return true;
         }
         BlockPos cell = baseQueue.get(0);
-        if (!farmInReach(cell)) {
+        if (!buildInReach(cell)) {
             // 去屋内中心站位；反复到不了位则换内圈邻格，再不行放弃这一格。
             String key = "base-stand";
             if (key.equals(baseLastActionKey)) {
@@ -3124,13 +3139,12 @@ public final class GoalExecutor {
                 return false;
             }
             BlockPos stand = new BlockPos(baseCenter.getX(), baseCenter.getY() + 1, baseCenter.getZ());
-            // 【fix64】到达判定改水平+脚位容差：旧口径 distSqr(stand)>1.0 中
-            // stand 的 Y 是室内脚位（地表+1）、身体方块 Y 低一层，完美站位
-            // dist² 恒 =1.0，任何漂移都 >1 → 每 tick 重发移动、永远不落位
-            // （boot-farm22 水边址放大成游泳循环，干地同样有微移动空转）。
-            double sdx = npc.getX() - (stand.getX() + 0.5D);
-            double sdz = npc.getZ() - (stand.getZ() + 0.5D);
-            boolean atStand = sdx * sdx + sdz * sdz <= 1.44D
+            // 【fix64→fix65 收紧】到达判定须精确到站位列：建造够格（buildInReach）
+            // 按屋内中心算，偏一列远角格就脱距（boot-farm23 实证：松口径
+            // 1.44 在邻列低一格误判到达，墙体逐格够不着被跳）。改方块列
+            // 一致 + 脚位差 ≤1.0（站位 Y 是室内脚位、身体低一层属正常）。
+            boolean atStand = npc.blockPosition().getX() == stand.getX()
+                    && npc.blockPosition().getZ() == stand.getZ()
                     && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
             if (!atStand) {
                 moveToStand(stand, baseActionStuck, "[BASE]");
@@ -3264,10 +3278,9 @@ public final class GoalExecutor {
                     return;
                 }
                 BlockPos stand = base.anchor();
-                // 【fix64】同 processBaseQueue：水平+脚位容差判定，免 dist² 恒 ≥1 空转。
-                double bdx = npc.getX() - (stand.getX() + 0.5D);
-                double bdz = npc.getZ() - (stand.getZ() + 0.5D);
-                boolean bedAtStand = bdx * bdx + bdz * bdz <= 1.44D
+                // 【fix65】同 processBaseQueue：站位须精确到列 + 脚位差 ≤1.0。
+                boolean bedAtStand = npc.blockPosition().getX() == stand.getX()
+                        && npc.blockPosition().getZ() == stand.getZ()
                         && Math.abs(npc.getY() - stand.getY()) <= 1.0D;
                 if (!bedAtStand) {
                     moveToStand(stand, bedActionStuck, "[BED]");
