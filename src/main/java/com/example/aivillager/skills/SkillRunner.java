@@ -1693,6 +1693,11 @@ public final class SkillRunner {
              */
             private int airTotalRounds;
             /**
+             * 【fix113b】本段无目标悬空是否已用过死线复位：落地（onGround）
+             * 即清零，保证每段悬空只有第一次死线先复位、之后照旧放行。
+             */
+            private boolean airRecentered;
+            /**
              * 【fix94】泡水累计轮数（本 descend 内）：真步数推进时清零。
              * descend 是挖楼梯、不是游泳——入口选在湖/河里时身体会长期泡水，
              * 旧口径靠步数看门狗单次磨 3 分钟、dig 再重派同点，farm54 实证
@@ -1852,6 +1857,26 @@ public final class SkillRunner {
                                 + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
                                 + " pos=" + npc.blockPosition().toShortString());
                     }
+                    // 【fix113b】悬空死线先复位：无目标悬空满 30 秒多半是身体
+                    // 楔在台地/洞壁边缘（farm77 洞穴口袋三连实证：死线放行后
+                    // 主步从楔住站位开挖、结算全是幻影步，只能等真降看门狗
+                    // 90 秒收口）。死线触发时先给一次横移站回有支撑实地的
+                    // 机会（与 fix113 结算分支复位同药、不同触发点）：成功
+                    // 清悬空计数、本 tick 收手，主步下一 tick 从实地重评；
+                    // 无路或本段悬空已用过，才走下面原强制放行（兜底不缺位）。
+                    if (airTotalRounds == 201 && !airRecentered
+                            && descendRecenterFromEdge(npc.blockPosition())) {
+                        airRecentered = true;
+                        airGateRounds = 0;
+                        airTotalRounds = 0;
+                        airGateMinY = Double.NaN;
+                        airGateMaxY = Double.NaN;
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 悬空超 30 秒死线，先复位站稳 | y="
+                                + String.format(java.util.Locale.ROOT, "%.2f", npc.getY())
+                                + " pos=" + npc.blockPosition().toShortString());
+                        return;
+                    }
                     // 【第四十一轮】悬空总死线：窗口快路走不通时，累计悬空约
                     // 30 秒（200 轮）强制放行，不再满 3 分钟步数看门狗当活靶子。
                     if (airTotalRounds == 201) {
@@ -1868,6 +1893,7 @@ public final class SkillRunner {
                     airTotalRounds = 0;
                     airGateMinY = Double.NaN;
                     airGateMaxY = Double.NaN;
+                    airRecentered = false;
                 }
                 landWaitRounds = 0;
                 if (lastTarget != null) {
