@@ -168,6 +168,12 @@ public final class ProgressionPlanner {
      * 猎物回来达标即清零。40 这个向导值本身一字不改。 */
     private int reserveFailStreak;
     private long reserveBackoffUntil;
+    /** 【fix103】专程回程补给专属连败与退避 + 在途标记：与 fix98 同款自己
+     * 记账（travel 单趟以分钟计，退避 120 秒×连败、上限 600 秒）；在途标记
+     * 只为到达专行日志（回到目标 48 格内打一行、清标记）。 */
+    private int homeReturnFailStreak;
+    private long homeReturnBackoffUntil;
+    private boolean homeReturnActive;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -443,6 +449,22 @@ public final class ProgressionPlanner {
                 } else {
                     reserveFailStreak = 0;
                     reserveBackoffUntil = 0L;
+                }
+            }
+            // 【fix103】回程补给专属连败记账（独立于 else-if 链，只认阶段名
+            // 「回程补给」）：travel 被看门狗处决/失败 → 退避，别刚到不了就
+            // 立刻再派同一趟长途；成功清零。在途标记失败时一并清掉，防 NPC
+            // 日后因别的原因漂进 48 格时误报到达。
+            if ("回程补给".equals(lastStage)) {
+                if (goalFailed) {
+                    homeReturnFailStreak++;
+                    homeReturnBackoffUntil = now + Math.min(600_000L, 120_000L * homeReturnFailStreak);
+                    homeReturnActive = false;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 回程补给退避 | 连败=" + homeReturnFailStreak
+                            + " 退避秒=" + (homeReturnBackoffUntil - now) / 1000L);
+                } else {
+                    homeReturnFailStreak = 0;
+                    homeReturnBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -901,6 +923,59 @@ public final class ProgressionPlanner {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 随身口粮见底，先补口粮 | foodNutrition=0");
                 return goal("补随身口粮", "hunt",
                         params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
+            }
+        }
+
+        // 6.65) 【fix103】专程回程补给（地理分离定案）：tend/store/安置床/
+        // 睡觉全是 ≤48 格「顺路触发、不专程跑」，活动中心漂远后（西区荒芜
+        // 带 ↔ 东区猎场 ↔ 农场/锚点三地分立，farm61/62 实证两小时无一顺路
+        // 步派发）nutrition 钉死个位数、下界入境闸（fix96）正当地拦着主线，
+        // 却没有任何步会带它回家——真玩家口粮见底会专程回农场/家里补给。
+        // 本步只补 krit 这一档，不动日常顺路 doctrine：距补给点 >48 格、
+        // nutrition 跌破入境闸量级（<20）、且（≤12 krit 线（fix79 物资门
+        // 同值）或储备 hunt 专属连败 ≥2（本地补给已被实证打不着））才专程
+        // 回一趟；白天派（夜里长途是 #7/#8/#9 死型），地下先回地表。
+        // 目标点：有农场先回农场（口粮源头），没农场回落脚点锚点。到达
+        // 48 格内本步自动停火，tend/store/安置床顺路链自然接管。
+        if (planHas(StagePlan.FOOD)
+                && System.currentTimeMillis() >= homeReturnBackoffUntil) {
+            com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.FarmMemory.Farm homeFarm =
+                    com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base homeBase =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            BlockPos homeTarget = homeFarm != null ? homeFarm.anchor()
+                    : (homeBase != null ? homeBase.anchor() : null);
+            if (homeTarget != null) {
+                double homeDx = homeTarget.getX() + 0.5D - npc.getX();
+                double homeDz = homeTarget.getZ() + 0.5D - npc.getZ();
+                double homeDist = Math.sqrt(homeDx * homeDx + homeDz * homeDz);
+                if (homeDist <= 48.0D) {
+                    if (homeReturnActive) {
+                        homeReturnActive = false;
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 回程补给到达 | 目标=" + (homeFarm != null ? "农场" : "落脚点")
+                                + " 距离=" + Math.round(homeDist)
+                                + " foodNutrition=" + foodNutrition()
+                                + "（tend/store/安置床顺路链接管）");
+                    }
+                } else if (!isNight() && foodNutrition() < 20
+                        && (foodNutrition() <= 12 || reserveFailStreak >= 2)) {
+                    if (underground()) {
+                        return skill("回程补给：先回地表", "ascend");
+                    }
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 回程补给触发 | 目标=" + (homeFarm != null ? "农场" : "落脚点")
+                            + " " + homeTarget.toShortString()
+                            + " 距离=" + Math.round(homeDist)
+                            + " foodNutrition=" + foodNutrition()
+                            + " reserveFailStreak=" + reserveFailStreak);
+                    homeReturnActive = true;
+                    return goal("回程补给", "travel",
+                            params("x", homeTarget.getX(), "y", homeTarget.getY(),
+                                    "z", homeTarget.getZ()));
+                }
             }
         }
 
