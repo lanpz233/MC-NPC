@@ -153,6 +153,10 @@ public final class GoalExecutor {
     private int handledObsidianSeq = -1;
     /** 【fix100】浇铸目标内 descend 连续失败计数：攒满 3 次即收场交规划层补镐。 */
     private int obsidianDescendFails;
+    /** 【fix111】找岩浆走廊方向（弧度，NaN=本目标未定）：随机换位互相
+     * 抵消（farm73 实证整轮净位移约 2 格），改每目标定一个方向沿走廊
+     * 直进、新目标重新定方向（等效换区）。 */
+    private double lavaSearchDir = Double.NaN;
     /** 【fix105】黑曜石路线：false=挖矿主路（mineobsidian），true=浇铸兜底（castobsidian）。 */
     private boolean obsidianRouteCasting;
     private int obsidianRouteFails;
@@ -614,6 +618,7 @@ public final class GoalExecutor {
         bedLastActionKey = "";
         sleepPhase = 0;
         obsidianDescendFails = 0;
+        lavaSearchDir = Double.NaN;
         obsidianRouteCasting = false;
         obsidianRouteFails = 0;
         obsidianRouteLogged = false;
@@ -4683,24 +4688,33 @@ public final class GoalExecutor {
     /**
      * 【fix110】找岩浆源专用换位：扫描半径 24 格时，通用 wander 的 4–9 格
      * 小跳与上次扫描重叠约九成，干岩区里挪不动（farm72 实证：Y=-52 随机
-     * 挪窝 5 分钟、attempts 没攒满先被目标看门狗处决）。照扫描直径跳
-     * 28→20→12 格逐级试（每级 3 个随机方向），全败落回通用 wander 兜底。
+     * 挪窝 5 分钟、attempts 没攒满先被目标看门狗处决）。
+     * 【fix111】随机方向仍不行：farm73 实证大跳虽获接受、方向随机互相
+     * 抵消，整轮 344 秒净位移约 2 格。改走廊式：本目标定一个方向
+     * （start 时重置、新目标换方向等效换区），每跳沿该方向 18 格，
+     * 正前方走不通依次试 ±45°、±90°，只有反向跳成功才把走廊翻转。
      */
     private void wanderForLava() {
-        double[] distances = {28.0D, 20.0D, 12.0D};
-        for (double distance : distances) {
-            for (int attempt = 0; attempt < 3; attempt++) {
-                double angle = java.util.concurrent.ThreadLocalRandom.current()
-                        .nextDouble() * Math.PI * 2.0D;
-                JsonObject params = new JsonObject();
-                params.addProperty("x", npc.getX() + Math.cos(angle) * distance);
-                params.addProperty("z", npc.getZ() + Math.sin(angle) * distance);
-                if (skills.run(new Intent("", "goto", params), "目标")) {
-                    LOG.info("[AIV][GOAL] " + npc.npcName()
-                            + " 附近没有岩浆源，换个位置寻找 accepted=true 距离="
-                            + String.format(Locale.ROOT, "%.1f", distance) + "（fix110）");
-                    return;
+        if (Double.isNaN(lavaSearchDir)) {
+            lavaSearchDir = java.util.concurrent.ThreadLocalRandom.current()
+                    .nextDouble() * Math.PI * 2.0D;
+        }
+        double[] offsets = {0.0D, Math.PI / 4.0D, -Math.PI / 4.0D,
+                Math.PI / 2.0D, -Math.PI / 2.0D, Math.PI};
+        for (double offset : offsets) {
+            double angle = lavaSearchDir + offset;
+            JsonObject params = new JsonObject();
+            params.addProperty("x", npc.getX() + Math.cos(angle) * 18.0D);
+            params.addProperty("z", npc.getZ() + Math.sin(angle) * 18.0D);
+            if (skills.run(new Intent("", "goto", params), "目标")) {
+                if (Math.abs(offset) >= Math.PI / 2.0D) {
+                    lavaSearchDir = angle;
                 }
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " 附近没有岩浆源，沿走廊换位 accepted=true 距离=18.0"
+                        + " 方向=" + String.format(Locale.ROOT, "%.2f", lavaSearchDir)
+                        + "（fix111）");
+                return;
             }
         }
         wander();
