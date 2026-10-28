@@ -148,6 +148,15 @@ public final class ProgressionPlanner {
      * 在地表反复抢钻石主线；退避到期再试。 */
     private int bucketFillFailStreak;
     private long bucketFillBackoffUntil;
+    /** 【fix88】步 10「挖铁」专属连败与退避：该步是早期补 8 锭的老口径
+     * （够镐+剑+余量），钻石时代只剩补仓价值，却排在步 11 保镐门与 13.1
+     * 钻石甲之前——farm47 实证这片水涝贫铁矿区挖铁三连 0/4、步 10 每轮
+     * 重派，钻石 ×10 够护腿却被 4 锭缺口无限期挡住。与 Fong「常备数是
+     * 软向导、不许硬指标卡进度」冲突：连败退避让位主线，退避到期再补
+     * （补仓本职已有步 13.3 在主线后兜底；保镐安全门步 11 不受影响）。
+     * 与皮革/存箱同口径自己记账（共享连败会被中间的补石镐成功清零）。 */
+    private int ironStepFailStreak;
+    private long ironStepBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -398,6 +407,17 @@ public final class ProgressionPlanner {
                 } else {
                     bucketFillFailStreak = 0;
                     bucketFillBackoffUntil = 0L;
+                }
+            } else if ("挖铁".equals(lastStage)) {
+                // 【fix88】步 10 专属退避记账（理由见字段注释）。
+                if (goalFailed) {
+                    ironStepFailStreak++;
+                    ironStepBackoffUntil = now + Math.min(300_000L, 60_000L * ironStepFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 挖铁退避 | 连败=" + ironStepFailStreak
+                            + " 退避秒=" + (ironStepBackoffUntil - now) / 1000L);
+                } else {
+                    ironStepFailStreak = 0;
+                    ironStepBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -1256,7 +1276,13 @@ public final class ProgressionPlanner {
 
         // 10) 铁矿石（原第 8 步，【第三十四轮】顺延）：石镐就能挖，Y=16 附近最密集。
         // 【第二十二轮】同理按存量差额：生铁+铁锭合计补到 8（够镐+剑+余量）。
-        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe) {
+        // 【fix88】连败退避中跳过本步：补 8 锭是早期口径，钻石时代（剑/甲已
+        // 钻石化、保镐门在步 11 独立把关）它只剩补仓价值；farm47 实证水涝贫
+        // 铁区三连 0/4 时它每轮重派、把 13.1 钻石甲（钻石 ×10 够护腿）无限
+        // 期挡住——违 Fong「常备数软向导、不许硬指标卡进度」。退避让位主
+        // 线（补仓另有步 13.3 在主线后兜底），退避到期照常重试。
+        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe
+                && System.currentTimeMillis() >= ironStepBackoffUntil) {
             return goal("挖铁", "dig",
                     params("resource", "iron", "count", 8 - rawIron - ingots));
         }
