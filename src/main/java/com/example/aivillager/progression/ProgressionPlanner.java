@@ -1533,7 +1533,18 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.SUSTAIN) && !lateStagesEnabled) {
             return sustainStep(food, hasSword, wood);
         }
-        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12) {
+        // 【fix96·审计C】入境口粮软闸：步 13 储备（目标营养 40）排在本段之前，
+        // 白天路径营养已被顶住；漏口在夜里——步 13 被夜晚总闸只记日志跳过、
+        // 直落本段带着低口粮建门/进门，下界没有计划内食物来源。整段加软闸：
+        // food<14 或随身营养 <20 时本轮不派下界链（落到后续维持步，补给步在
+        // 前序/天亮后自会把口粮顶上来），与 fix86 下矿口粮门同族、只拦不锁。
+        boolean netherFoodOk = npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20;
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && !netherFoodOk) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " [NETHER] 入境口粮软闸未过，本轮不派下界链 | food="
+                    + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
+                    + "（需 food>=14 且 nutrition>=20）");
+        }
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && netherFoodOk) {
             // 【fix93·D8】下界金装闸：Fong 定下界必穿一件金装（猪灵只认
             // 身上的金子，没穿的当入侵者围殴）。金靴最便宜（4 锭），定为
             // 指定件：脚上/包里都没有金靴时，先烧金、做金靴、缺料挖金，

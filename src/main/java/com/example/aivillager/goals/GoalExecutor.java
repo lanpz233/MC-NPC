@@ -4456,6 +4456,23 @@ public final class GoalExecutor {
                     finish("缺少打火石，无法点燃传送门");
                     return;
                 }
+                // 【fix96·审计B】有落脚点账本时门建在锚点附近：浇铸收工点在
+                // Y≈-52 岩浆湖边，就地选址门必然建在地下湖边（回程落点深、
+                // 下界侧贴岩浆海）；玩家是背黑曜石回家门口建门。照 fix82
+                // 先就位后选位：距锚点水平 >16 格先 moveToStand 回锚点
+                // （竖直对齐/travel 编排由它管），到位后选址中心自然落在锚点一带。
+                BaseMemory.bindWorld(npc.level());
+                BaseMemory.Base portalBase = BaseMemory.base(npc.npcName());
+                if (portalBase != null) {
+                    BlockPos anchor = portalBase.anchor();
+                    double dxa = npc.getX() - (anchor.getX() + 0.5D);
+                    double dza = npc.getZ() - (anchor.getZ() + 0.5D);
+                    if (dxa * dxa + dza * dza > 16.0D * 16.0D) {
+                        status = "先回落脚点附近建门 | 锚点=" + anchor.toShortString();
+                        moveToStand(anchor, 99, "[PORTAL]");
+                        return;
+                    }
+                }
                 PortalSite site = findPortalSite();
                 if (site == null) {
                     attempts++;
@@ -4493,6 +4510,11 @@ public final class GoalExecutor {
             case 2 -> {
                 if (portalOrigin == null) {
                     finish("传送门选址丢失");
+                    return;
+                }
+                // 【fix96·审计C】进门执行层口粮兜底（规划层同口径软闸在前）。
+                if (!inNetherDim() && !netherFoodGateOk()) {
+                    finish("进门中止：口粮不足（入境软闸 food>=14 且 nutrition>=20）");
                     return;
                 }
                 // 【fix93·D8】自建门走进去之前同样过金装闸（主世界侧）。
@@ -4534,6 +4556,11 @@ public final class GoalExecutor {
         return npc.level().dimension().identifier().toString().contains("the_nether");
     }
 
+    /** 【fix96·审计C】入境口粮软闸的执行层口径（与规划层同值）：饱食条与随身营养双过线。 */
+    private boolean netherFoodGateOk() {
+        return npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20;
+    }
+
     /**
      * 【fix93·D8】进门前把金靴换到脚上：主世界侧 AutoArmor 按防御分穿
      * 最好的靴子，金靴（防御 1）永远轮不到——进下界前必须强制换装，
@@ -4564,6 +4591,11 @@ public final class GoalExecutor {
         BlockPos portal = nearbyPortal();
         if (portal == null) {
             finish("附近找不到已点亮的传送门");
+            return;
+        }
+        // 【fix96·审计C】进门执行层口粮兜底（规划层同口径软闸在前）。
+        if (!inNetherDim() && !netherFoodGateOk()) {
+            finish("进门中止：口粮不足（入境软闸 food>=14 且 nutrition>=20）");
             return;
         }
         // 【fix93·D8】主世界侧进门先过金装闸（下界内回程不拦）。
