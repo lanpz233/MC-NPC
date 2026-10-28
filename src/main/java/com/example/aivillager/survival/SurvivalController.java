@@ -1455,7 +1455,12 @@ public final class SurvivalController {
         // 贴身封锁（5 格内有敌 + 举盾 isUsingItem 双锁），food 13→0 零进食、
         // 饿到不能疾跑后被僵尸追上。有即食时抢吃一口（32 tick）换回疾跑
         // 能力，净收益为正：绕过贴身封锁；正举盾先放盾（不放盾吃不了）。
-        boolean desperate = npc.getFoodData().getFoodLevel() <= 6;
+        // 【fix87】第二把钥匙：低血（≤35% 惜命线）且 food<18 回不上血时同为
+        // 危险线——farm46 实证 hp=5.8 时 food 在 6–9 徘徊、种苗被留种守卫锁
+        // 在抢吃线外，永远回不了血。低血优先于留种：先吃到能回血再说。
+        boolean desperate = npc.getFoodData().getFoodLevel() <= 6
+                || (npc.getHealth() <= LOW_HEALTH_THRESHOLD
+                    && npc.getFoodData().getFoodLevel() < 18);
         if (onlyWhenSafe && !desperate && hasEnemyWithin(FORCE_DEFEND_RANGE_SQ)) {
             return;
         }
