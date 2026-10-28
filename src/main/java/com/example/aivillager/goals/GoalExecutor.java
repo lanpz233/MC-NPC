@@ -157,6 +157,12 @@ public final class GoalExecutor {
      * 抵消（farm73 实证整轮净位移约 2 格），改每目标定一个方向沿走廊
      * 直进、新目标重新定方向（等效换区）。 */
     private double lavaSearchDir = Double.NaN;
+    /** 【fix112】坏岩浆提示点（本目标内）：目标层扫描只认岩浆源方块、
+     * 不问露面与落脚，技能层到场才发现挖不了/站不住（farm74 实证同一
+     * 坏点连喂 6 次、3 秒烧光两路连败计数）。技能以「未挖到/没有落脚点」
+     * 失败时把派单提示点拉黑，扫描跳过它换下一个源；有进账清账。 */
+    private final java.util.Set<BlockPos> badLavaHints = new java.util.HashSet<>();
+    private BlockPos lastObsidianHint;
     /** 【fix105】黑曜石路线：false=挖矿主路（mineobsidian），true=浇铸兜底（castobsidian）。 */
     private boolean obsidianRouteCasting;
     private int obsidianRouteFails;
@@ -619,6 +625,8 @@ public final class GoalExecutor {
         sleepPhase = 0;
         obsidianDescendFails = 0;
         lavaSearchDir = Double.NaN;
+        badLavaHints.clear();
+        lastObsidianHint = null;
         obsidianRouteCasting = false;
         obsidianRouteFails = 0;
         obsidianRouteLogged = false;
@@ -4553,7 +4561,17 @@ public final class GoalExecutor {
                     || (outcome.contains("mined=") && !outcome.contains("mined=0")));
             if (got) {
                 obsidianRouteFails = 0;
+                badLavaHints.clear(); // 【fix112】有进账说明地形已变，坏点清账
                 return;
+            }
+            // 【fix112】提示点质量失败（没露面/没落脚点）：拉黑本次派单点，
+            // 目标扫描换下一个源——同一坏点不许连烧连败计数（farm74 实证
+            // 同点 6 次 3 秒烧光两路）。
+            if ((outcome.contains("未挖到") || outcome.contains("没有落脚点"))
+                    && lastObsidianHint != null && badLavaHints.add(lastObsidianHint)) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 坏岩浆提示点拉黑 | pos="
+                        + lastObsidianHint.toShortString() + " outcome=" + outcome
+                        + "（fix112）");
             }
             obsidianRouteFails++;
             LOG.info("[AIV][GOAL] " + npc.npcName() + " 黑曜石路线失败计数 | fails="
@@ -4664,6 +4682,7 @@ public final class GoalExecutor {
 
         BlockPos lava = nearbyLavaSource(24, 8);
         if (lava != null) {
+            lastObsidianHint = lava; // 【fix112】记下派单点，失败时拉黑用
             JsonObject params = params("x", lava.getX(), "y", lava.getY(), "z", lava.getZ());
             boolean started;
             if (obsidianRouteCasting) {
@@ -5408,6 +5427,9 @@ public final class GoalExecutor {
             BlockState state = npc.level().getBlockState(pos);
             if (!state.is(Blocks.LAVA) || !state.getFluidState().isSource()) {
                 continue;
+            }
+            if (badLavaHints.contains(pos)) {
+                continue; // 【fix112】技能已判此源不可用的，不再重复派单
             }
             double distanceSq = center.distSqr(pos);
             if (distanceSq < bestSq) {
