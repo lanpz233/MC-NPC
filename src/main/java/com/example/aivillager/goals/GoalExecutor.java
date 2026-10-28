@@ -4677,6 +4677,32 @@ public final class GoalExecutor {
             finish("找不到岩浆源，黑曜石失败 " + have + "/" + targetCount);
             return;
         }
+        wanderForLava();
+    }
+
+    /**
+     * 【fix110】找岩浆源专用换位：扫描半径 24 格时，通用 wander 的 4–9 格
+     * 小跳与上次扫描重叠约九成，干岩区里挪不动（farm72 实证：Y=-52 随机
+     * 挪窝 5 分钟、attempts 没攒满先被目标看门狗处决）。照扫描直径跳
+     * 28→20→12 格逐级试（每级 3 个随机方向），全败落回通用 wander 兜底。
+     */
+    private void wanderForLava() {
+        double[] distances = {28.0D, 20.0D, 12.0D};
+        for (double distance : distances) {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                double angle = java.util.concurrent.ThreadLocalRandom.current()
+                        .nextDouble() * Math.PI * 2.0D;
+                JsonObject params = new JsonObject();
+                params.addProperty("x", npc.getX() + Math.cos(angle) * distance);
+                params.addProperty("z", npc.getZ() + Math.sin(angle) * distance);
+                if (skills.run(new Intent("", "goto", params), "目标")) {
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " 附近没有岩浆源，换个位置寻找 accepted=true 距离="
+                            + String.format(Locale.ROOT, "%.1f", distance) + "（fix110）");
+                    return;
+                }
+            }
+        }
         wander();
     }
 
