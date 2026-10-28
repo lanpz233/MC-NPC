@@ -157,6 +157,17 @@ public final class ProgressionPlanner {
      * 与皮革/存箱同口径自己记账（共享连败会被中间的补石镐成功清零）。 */
     private int ironStepFailStreak;
     private long ironStepBackoffUntil;
+    /** 【fix98】步 13「储备食物」专属连败与退避：与 fix88 挖铁同病同治——储备
+     * 40 是 Fong 定的顺路型软向导，却排在 13.5 下界链之前白天必派 hunt；出生点/
+     * 农场一带动物被猎稀后 hunt 趟趟全灭（farm57/58 实证：半径 32/48、escalate
+     * 远走 64 格仍零猎物，常驻加载区块被动生物刷新近乎为零=结构性枯竭），
+     * nutrition 在 12–32 磨耗、下界主线被无限期堵死，与「软向导不许硬卡进度」
+     * 冲突。自己记账（共享连败会被中间 tend 成功冲掉）：失败退避 120 秒×连败、
+     * 上限 600 秒（≈一个白昼窗口），退避中让位主线（13.5 自有 fix96 入境口粮
+     * 软闸、安全型步 0/6.6 在步 13 之前，均不受影响）；退避到期重试储备，
+     * 猎物回来达标即清零。40 这个向导值本身一字不改。 */
+    private int reserveFailStreak;
+    private long reserveBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -418,6 +429,20 @@ public final class ProgressionPlanner {
                 } else {
                     ironStepFailStreak = 0;
                     ironStepBackoffUntil = 0L;
+                }
+            }
+            // 【fix98】储备食物专属连败记账（独立于 else-if 链，只认目标层结果、
+            // 只认阶段名恰为「储备食物」——安稳维持的同名步不走这条链，不冲账）。
+            if ("储备食物".equals(lastStage)) {
+                if (goalFailed) {
+                    reserveFailStreak++;
+                    reserveBackoffUntil = now + Math.min(600_000L, 120_000L * reserveFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备退避 | 连败=" + reserveFailStreak
+                            + " 退避秒=" + (reserveBackoffUntil - now) / 1000L
+                            + " foodNutrition=" + foodNutrition());
+                } else {
+                    reserveFailStreak = 0;
+                    reserveBackoffUntil = 0L;
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -1505,6 +1530,12 @@ public final class ProgressionPlanner {
             // 猎，落到补仓/维持步，天亮再补。挨饿急救走步 0/6.6，不经这里。
             if (isNight() && !underground()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 食物储备 hunt 夜里跳过（夜晚总闸） | foodNutrition=" + foodNutrition());
+            } else if (System.currentTimeMillis() < reserveBackoffUntil) {
+                // 【fix98】储备 hunt 连败退避中：软向导让位主线，落到 13.3 补仓/
+                // 13.5 下界链（入境口粮由 fix96 软闸另行把关）；退避到期回步 13 重试。
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备食物退避中，让位主线 | 连败=" + reserveFailStreak
+                        + " 退避余秒=" + (reserveBackoffUntil - System.currentTimeMillis()) / 1000L
+                        + " foodNutrition=" + foodNutrition());
             } else {
                 return goal("储备食物", "hunt",
                         params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
