@@ -888,6 +888,10 @@ public final class SurvivalController {
             if (!(bedState.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床账本在但床已不在（被拆/被换），回落世界出生点 | bed="
                         + foot.getX() + "," + foot.getY() + "," + foot.getZ());
+                // 【fix99】顺手失效 stale 床账本：不然账本一直记着假床位，
+                // 规划层 6.76 凭 bedPos!=null 永不重派安置，床链永久悬空。
+                // 失效后白天即可凭包里的床重走 place_bed。
+                BaseMemory.clearBed(npc.npcName());
                 return null;
             }
             // 床占两格：按 PART 定出另一格（账本存的是脚格，此处对头格同样成立）；两格四邻逐个试站位。

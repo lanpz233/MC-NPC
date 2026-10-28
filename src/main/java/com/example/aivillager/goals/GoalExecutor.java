@@ -3301,6 +3301,12 @@ public final class GoalExecutor {
         return null;
     }
 
+    /** 【fix99】账本床位验真：该格仍是床块（任一半）才算床还在。 */
+    private boolean bedStillThere(BlockPos bedPos) {
+        return npc.level().getBlockState(bedPos).getBlock()
+                instanceof net.minecraft.world.level.block.BedBlock;
+    }
+
     /** 床格可放：本格空/植被无流体，且脚下是实心（屋内地面）。 */
     private boolean bedCellFree(BlockPos pos) {
         BlockState state = npc.level().getBlockState(pos);
@@ -3381,8 +3387,17 @@ public final class GoalExecutor {
             return;
         }
         if (base.bedPos() != null) {
-            finish("床已安置（账本已有记录）");
-            return;
+            // 【fix99】账本有床先验真：床被挖掉/被拆后账本是 stale 的，
+            // 假报"已安置"会让重生点与睡眠永久悬空（且 sleep 只在距床
+            // 32 格内才派，远处 stale 账本可能长期没人验）。不在→失效
+            // 账本后照常往下走安置（床多半已回包）。
+            if (bedStillThere(base.bedPos())) {
+                finish("床已安置（账本已有记录）");
+                return;
+            }
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 账本床位已空，失效后重走安置 | bed="
+                    + base.bedPos().toShortString());
+            BaseMemory.clearBed(npc.npcName());
         }
         switch (bedPhase) {
             case 0 -> {
@@ -3538,6 +3553,20 @@ public final class GoalExecutor {
         }
         BlockPos bed = base.bedPos();
         BlockPos anchor = base.anchor();
+        // 【fix99】先验床还在：farm59 实证床头被自救挖掘挖掉后，本目标仍对
+        // 已成空气的 bedPos 调 startSleepInBed，ServerPlayer 读 BedBlock.PART
+        // 抛 IAE（Leaves 抑制为 UpdateSuppressionException），safeTick 每 tick
+        // 吞下刷屏、目标卡死等看门狗处决。床没了→失效账本（床已回包，
+        // place_bed 可重走安置）+ 优雅收场，不许再碰 startSleepInBed。
+        if (!bedStillThere(bed)) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 床已不在，失效账本 | bed="
+                    + bed.toShortString() + " state="
+                    + BuiltInRegistries.BLOCK.getKey(
+                            npc.level().getBlockState(bed).getBlock()).getPath());
+            BaseMemory.clearBed(npc.npcName());
+            finish("睡觉放弃：床已不在（账本已失效，待重新安置）");
+            return;
+        }
         switch (sleepPhase) {
             case 0 -> {
                 status = "睡觉：回床边";

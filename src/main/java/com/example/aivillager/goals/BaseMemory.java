@@ -146,6 +146,24 @@ data.bedZ = bedFoot.getZ();
 writeData(npcName, data);
 }
 
+/** 床已不在时失效床账本（fix99）：farm59 实证床被自救挖掘挖掉后账本仍
+ * 记着旧床位，tickSleep 对空气格 startSleepInBed 抛 IAE 卡死刷屏。
+ * 只清 hasBed，锚点/箱子/世界沿用现有记录；床多半已回包，
+ * 规划层凭 bedPos==null + 包里有床会重走 place_bed 安置。 */
+public static void clearBed(String npcName) {
+if (folder == null) {
+return;
+}
+BaseData data = readData(npcName);
+if (data == null ||!worldKey().equals(data.world)) {
+LOG.warning("[AIV][BASE] 失效床账本失败：无本世界落脚点记录 " + npcName);
+return;
+}
+data.hasBed = false;
+writeData(npcName, data);
+LOG.info("[AIV][BASE] 床账本已失效（床已不在） " + npcName);
+}
+
 /** 安置箱子后落盘（fix69）：只更新箱子字段，锚点/床/世界沿用现有记录。 */
 public static void saveChest(String npcName, BlockPos chestPos) {
 if (folder == null) {

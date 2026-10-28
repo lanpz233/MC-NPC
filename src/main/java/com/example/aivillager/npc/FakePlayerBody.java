@@ -92,6 +92,8 @@ public final class FakePlayerBody extends ServerPlayer {
     private int toolLogCounter;
     /** fix44 守卫拒挖日志节流：技能收场前会反复试挖，10 秒最多打一行。 */
     private long lastTierGuardLogTick = -100000L;
+    /** fix99 床块守卫日志节流：卡住自救会反复试挖床格，10 秒最多打一行。 */
+    private long lastBedGuardLogTick = -100000L;
     /** 【第四十五轮】逃生后岩浆位置记忆：生存层接触岩浆时写入的最后一格 + tick。 */
     private BlockPos recentLavaCell;
     private long recentLavaTick = -100000L;
@@ -739,6 +741,21 @@ public final class FakePlayerBody extends ServerPlayer {
 
     /** 挖掘方块，返回是否成功。Survival 模式下会走正常掉落流程。 */
     public boolean mine(BlockPos pos) {
+        // 【fix99】床块永不挖：本方法是全插件唯一的 destroyBlock 包装，
+        // 身体层卡住自救、生存层窒息/卡块自救、技能层全部挖掘最终都过这里，
+        // 一处守卫全覆盖。farm59 实证：sleep phase 0 去锚点站位的直线路径穿过
+        // 自家床格，walk-stuck 自救把床头挖掉，随后 startSleepInBed 对空气格
+        // 抛 IAE、目标卡死刷屏。真玩家不会挖穿自家床，他家床同理——直接拒挖，
+        // 调用方按"挖不开"诚实改道/放弃。
+        BlockState targetState = this.level().getBlockState(pos);
+        if (targetState.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+            if (this.tickCount - lastBedGuardLogTick >= 200) {
+                lastBedGuardLogTick = this.tickCount;
+                log(npcName, "mine-bed-guard", "拒绝挖床块 " + targetState.getBlock()
+                        + " " + pos.toShortString());
+            }
+            return false;
+        }
         String before = this.level().getBlockState(pos).toString();
         // 【第二十三轮】工具损坏取证：动作前先记下主手工具，挖完比对（标准第 4 条）。
         ItemStack handBefore = this.getMainHandItem();
