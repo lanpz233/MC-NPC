@@ -5471,7 +5471,13 @@ public final class GoalExecutor {
             return;
         }
         int placed = buildShelter(material);
-        if (placed < SHELTER_BLOCKS) {
+        if (placed <= 0) {
+            // 【fix108】放置=0 = 站位周围根本没法下块（已建满/被占）：旧版按
+            // 「部分完成」成功口径收场，规划层连败被清零、每个 decide 都重派，
+            // farm70 实证整夜约 1 Hz 热循环（96+ 次）。0 块必须算失败，
+            // 交规划层小屋退避（同位置冷却、挪窝失效）；1 块起仍按部分完成。
+            finish("建造失败：站位周围无可放格，放置=0/" + SHELTER_BLOCKS);
+        } else if (placed < SHELTER_BLOCKS) {
             finish("建造部分完成：材料=" + material + " 放置=" + placed + "/" + SHELTER_BLOCKS);
         } else {
             finish("建造完成：材料=" + material + " 放置=" + placed);

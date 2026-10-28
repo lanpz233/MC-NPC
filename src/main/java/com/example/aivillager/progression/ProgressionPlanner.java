@@ -127,6 +127,14 @@ public final class ProgressionPlanner {
      * 开田注定连败，不能让它每轮 decide 都抢在铁线前面重试；退避到期再试。 */
     private int farmFailStreak;
     private long farmBackoffUntil;
+    /** 【fix108】夜间小屋专属连败退避 + 失败位置：build 放置=0 改判失败后
+     * （GoalExecutor.tickBuild），同一站位反复建不出来不能整夜重派
+     * （farm70 实证「部分完成 0/25」被当成功、96+ 次 1 Hz 热循环）。
+     * 失败记当前站位，冷却 min(600s, 120s×连败)；NPC 离开失败点 8 格外
+     * 视为换了站位、冷却失效（新营地照常能建）；成功清零。 */
+    private int shelterFailStreak;
+    private long shelterBackoffUntil;
+    private net.minecraft.core.BlockPos shelterFailPos;
     /** 【fix50】采集木头专属连败计数：木料安全线（步 6.5）的放行阀原读共享
      * failStreak，但采集失败后规划层总会先插一个 0.5 秒必成的合成步（补石镐），
      * 成功即把共享连败清零，放行阀永远凑不满 2——fix49 短验实证 NPC 在
@@ -405,6 +413,20 @@ public final class ProgressionPlanner {
                     bedFailStreak = 0;
                     bedBackoffUntil = 0L;
                 }
+            } else if ("夜间小屋".equals(lastStage)) {
+                // 【fix108】小屋失败退避：记站位、同位置冷却（见字段注释）。
+                if (goalFailed) {
+                    shelterFailStreak++;
+                    shelterBackoffUntil = now + Math.min(600_000L, 120_000L * shelterFailStreak);
+                    shelterFailPos = npc.blockPosition();
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 小屋退避 | 连败=" + shelterFailStreak
+                            + " 退避秒=" + (shelterBackoffUntil - now) / 1000L
+                            + " 位置=" + shelterFailPos.toShortString());
+                } else {
+                    shelterFailStreak = 0;
+                    shelterBackoffUntil = 0L;
+                    shelterFailPos = null;
+                }
             } else if ("回箱存物".equals(lastStage)) {
                 if (goalFailed) {
                     storeFailStreak++;
@@ -607,6 +629,14 @@ public final class ProgressionPlanner {
     private enum Kind { GOAL, SKILL }
 
     private record Step(String stage, Kind kind, Intent intent) {
+    }
+
+    /** 【fix108】夜间小屋是否在同位置冷却中（离开失败点 8 格外即失效）。 */
+    private boolean shelterCoolingDown() {
+        if (shelterFailPos == null || System.currentTimeMillis() >= shelterBackoffUntil) {
+            return false;
+        }
+        return npc.blockPosition().distSqr(shelterFailPos) < 64.0D;
     }
 
     /** 结果文本是否算"失败"（第十九轮抽出）：目标层与技能层共用同一套关键词。 */
@@ -876,7 +906,8 @@ public final class ProgressionPlanner {
         // 两死皆夜间地表补给——小屋原排第 14 步、主线没走完轮不到，夜里照样
         // 被派去地表打猎砍树）。与步 14 同条件、排位提前到木料/口粮补给步
         // 之前；步 14 保留作主线走完后的兜底。
-        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25) {
+        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25
+                && !shelterCoolingDown()) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
 
@@ -1765,7 +1796,8 @@ public final class ProgressionPlanner {
         }
 
         // 14) 夜晚没遮蔽就搭个 3x3 小屋：避免整夜被怪追着跑。
-        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25) {
+        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25
+                && !shelterCoolingDown()) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
 
