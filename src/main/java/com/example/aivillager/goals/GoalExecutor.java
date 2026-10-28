@@ -6073,16 +6073,64 @@ public final class GoalExecutor {
                     worstSlot = slot;
                 }
             }
+            boolean lastResortUsed = false;
+            if (worstSlot < 0) {
+                // 【fix90】二线兜底：一线（非关键物）挑不出受害者时——farm49
+                // 实证 36 格全是关键物（工具/护甲/矿石/口粮全在保护名单）、
+                // 兜底返回 0、合成产物无处落物「放不下」连败死循环。二线只对
+                // 大宗消耗料下手（煤/红石/燧石/种子/箭/青金石等，取最小堆），
+                // 硬保：一切耐久物（工具/武器/护甲）、一切能吃的、贵重锭料与
+                // 通关物（钻石/铁锭/金/珍珠/烈焰棒/黑曜石/桶/工作台/熔炉）、
+                // 火把与圆石族（fix89）。玩家满包做镐时也会先扔一把煤腾格。
+                for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+                    ItemStack stack = npc.getInventory().getItem(slot);
+                    if (stack.isEmpty() || slot == protectedPickaxe) {
+                        continue;
+                    }
+                    if (!isLastResortDroppable(stack)) {
+                        continue;
+                    }
+                    if (stack.getCount() < worstCount) {
+                        worstCount = stack.getCount();
+                        worstSlot = slot;
+                    }
+                }
+                lastResortUsed = worstSlot >= 0;
+            }
             if (worstSlot < 0) {
                 return freed;
             }
             ItemStack stack = npc.getInventory().getItem(worstSlot);
             int amount = stack.getCount();
             // 走统一的丢弃入口：那里会把拾取延迟设成永久，避免伪玩家两秒后又捡回来。
-            dropItems(worstSlot, amount, "背包塞满，兜底 " + pathOf(stack));
+            dropItems(worstSlot, amount, "背包塞满，兜底 " + pathOf(stack)
+                    + (lastResortUsed ? "（二线）" : ""));
             freed++;
         }
         return freed;
+    }
+
+    /** 【fix90】二线兜底可丢的大宗消耗料：非耐久、不能吃、不在硬保名单。
+     * 圆石族不在此列（fix89 已钉死永不扔）；名单外的大宗囤积（滴石块等）
+     * 天然落入本线——按最小堆挑，先小后大。 */
+    private boolean isLastResortDroppable(ItemStack stack) {
+        if (stack.isDamageableItem()) {
+            return false;
+        }
+        String path = pathOf(stack);
+        net.minecraft.world.item.Item item = item(path);
+        if (item != Items.AIR
+                && new ItemStack(item).get(net.minecraft.core.component.DataComponents.FOOD) != null) {
+            return false;
+        }
+        return switch (path) {
+            case "diamond", "iron_ingot", "gold_ingot", "raw_iron", "raw_gold",
+                    "ender_pearl", "ender_eye", "blaze_rod", "blaze_powder",
+                    "obsidian", "bucket", "water_bucket", "crafting_table",
+                    "furnace", "torch", "cobblestone", "cobbled_deepslate",
+                    "blackstone" -> false;
+            default -> true;
+        };
     }
 
     /** 主背包 0-35 里是否还有空槽。 */
