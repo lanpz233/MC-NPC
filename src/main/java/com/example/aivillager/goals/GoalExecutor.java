@@ -5909,7 +5909,13 @@ public final class GoalExecutor {
             case "stick" -> {
                 return 16;
             }
-            case "rotten_flesh", "spider_eye", "poisonous_potato", "pufferfish" -> {
+            // 【fix91】腐肉移出本组：Fong 定腐肉是应急口粮（平时不吃、
+            // 危险线才吃，见 SurvivalController.foodScore 的 fix91 分支），
+            // 盘点/规划/hunt 存量也都按食物记账——旧口径把它和蜘蛛眼等
+            // 真毒物同组保留=0，farm50 实证 NPC food=0/hp=8.8 时拾到的
+            // 唯一食物腐肉×2 在 9 秒后被配额裁剪整堆扔掉。移出后落
+            // default -1，与其他食物同格不裁剪。
+            case "spider_eye", "poisonous_potato", "pufferfish" -> {
                 return 0;
             }
             // 低阶工具/护甲：有更好的就丢，留着只会占槽位。

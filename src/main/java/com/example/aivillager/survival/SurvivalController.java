@@ -90,7 +90,6 @@ public final class SurvivalController {
      * 这里直接排除带负面效果的食物，宁可饿着等玩家给面包。
      */
     private static final Set<Item> HARMFUL_FOODS = Set.of(
-            Items.ROTTEN_FLESH,
             Items.SPIDER_EYE,
             Items.POISONOUS_POTATO,
             Items.PUFFERFISH,
@@ -1543,6 +1542,16 @@ public final class SurvivalController {
      */
     private int foodScore(ItemStack stack, boolean desperate) {
         if (stack.isEmpty() || HARMFUL_FOODS.contains(stack.getItem())) {
+            return -1;
+        }
+        // 【fix91】腐肉=Fong 定的应急口粮：原版吃下有 80% 概率挂 30 秒
+        // 饥饿效应、净收益差，平时不吃（本函数旧口径把它放进
+        // HARMFUL_FOODS 恒 -1，等于永远不吃）；但饿到危险线（desperate）
+        // 时它是真口粮——farm50 实证 food=0/hp=8.8 的 NPC 拾到腐肉×2，
+        // 抢吃轮不到（评分拉黑）、配额裁剪又整堆扔掉，捡食如没捡。
+        // 危险线时按下方原版公式计分（营养 4×2+饱和 1=9），有正经
+        // 食物时评分更高、照旧优先正经食物。
+        if (stack.is(Items.ROTTEN_FLESH) && !desperate) {
             return -1;
         }
         // 【fix49·D11 留种守卫】胡萝卜/生土豆是田里的种苗：已开田且背包存量
