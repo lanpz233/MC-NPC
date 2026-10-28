@@ -1450,20 +1450,34 @@ public final class SurvivalController {
         if (npc.getFoodData().getFoodLevel() >= threshold) {
             return;
         }
-        if (onlyWhenSafe && hasEnemyWithin(FORCE_DEFEND_RANGE_SQ)) {
+        // 【fix86】危险线抢吃：food≤6 已不能疾跑，被追时只会越饿越慢——farm44
+        // 死亡 #7 实证：包里胡萝卜×8（nutrition=27），夜间长途战斗链里进食被
+        // 贴身封锁（5 格内有敌 + 举盾 isUsingItem 双锁），food 13→0 零进食、
+        // 饿到不能疾跑后被僵尸追上。有即食时抢吃一口（32 tick）换回疾跑
+        // 能力，净收益为正：绕过贴身封锁；正举盾先放盾（不放盾吃不了）。
+        boolean desperate = npc.getFoodData().getFoodLevel() <= 6;
+        if (onlyWhenSafe && !desperate && hasEnemyWithin(FORCE_DEFEND_RANGE_SQ)) {
             return;
         }
         if (npc.isUsingItem()) {
-            // 原版正在进食，等它自然完成；这里不再重复触发使用。
-            return;
+            if (desperate && usingShield()) {
+                npc.stopUsingItem();
+            } else {
+                // 原版正在进食，等它自然完成；这里不再重复触发使用。
+                return;
+            }
         }
-        int slot = ensureFoodInHand();
+        int slot = ensureFoodInHand(desperate);
         if (slot < 0) {
             return;
         }
         ItemStack food = npc.getMainHandItem();
         if (food.isEmpty() || food.get(DataComponents.FOOD) == null) {
             return;
+        }
+        if (desperate) {
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 危险线抢吃 | food="
+                    + npc.getFoodData().getFoodLevel() + " item=" + food.getItem());
         }
         // 只调用一次 useItem：FoodItem 会 startUsingItem，之后由 ServerPlayer.tick 完成 32 tick 的进食。
         npc.gameMode.useItem(npc, npc.level(), food, InteractionHand.MAIN_HAND);
@@ -1478,7 +1492,7 @@ public final class SurvivalController {
      *
      * @return 食物所在快捷栏索引；没有可用食物返回 -1
      */
-    private int ensureFoodInHand() {
+    private int ensureFoodInHand(boolean desperate) {
         Inventory inventory = npc.getInventory();
         // 1.21.11 的 selected 字段是 private，统一走 getSelectedSlot/setSelectedSlot。
         int selected = inventory.getSelectedSlot();
@@ -1486,7 +1500,7 @@ public final class SurvivalController {
         int bestScore = -1;
         // 0..35 一起扫：0..8 是快捷栏，9..35 是背包。
         for (int slot = 0; slot < 36; slot++) {
-            int score = foodScore(inventory.getItem(slot));
+            int score = foodScore(inventory.getItem(slot), desperate);
             if (score > bestScore) {
                 bestScore = score;
                 bestSlot = slot;
@@ -1512,6 +1526,17 @@ public final class SurvivalController {
      * 非食物和黑名单食物统一返回 -1，保证不会被选中。
      */
     private int foodScore(ItemStack stack) {
+        return foodScore(stack, false);
+    }
+
+    /**
+     * @param desperate 【fix86】饿到危险线（food≤6）时留种守卫让路：留苗线
+     * （胡萝卜/生土豆 ≤8 不许吃）本是「永不吃光种苗」的护栏，但 farm45
+     * 实证 NPC 只剩胡萝卜×8+土豆×1 时被守卫判为全部不可吃、food 20→0
+     * 全程零进食、泡水 hp=2.4 濒死——留种不能压过保命（惜命第一），
+     * 危险线时种苗按普通食物计分（吃完靠补种/搜刮恢复种源）。
+     */
+    private int foodScore(ItemStack stack, boolean desperate) {
         if (stack.isEmpty() || HARMFUL_FOODS.contains(stack.getItem())) {
             return -1;
         }
@@ -1519,7 +1544,7 @@ public final class SurvivalController {
         // 在留苗线（8）以内时不许当食物吃掉——吃光种苗等于把田吃绝（Fong
         // 硬规矩：留种留苗永不吃光）。烤土豆是加工品、不在此列（规划层只烤
         // 留苗线以上的富余）。没开田时不拦：那时它们只是普通食物。
-        if ((stack.is(Items.CARROT) || stack.is(Items.POTATO)) && isSeedStock(stack.getItem())) {
+        if (!desperate && (stack.is(Items.CARROT) || stack.is(Items.POTATO)) && isSeedStock(stack.getItem())) {
             return -1;
         }
         FoodProperties food = stack.get(DataComponents.FOOD);
