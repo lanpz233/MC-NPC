@@ -1,5 +1,6 @@
 package com.example.aivillager.survival;
 
+import com.example.aivillager.goals.BaseMemory;
 import com.example.aivillager.npc.FakePlayerBody;
 import com.example.aivillager.pathfinding.PathFinder;
 import com.example.aivillager.skills.SkillRunner;
@@ -834,12 +835,28 @@ public final class SurvivalController {
         }
         org.bukkit.World world = Bukkit.getWorlds().get(0);
         org.bukkit.Location spawn = world.getSpawnLocation();
-        int blockX = spawn.getBlockX();
-        int blockZ = spawn.getBlockZ();
-        // 出生点可能是坑：用最高的可站立方块往上抬一格，避免复活就卡在方块里。
-        double y = world.getHighestBlockYAt(blockX, blockZ) + 1.0D;
-        npc.teleportTo(((org.bukkit.craftbukkit.CraftWorld) world).getHandle(),
-                blockX + 0.5D, y, blockZ + 0.5D, java.util.Set.of(), spawn.getYaw(), spawn.getPitch(), true);
+        // 【fix95】复活点对齐原版（Fong D1：床=重生点）：旧实现写死世界出生点，
+        // fix56 登记的 RespawnConfig 走原版重生流程、假人自有 revive 从不经过——等于白登记
+        // （死亡 #8 复活在世界出生点而非床边实证）。改为先查落脚点账本的床：
+        // 床还在且床边有可站立格 → 床边复活；床被拆/被堵/无账本 → 回落世界出生点旧路径。
+        // 死亡重生是规则内传送，此处只是换落点、不引入新传送类型。
+        net.minecraft.server.level.ServerLevel mainLevel =
+                ((org.bukkit.craftbukkit.CraftWorld) world).getHandle();
+        BlockPos bedStand = findBedRespawnStand(mainLevel);
+        if (bedStand != null) {
+            npc.teleportTo(mainLevel, bedStand.getX() + 0.5D, bedStand.getY(), bedStand.getZ() + 0.5D,
+                    java.util.Set.of(), spawn.getYaw(), spawn.getPitch(), true);
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 复活点来源=床 | stand="
+                    + bedStand.getX() + "," + bedStand.getY() + "," + bedStand.getZ());
+        } else {
+            int blockX = spawn.getBlockX();
+            int blockZ = spawn.getBlockZ();
+            // 出生点可能是坑：用最高的可站立方块往上抬一格，避免复活就卡在方块里。
+            double y = world.getHighestBlockYAt(blockX, blockZ) + 1.0D;
+            npc.teleportTo(mainLevel,
+                    blockX + 0.5D, y, blockZ + 0.5D, java.util.Set.of(), spawn.getYaw(), spawn.getPitch(), true);
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 复活点来源=世界出生点");
+        }
         npc.setHealth(npc.getMaxHealth());
         npc.deathTime = 0;
         npc.clearFire();
@@ -851,6 +868,59 @@ public final class SurvivalController {
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 复活 | " + npc.describe());
         // 【第二十三轮】复活后盘点一次（强制打，死亡/复活永不抽样）。
         InventorySnapshot.log(npc, "respawn", "-", true);
+    }
+
+    /**
+     * 【fix95】按落脚点账本找床边复活站位：账本有床、床格仍是床方块、且床两格的四邻有
+     * 可站立格时返回该格；否则返回 null（revive 回落世界出生点）。
+     * bindWorld 必须用主世界 level——若死亡发生在下界、拿 npc 当前 level 绑定，
+     * 世界键会被算成下界、账本按串世界拒读（BaseMemory.base 的 world 校验）。
+     */
+    private BlockPos findBedRespawnStand(net.minecraft.server.level.ServerLevel mainLevel) {
+        try {
+            BaseMemory.bindWorld(mainLevel);
+            BaseMemory.Base base = BaseMemory.base(npc.npcName());
+            if (base == null || base.bedPos() == null) {
+                return null;
+            }
+            BlockPos foot = base.bedPos();
+            net.minecraft.world.level.block.state.BlockState bedState = mainLevel.getBlockState(foot);
+            if (!(bedState.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床账本在但床已不在（被拆/被换），回落世界出生点 | bed="
+                        + foot.getX() + "," + foot.getY() + "," + foot.getZ());
+                return null;
+            }
+            // 床占两格：按 PART 定出另一格（账本存的是脚格，此处对头格同样成立）；两格四邻逐个试站位。
+            net.minecraft.core.Direction facing = bedState.getValue(net.minecraft.world.level.block.BedBlock.FACING);
+            BlockPos other = bedState.getValue(net.minecraft.world.level.block.BedBlock.PART)
+                    == net.minecraft.world.level.block.state.properties.BedPart.FOOT
+                    ? foot.relative(facing) : foot.relative(facing.getOpposite());
+            for (BlockPos cell : new BlockPos[]{foot, other}) {
+                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                    BlockPos stand = cell.relative(dir);
+                    if (stand.equals(foot) || stand.equals(other)) {
+                        continue;
+                    }
+                    if (PathFinder.isStandable(mainLevel, stand)) {
+                        // 顺手把原版 RespawnConfig 回写一致（fix56 登记口径），防其他读者读到旧值。
+                        try {
+                            npc.setRespawnPosition(new net.minecraft.server.level.ServerPlayer.RespawnConfig(
+                                    net.minecraft.world.level.storage.LevelData.RespawnData.of(
+                                            mainLevel.dimension(), foot, 0.0F, 0.0F), false), false);
+                        } catch (Throwable ignored) {
+                            // 回写失败不影响本次复活落点。
+                        }
+                        return stand;
+                    }
+                }
+            }
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床在但床边无可站立格（被堵），回落世界出生点 | bed="
+                    + foot.getX() + "," + foot.getY() + "," + foot.getZ());
+            return null;
+        } catch (Throwable throwable) {
+            LOG.warning("[AIV][SURVIVAL] " + npc.npcName() + " 床边复活解析失败，回落世界出生点: " + throwable);
+            return null;
+        }
     }
 
     /** 【第二十三轮】死亡现场快照：死因 + 环境 + 活动，key=value 一行打全。 */
