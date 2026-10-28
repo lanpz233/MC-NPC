@@ -264,6 +264,14 @@ public final class GoalExecutor {
     private int progressMetric;
     /** 上次有进展时的位置锚点：离开锚点 6 格以上也算进展（长距离移动/下矿途中）。 */
     private BlockPos progressAnchor;
+    /**
+     * 【fix107】travel/revisit 竖向对齐死线状态：进入「水平已到位（≤4 格）但
+     * 高差 >3」的对齐带时锚定 tick 与当时高差；高差改善 ≥4 格重新锚定，
+     * 连续 300 秒（6000 tick）无改善即诚实收场，不再干等 LONG 看门狗的
+     * 480 秒位置处决（farm67 山顶边缘悬挂实证）。0=不在对齐带。
+     */
+    private long alignBandSinceTick;
+    private double alignBestAbsDelta = Double.MAX_VALUE;
     /** 传送门选址结果：origin 是框架左下角，alongX 表示门面横向沿 X 轴。 */
     private BlockPos portalOrigin;
     private boolean portalAlongX = true;
@@ -629,6 +637,8 @@ public final class GoalExecutor {
         lastProgressTick = npc.tickCount;
         progressMetric = goalMetric();
         progressAnchor = npc.blockPosition();
+        alignBandSinceTick = 0;
+        alignBestAbsDelta = Double.MAX_VALUE;
         goalDimension = npc.level().dimension().identifier().toString();
         status = describeStart();
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 接受目标 | " + status);
@@ -723,6 +733,13 @@ public final class GoalExecutor {
             skills.stop();
             finish("追杀放弃：120 秒无新战利品（fix106 追杀时限）type=" + type
                     + " target=" + chaseTarget + " 已追 " + chasedSec + " 秒");
+            return;
+        }
+        // 【fix107】竖向对齐死线（travel/revisit）：水平已到位、高差悬殊时
+        // descend/ascend 若在边缘悬挂等状态里空转，技能会长占忙位、目标层
+        // 只能干等 LONG 看门狗 480 秒位置处决（farm67 实证）。与 fix106
+        // 同置于"技能忙"早退之前检查：对齐带内 300 秒高差无改善即收场。
+        if (checkVerticalAlignDeadline()) {
             return;
         }
         // 技能还在执行（走路/挖矿）就等它结束，目标层只负责“下一步做什么”。
@@ -4940,6 +4957,56 @@ public final class GoalExecutor {
         } else {
             staleChecks = 0;
         }
+    }
+
+    /**
+     * 【fix107】竖向对齐死线：travel/revisit 水平已到位（≤4 格）但高差 >3 时
+     * 进入对齐带计时；高差改善 ≥4 格重新锚定（稳步升降永不误杀），连续
+     * 300 秒（6000 tick）无改善 → 停技能、finish 交规划层，抢在 LONG
+     * 看门狗 480 秒处决之前诚实收场（farm67 山顶悬停 7 分钟实证）。
+     *
+     * @return 是否已收场（调用方直接 return）
+     */
+    private boolean checkVerticalAlignDeadline() {
+        double tx;
+        double ty;
+        double tz;
+        if ("travel".equals(type)) {
+            tx = travelX;
+            ty = travelY;
+            tz = travelZ;
+        } else if ("revisit".equals(type)) {
+            tx = revisitX + 0.5D;
+            ty = revisitY;
+            tz = revisitZ + 0.5D;
+        } else {
+            alignBandSinceTick = 0;
+            return false;
+        }
+        double dx = tx - npc.getX();
+        double dz = tz - npc.getZ();
+        double absDelta = Math.abs(ty - npc.getY());
+        if (dx * dx + dz * dz > 16.0D || absDelta <= 3.0D) {
+            alignBandSinceTick = 0;
+            alignBestAbsDelta = Double.MAX_VALUE;
+            return false;
+        }
+        if (alignBandSinceTick == 0 || absDelta < alignBestAbsDelta - 4.0D) {
+            alignBandSinceTick = npc.tickCount;
+            alignBestAbsDelta = absDelta;
+            return false;
+        }
+        if (npc.tickCount - alignBandSinceTick > 6000L) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 竖向对齐死线 | type=" + type
+                    + " 高度差=" + Math.round(absDelta)
+                    + " 已带内秒=" + ((npc.tickCount - alignBandSinceTick) / 20)
+                    + "（fix107：300 秒无改善，诚实收场）");
+            skills.stop();
+            finish("竖向对齐 300 秒无进展（高度差 " + Math.round(absDelta)
+                    + "），放弃交规划器（fix107）");
+            return true;
+        }
+        return false;
     }
 
     private void tickTravel() {

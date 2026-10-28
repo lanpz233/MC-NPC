@@ -1551,6 +1551,59 @@ public final class SkillRunner {
     }
 
     /**
+     * 【fix107】边缘悬挂复位：身体被邻格方块的边缘碰撞托住、站立列正下方是
+     * 空气时（onGround 恒 false、Y 纹丝不动），descend 往自己列中心「向下走
+     * 一格」只会原地 arrive、永远落不下去（farm67 山顶桥头悬停 7 分钟实证）。
+     * 玩家的做法是先横移一步站回实地：扫四邻，找「下有实心支撑（非流体、
+     * 非滴石锥）∧ 本格与头格可过」的邻列走过去站稳，descend 再按正常
+     * 阶梯逻辑接管。
+     *
+     * @return 是否找到并走向了复位列
+     */
+    private boolean descendRecenterFromEdge(BlockPos feet) {
+        // 先正交后对角：farm67 实证里支撑块可能在对角列（身体 bbox 覆盖
+        // 3×3 列、正交四邻的下格却全空），只扫四邻会漏掉真正的落脚点。
+        int[][] scan = {{1, 0}, {0, 1}, {-1, 0}, {0, -1},
+                {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int[] d : scan) {
+            BlockPos n = feet.offset(d[0], 0, d[1]);
+            BlockPos support = n.below();
+            BlockState supportState = npc.level().getBlockState(support);
+            BlockState nState = npc.level().getBlockState(n);
+            BlockState nHeadState = npc.level().getBlockState(n.above());
+            if (supportState.getCollisionShape(npc.level(), support).isEmpty()
+                    || !supportState.getFluidState().isEmpty()
+                    || supportState.is(Blocks.POINTED_DRIPSTONE)
+                    || isFluid(nState) || isFluid(nHeadState)
+                    || !(nState.isAir() || nState.canBeReplaced()
+                            || nState.getCollisionShape(npc.level(), n).isEmpty())
+                    || !(nHeadState.isAir() || nHeadState.canBeReplaced()
+                            || nHeadState.getCollisionShape(npc.level(), n.above()).isEmpty())) {
+                continue;
+            }
+            if (d[0] != 0 && d[1] != 0) {
+                // 对角穿行：两个正交过渡格至少要有一个脚位不挡，
+                // 否则身体会被墙角卡住、白走一趟。
+                BlockPos sideA = feet.offset(d[0], 0, 0);
+                BlockPos sideB = feet.offset(0, 0, d[1]);
+                boolean aBlocked = !npc.level().getBlockState(sideA)
+                        .getCollisionShape(npc.level(), sideA).isEmpty();
+                boolean bBlocked = !npc.level().getBlockState(sideB)
+                        .getCollisionShape(npc.level(), sideB).isEmpty();
+                if (aBlocked && bBlocked) {
+                    continue;
+                }
+            }
+            npc.walkTo(new Vec3(n.getX() + 0.5D, feet.getY(), n.getZ() + 0.5D), false, null);
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 边缘悬挂复位 | from="
+                    + feet.toShortString() + " to=" + n.toShortString()
+                    + "（fix107：站立列悬空、支撑在邻列，先站回实地）");
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * 阶梯式下挖：沿一个水平方向挖 1x2 通道逐层下降，直到接近目标 Y。
      *
      * <p>为什么不做垂直挖坑：垂直坑需要垫脚才能上来，伪玩家不擅长放方块自救；
@@ -1580,6 +1633,14 @@ public final class SkillRunner {
              * 每转一次刷一条日志，NPC 却永远不落地。这里累计到整圈（4 次）后改成垂直下挖。
              */
             private int unsafeTurns;
+            /**
+             * 【fix107】「脚下悬空，向下走一格」的同点无下降记账：同一站位
+             * 第二次进该分支且 Y 未降，判定边缘悬挂（支撑在邻列），先横移
+             * 复位（descendRecenterFromEdge）再回正常阶梯逻辑。
+             */
+            private BlockPos lastAirWalkPos;
+            private int lastAirWalkY = Integer.MIN_VALUE;
+            private int airWalkStuck;
             /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
             private int lastStepsSeen;
             private int roundsWithoutProgress;
@@ -1873,6 +1934,26 @@ public final class SkillRunner {
                     // 都在"垂直下挖 / 走位中断"之间空转（实测连续 6 级全失败）。
                     // 玩家的做法是往下一格走过去，让重力把人接住。
                     if (belowState.isAir()) {
+                        // 【fix107】边缘悬挂：同一站位反复进此分支且 Y 不降，
+                        // 说明身体被邻格边缘托住（站立列下空、支撑在邻列），
+                        // 往自己列中心走只会原地 arrive（farm67 山顶桥头实证：
+                        // Y=149 悬停 7 分钟，直到目标看门狗处决）。第二次同点
+                        // 无下降先横移复位到有支撑的邻列站稳，再回阶梯逻辑；
+                        // 复位无路则落回原 walk-down，由 failedSteps 与目标层
+                        // 竖向对齐死线兜底收场。真悬空（树冠等 walk-down 一次
+                        // 就能落下）的情形第一次照旧走、不受影响。
+                        if (feet.equals(lastAirWalkPos) && feet.getY() >= lastAirWalkY) {
+                            airWalkStuck++;
+                        } else {
+                            lastAirWalkPos = feet.immutable();
+                            lastAirWalkY = feet.getY();
+                            airWalkStuck = 0;
+                        }
+                        if (airWalkStuck >= 1 && descendRecenterFromEdge(feet)) {
+                            airWalkStuck = 0;
+                            lastTarget = null;
+                            return;
+                        }
                         stepStartY = feet.getY();
                         lastTarget = belowFeet;
                         npc.walkTo(new Vec3(belowFeet.getX() + 0.5D, belowFeet.getY(),
