@@ -3971,10 +3971,12 @@ public final class GoalExecutor {
     private int lootStuck;
     private BlockPos lootStandPos;
 
-    /** 存入名单（草案定版）：死了怕丢、平时不用的贵重物 + 第二档杂物（存箱优先于扔）。 */
+    /** 存入名单（草案定版）：死了怕丢、平时不用的贵重物 + 第二档杂物（存箱优先于扔）。
+     * 【fix92·Fong 2026-10-28】红石加入：留存的一组（配额裁剪已封顶 64）
+     * 回家存进箱子，不在包里占格。 */
     private static final java.util.Set<String> STORE_LOOT = java.util.Set.of(
             "diamond", "emerald", "netherite_ingot", "netherite_scrap", "ancient_debris",
-            "blaze_rod", "ender_pearl", "gold_ingot",
+            "blaze_rod", "ender_pearl", "gold_ingot", "redstone",
             "bone", "string", "spider_eye");
 
     /** 落脚点箱子是否已安置且在 range 格内（第二档"存箱优先"的判定口）。 */
@@ -5893,6 +5895,13 @@ public final class GoalExecutor {
             case "cobblestone" -> {
                 return 128;
             }
+            // 【fix92·Fong 2026-10-28 拍板】「红石最多就留一组，其他都扔了。
+            // 回家就把这些放箱子」：保留=64，超出部分由本裁剪清掉；留存的
+            // 一组回家存箱（STORE_LOOT 已同步加入 redstone）。此口径只点名
+            // 红石，滴石块等其他大宗囤积不套用。
+            case "redstone" -> {
+                return 64;
+            }
             case "stone" -> {
                 return 64;
             }
@@ -6135,6 +6144,10 @@ public final class GoalExecutor {
                     "obsidian", "bucket", "water_bucket", "crafting_table",
                     "furnace", "torch", "cobblestone", "cobbled_deepslate",
                     "blackstone" -> false;
+            // 【fix92·Fong 2026-10-28】红石最多留一组：总量 ≤64 时二线
+            // 也不许动；超出时才可丢——二线按最小堆挑受害者，丢掉最小的
+            // 红石堆后总量仍 ≥64 或收敛到一组内，不会把留存组扔穿。
+            case "redstone" -> countItem("redstone") > 64;
             default -> true;
         };
     }

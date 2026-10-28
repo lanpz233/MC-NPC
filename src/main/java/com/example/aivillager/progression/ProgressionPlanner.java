@@ -1020,7 +1020,8 @@ public final class ProgressionPlanner {
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 存箱触发 | 钻石="
                             + countItem("diamond") + " 珍珠=" + countItem("ender_pearl")
                             + " 骨头=" + countItem("bone") + " 线=" + countItem("string")
-                            + " 铁锭=" + countItem("iron_ingot"));
+                            + " 铁锭=" + countItem("iron_ingot")
+                            + " 红石=" + countItem("redstone"));
                     return goal("回箱存物", "store_loot", params());
                 }
             }
@@ -1898,7 +1899,9 @@ public final class ProgressionPlanner {
                 || countItem("ancient_debris") > 0 || countItem("blaze_rod") > 0
                 || countItem("ender_pearl") > 0 || countItem("gold_ingot") > 0
                 || countItem("bone") > 0 || countItem("string") > 0
-                || countItem("spider_eye") > 0 || countItem("iron_ingot") > 32;
+                || countItem("spider_eye") > 0 || countItem("iron_ingot") > 32
+                // 【fix92·Fong 2026-10-28】红石留存一组回家存箱，也算可存物。
+                || countItem("redstone") > 0;
     }
 
     /** 同色羊毛 ≥3 的颜色前缀（fix56：原版床配方要 3 张同色羊毛）；没有返回 null。 */
