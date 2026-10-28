@@ -121,6 +121,8 @@ public final class GoalExecutor {
     private int goalStartY;
     private int goalStartZ;
     private int staleChecks;
+    /** 【fix101】目标层镐子兜底放行日志每目标只打一次（tickDig 每 tick 都会路过）。 */
+    private boolean digPickFallbackLogged;
     // 找资源扩围的方向惯性（fix18）：跨目标保留的航向/档位/锚点，故意不随
     // 目标重下而重置——旧逻辑每个新目标 attempts 归零、距离永远从 8 格起步，
     // 且每次都重挑"地表最低方向"，会在盆地里绕圈打转（长跑 #5 实测：
@@ -377,6 +379,7 @@ public final class GoalExecutor {
                             DigDepthMemory.depth(npc.npcName()));
                 }
                 oreTarget = target;
+                digPickFallbackLogged = false;
                 newTarget = target.block();
                 newCount = clamp(intent.intParam("count", 8), 1, 64);
                 if ("diamond_ore".equals(oreTarget.block())) {
@@ -1615,8 +1618,30 @@ public final class GoalExecutor {
         // 一条矿道就能把铁镐烧掉大半（fix24 只改了选工具顺序，库存断供时
         // 顺序无从谈起）。当场收场交回规划器：它会用背包圆石当场补做石镐。
         if (!"stone".equals(oreTarget.block()) && !hasUsableStonePick()) {
-            finish("挖矿放弃：石镐耗尽，先补石镐（石镐主力，铁镐只留给必需矿）");
-            return;
+            // 【fix101·Fong 2026-10-28 通则：守卫必须配兜底】旧口径无条件收场
+            // 补石镐：合得出时没问题；合不出（缺木棍料/没工作台）时规划层也
+            // 变不出石镐，挖矿目标与补镐步互相踢皮球成硬死角（与身体层
+            // fix44 守卫同病，浇铸覆灭的同族现场）。改三路：合得出→照旧
+            // 收场补造；合不出但有可用铁/钻镐→放行本目标掘进（身体层
+            // pick-fallback 逐格兜底选镐，专行日志每目标一次）；合不出且
+            // 无高级镐→收场交规划层补工具链（木镐/砍木头）。
+            StringBuilder missing = new StringBuilder();
+            if (npc.stonePickCraftableNow(missing)) {
+                finish("挖矿放弃：石镐耗尽，先补石镐（石镐主力，铁镐只留给必需矿）");
+                return;
+            }
+            if (hasUsablePickaxe()) {
+                if (!digPickFallbackLogged) {
+                    digPickFallbackLogged = true;
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " pick-fallback | 目标层放行 | reason=石镐耗尽且合不出石镐 missing="
+                            + missing.toString().trim()
+                            + " | 用铁/钻镐掘进 target=" + oreTarget.block());
+                }
+            } else {
+                finish("挖矿放弃：石镐耗尽且合不出石镐、无高级镐可用，先补工具");
+                return;
+            }
         }
         // 上一条矿道如果挖空了，下一轮掘进前要先换位置（见下方步骤 3 前的处理）。
         noteStripOutcome();

@@ -92,6 +92,10 @@ public final class FakePlayerBody extends ServerPlayer {
     private int toolLogCounter;
     /** fix44 守卫拒挖日志节流：技能收场前会反复试挖，10 秒最多打一行。 */
     private long lastTierGuardLogTick = -100000L;
+    /** 【fix101】镐子兜底链状态：无可用石镐且合不出石镐时，降级用铁/钻镐
+     * 顶上干活（Fong 2026-10-28 通则：守卫必须配兜底，只堵不疏不许出厂）。
+     * 启用/解除各打一条 pick-fallback 专行日志；石镐回包即解除。 */
+    private boolean pickFallbackActive;
     /** fix99 床块守卫日志节流：卡住自救会反复试挖床格，10 秒最多打一行。 */
     private long lastBedGuardLogTick = -100000L;
     /** 【第四十五轮】逃生后岩浆位置记忆：生存层接触岩浆时写入的最后一格 + tick。 */
@@ -928,6 +932,12 @@ public final class FakePlayerBody extends ServerPlayer {
                 stoneSlot = slot;
             }
         }
+        // 【fix101】兜底解除：石镐回包（补造/挖到/补给到）即切回石镐主力，
+        // 专行打日志——兜底是偏好失效时的降级路径，不是把铁镐扶正。
+        if (stoneSlot >= 0 && pickFallbackActive) {
+            pickFallbackActive = false;
+            log(npcName, "pick-fallback", "解除 | reason=石镐回包，回归石镐主力");
+        }
         // 【第三十六轮】石镐断供时不许拿高级镐顶普通石头（allowLastResort=false
         // 的脱困类路径）：长跑#12 两度实证——石镐在长掘进里烧成退役壳后，
         // ascend 回地表一路用铁镐挖普通石头（铁镐 250→60、60→16 的主烧段）。
@@ -957,18 +967,34 @@ public final class FakePlayerBody extends ServerPlayer {
         if (stoneSlot < 0 && allowLastResort
                 && new ItemStack(Items.STONE_PICKAXE).isCorrectToolForDrops(state)
                 && !hasUsableCheapPick(inventory, state)) {
-            int cobble = countInventoryItem(inventory, Items.COBBLESTONE);
-            if (cobble >= 3) {
+            // 【fix101·Fong 2026-10-28 通则：守卫必须配兜底】fix44 旧口径只看
+            // 圆石 ≥3 就一律拒挖——但圆石够 ≠ 合得出（缺木棍料/没工作台时
+            // 合成路径同样不通），守卫只有「不许」没有出路：浇铸三趟里
+            // descend 1 秒速败、规划层补镐也变不出来，就是这处无兜底守卫
+            // 堵死的（fix100 只治了目标层热循环）。新链：先判能否立刻合
+            // 石镐——合得出照旧拒挖、交规划层当场补造（省镐偏好不变）；
+            // 合不出就降级兜底：不返回 false，落回下面评分顺位开挖——
+            // toolScore 低 tier 分高，铁镐（tier3）天然排在钻石镐（tier4）
+            // 之前，即 Fong 定的「铁先、钻最后」；全没镐时评分无可选，
+            // 由 mine-no-tool 收场交规划层补镐步。兜底启用只打一行专行
+            // 日志（写明缺什么料合不出），石镐回包时另有解除行（见上）。
+            StringBuilder missing = new StringBuilder();
+            if (stonePickCraftableNow(missing)) {
                 if (this.tickCount - lastTierGuardLogTick >= 200) {
                     lastTierGuardLogTick = this.tickCount;
-                    log(npcName, "mine-tier-guard", "无可用石镐/木镐，拒绝用高级镐挖 "
-                            + state.getBlock() + "（圆石 " + cobble + "≥3，交规划层补造石镐） "
+                    log(npcName, "mine-tier-guard", "无可用石镐/木镐但可立即合石镐，拒绝用高级镐挖 "
+                            + state.getBlock() + "（交规划层补造石镐） "
                             + pos.toShortString());
                 }
                 return false;
             }
-            log(npcName, "mine-tier-guard", "无可用石镐/木镐且圆石 " + cobble
-                    + "<3，准用高级镐挖当块补圆石（做石镐用） " + pos.toShortString());
+            if (!pickFallbackActive) {
+                pickFallbackActive = true;
+                log(npcName, "pick-fallback", "启用 | reason=无可用石镐且合不出石镐 missing="
+                        + missing.toString().trim()
+                        + " | tool=评分顺位(铁镐>钻石镐) block=" + state.getBlock()
+                        + " pos=" + pos.toShortString());
+            }
         }
         int bestSlot = stoneSlot;
         int bestScore = stoneSlot >= 0 ? Integer.MAX_VALUE : -1;
@@ -1051,6 +1077,63 @@ public final class FakePlayerBody extends ServerPlayer {
             }
             if (stack.isCorrectToolForDrops(state)) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 【fix101】能否立刻合出一把石镐（兜底链判定，身体层与目标层共用同一口径）：
+     * 圆石（含深板岩圆石，fix57 口径）≥3、木棍料够（存货木棍 ≥2，或木板 ≥2，
+     * 或原木 ≥1——1 原木出 4 木板、2 木板出 4 木棍）、工作台够得着（包里有，
+     * 或身边 4 格内有一台）。缺哪件写进 missing（日志取证用）。
+     */
+    public boolean stonePickCraftableNow(StringBuilder missing) {
+        Inventory inventory = this.getInventory();
+        int cobble = countInventoryItem(inventory, Items.COBBLESTONE)
+                + countInventoryItem(inventory, Items.COBBLED_DEEPSLATE);
+        int sticks = countInventoryItem(inventory, Items.STICK);
+        int planks = 0;
+        int logs = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            String path = itemPathOf(stack);
+            if (path.endsWith("_planks")) {
+                planks += stack.getCount();
+            } else if (path.endsWith("_log") || path.endsWith("_stem")) {
+                logs += stack.getCount();
+            }
+        }
+        boolean stickMaterial = sticks >= 2 || planks >= 2 || logs >= 1;
+        boolean bench = countInventoryItem(inventory, Items.CRAFTING_TABLE) > 0
+                || nearbyCraftingTable();
+        if (cobble < 3) {
+            missing.append("圆石=").append(cobble).append("/3 ");
+        }
+        if (!stickMaterial) {
+            missing.append("木棍料(棍=").append(sticks).append(",板=").append(planks)
+                    .append(",原木=").append(logs).append(") ");
+        }
+        if (!bench) {
+            missing.append("工作台=无 ");
+        }
+        return cobble >= 3 && stickMaterial && bench;
+    }
+
+    /** 身边 4 格内有没有放着的工作台（包里没有时合成路径要靠它）。 */
+    private boolean nearbyCraftingTable() {
+        BlockPos feet = this.blockPosition();
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dz = -4; dz <= 4; dz++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    if (this.level().getBlockState(feet.offset(dx, dy, dz))
+                            .is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE)) {
+                        return true;
+                    }
+                }
             }
         }
         return false;
