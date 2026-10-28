@@ -4575,6 +4575,17 @@ public final class GoalExecutor {
         obsidianDescendFails++;
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 浇铸下挖失败计数 | fails="
                 + obsidianDescendFails + " outcome=" + outcome);
+        // 【fix109】缺镐类失败不许原地重派凑数：分级守卫拒挖的状态不变，
+        // descend 必然 1 秒速败（farm70/71 两度实证 fails 相隔 1 秒、同点
+        // 同因），重派几次都不会变，只会白烧连败计数。计数直接顶满，
+        // 由 tickObsidian 本 tick 收场交规划器补镐；补完再派时 descend
+        // 从当前深度续挖，已挖深度不丢。其他死因维持 3 次计数。
+        if (outcome.contains("缺少镐")) {
+            obsidianDescendFails = 3;
+            LOG.info("[AIV][GOAL] " + npc.npcName()
+                    + " 浇铸下挖缺镐速断 | outcome=" + outcome
+                    + "（fix109：不原地重派，直接交规划器补镐）");
+        }
     }
 
     /**
