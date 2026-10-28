@@ -265,7 +265,7 @@ public final class GoalExecutor {
     /** 上次有进展时的位置锚点：离开锚点 6 格以上也算进展（长距离移动/下矿途中）。 */
     private BlockPos progressAnchor;
     /**
-     * 【fix107】travel/revisit 竖向对齐死线状态：进入「水平已到位（≤4 格）但
+     * 【fix107】travel/revisit 竖向对齐死线状态：进入「水平已近（≤6 格）但
      * 高差 >3」的对齐带时锚定 tick 与当时高差；高差改善 ≥4 格重新锚定，
      * 连续 300 秒（6000 tick）无改善即诚实收场，不再干等 LONG 看门狗的
      * 480 秒位置处决（farm67 山顶边缘悬挂实证）。0=不在对齐带。
@@ -4960,10 +4960,13 @@ public final class GoalExecutor {
     }
 
     /**
-     * 【fix107】竖向对齐死线：travel/revisit 水平已到位（≤4 格）但高差 >3 时
+     * 【fix107】竖向对齐死线：travel/revisit 水平已近（≤6 格）但高差 >3 时
      * 进入对齐带计时；高差改善 ≥4 格重新锚定（稳步升降永不误杀），连续
      * 300 秒（6000 tick）无改善 → 停技能、finish 交规划层，抢在 LONG
      * 看门狗 480 秒处决之前诚实收场（farm67 山顶悬停 7 分钟实证）。
+     * 带宽取 6 格而非 tickTravel 派对齐技能的 4 格：对齐僵局里身体会在
+     * 落脚面内横移数格（staging 基岩台实证：角上 dist²=16.25 短暂滑出
+     * 4 格带、计时被反复清零），6 格内仍是同一处对齐僵局、不是新行程。
      *
      * @return 是否已收场（调用方直接 return）
      */
@@ -4986,7 +4989,7 @@ public final class GoalExecutor {
         double dx = tx - npc.getX();
         double dz = tz - npc.getZ();
         double absDelta = Math.abs(ty - npc.getY());
-        if (dx * dx + dz * dz > 16.0D || absDelta <= 3.0D) {
+        if (dx * dx + dz * dz > 36.0D || absDelta <= 3.0D) {
             alignBandSinceTick = 0;
             alignBestAbsDelta = Double.MAX_VALUE;
             return false;
