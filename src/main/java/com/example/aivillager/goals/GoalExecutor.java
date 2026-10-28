@@ -146,6 +146,10 @@ public final class GoalExecutor {
     private int stoneStripFails;
     /** 已经处理过的 strip 结果：同一个结果字符串不要每 tick 重复触发"换点"。 */
     private String handledStripOutcome = "-";
+    /** 【fix100】已经处理过的浇铸目标技能结果（水位线，防同一结果每 tick 重复计数）。 */
+    private String handledObsidianOutcome = "-";
+    /** 【fix100】浇铸目标内 descend 连续失败计数：攒满 3 次即收场交规划层补镐。 */
+    private int obsidianDescendFails;
     /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
     private int oreScanCooldown;
     /** 上次探矿扫描选中的目标格：单格复核（方块还在、仍然裸露）通过就直接复用，省掉重复全扫。 */
@@ -576,6 +580,8 @@ public final class GoalExecutor {
         bedActionStuck = 0;
         bedLastActionKey = "";
         sleepPhase = 0;
+        obsidianDescendFails = 0;
+        handledObsidianOutcome = "-";
         sleepStartMillis = 0L;
         sleepDayTime0 = -1L;
         sleepActionStuck = 0;
@@ -4408,6 +4414,26 @@ public final class GoalExecutor {
         }
     }
 
+    /** 【fix100】消费浇铸目标的 descend 结果：只认新出现的结果（水位线），
+     * 到达清零、其余 descend 结局计一次失败。 */
+    private void noteObsidianOutcome() {
+        String outcome = skills.lastOutcome();
+        if (outcome.equals(handledObsidianOutcome)) {
+            return;
+        }
+        handledObsidianOutcome = outcome;
+        if (!outcome.startsWith("descend ")) {
+            return;
+        }
+        if (outcome.contains("到达")) {
+            obsidianDescendFails = 0;
+            return;
+        }
+        obsidianDescendFails++;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 浇铸下挖失败计数 | fails="
+                + obsidianDescendFails + " outcome=" + outcome);
+    }
+
     /**
      * 浇铸黑曜石：水桶浇岩浆源 → 钻石镐采集 → 收水回桶。
      * 附近没有岩浆时先阶梯下挖到 Y≈-52 的岩浆层。
@@ -4426,6 +4452,18 @@ public final class GoalExecutor {
         }
         if (countItem("bucket") <= 0 && countItem("water_bucket") <= 0) {
             finish("缺少铁桶（3 个铁锭合成）");
+            return;
+        }
+        // 【fix100】先消费 descend 的技能结果（水位线模式，同 noteStripOutcome）：
+        // farm61 三趟浇铸实证——石镐在下楼途中烧到退役后，fix44 分级守卫按
+        // 设计拒用高级镐挖石头，descend 1 秒速败；旧版 tickObsidian 不看结果、
+        // 每 tick 无条件重派 descend，热循环 900 次直至 300 秒看门狗处决，
+        // 规划层的补镐保障步永远等不到目标边界。改：descend 失败计数，
+        // 连续 3 次即收场交回规划器（补镐/换区自有既有步处置）；descend
+        // 到达或黑曜石进账清零。
+        noteObsidianOutcome();
+        if (obsidianDescendFails >= 3) {
+            finish("浇铸黑曜石：下挖连续失败（多为石镐烧光待补镐），交回规划器");
             return;
         }
         // 先到地下层：地表附近常常找不到水（草原/沙漠/平原），
@@ -4450,6 +4488,7 @@ public final class GoalExecutor {
         } else {
             lastProgress = have;
             staleChecks = 0;
+            obsidianDescendFails = 0;
         }
 
         BlockPos lava = nearbyLavaSource(24, 8);
