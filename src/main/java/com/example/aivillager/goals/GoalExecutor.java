@@ -5271,7 +5271,13 @@ public final class GoalExecutor {
     private int noProgressLimitTicks() {
         return switch (type) {
             case "dig" -> GOAL_NO_PROGRESS_TICKS_DIG;
-            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base", "store_loot", "loot_chest" -> GOAL_NO_PROGRESS_TICKS_LONG;
+            // 【fix85】place_bed/sleep 与 travel/store_loot 同为「长接近+
+            // 短动作」的回家型目标：接近段（下栈/越岭/崖面 descend）动辄
+            // 数分钟困在小范围内刨挖，位移 <6 格不触发进展信号，按 DEFAULT
+            // 300 秒必被误杀（farm44 实证：stall 满 300 秒被杀、目标死后
+            // 10 秒 descend 自行打通）。归 LONG 档（480 秒）与同形目标同口径；
+            // 总时长仍有 1800 秒硬顶回收，不会无限期挂死。
+            case "smelt", "travel", "revisit", "endportal", "dragon", "farm", "base", "store_loot", "loot_chest", "place_bed", "sleep" -> GOAL_NO_PROGRESS_TICKS_LONG;
             default -> GOAL_NO_PROGRESS_TICKS_DEFAULT;
         };
     }
