@@ -236,6 +236,14 @@ public final class GoalExecutor {
     private String slayDrop = "string";
     private int slayBaseline;
     private int slayAttempts;
+    /** 【fix106】追杀时限（Fong 2026-10-29 拍板）：猎杀类目标 120 秒无新战利品即放弃。 */
+    private static final long CHASE_NO_GAIN_LIMIT_MILLIS = 120_000L;
+    /** 追杀进度基线：目标开始时的进度量（与 hunt/slay 各自基线同源，见 start()）。 */
+    private int chaseBaseline;
+    /** 本目标已见到的最大战利品增量；增量上涨即重置无战利品计时。 */
+    private int chaseGainSeen;
+    /** 上次战利品增量上涨的时刻（目标开始时初始化为目标开始时刻）。 */
+    private long chaseLastGainMillis;
     /** 长途行进的目标坐标（travel 目标使用）。 */
     private double travelX;
     private double travelY;
@@ -551,6 +559,15 @@ public final class GoalExecutor {
         slayDrop = "slay".equals(type) ? dropOfEntity(targetId) : "string";
         slayBaseline = "slay".equals(type) ? countItem(slayDrop) : 0;
         slayAttempts = 0;
+        // 【fix106】追杀时限记账复位：进度基线与 hunt/slay 各自的完成判定同源——
+        // 存量驱动看存量（皮革数/食物营养）、计数狩猎看 huntBaseline、定点猎杀看 slayBaseline。
+        chaseBaseline = "hunt".equals(type)
+                ? (!huntNeed.isEmpty()
+                        ? ("leather".equals(huntNeed) ? countItem("leather") : foodNutrition())
+                        : huntBaseline)
+                : "slay".equals(type) ? slayBaseline : 0;
+        chaseGainSeen = 0;
+        chaseLastGainMillis = goalStartedMillis;
         endPhase = 0;
         dragonPhase = 0;
         dragonAttempts = 0;
@@ -688,6 +705,24 @@ public final class GoalExecutor {
             LOG.info("[AIV][GOAL] " + npc.npcName() + " " + reason);
             skills.stop();
             finish(reason + " 目标超时放弃，交回规划器");
+            return;
+        }
+        // 【fix106】追杀时限（Fong 2026-10-29 拍板 120 秒，审计提案①）：猎杀类目标
+        // "一直在追、就是杀不死"时（farm67 湖汊猎鸡 goto 连环超时空转 10 分钟+），
+        // 看门狗的"无进展"口径会被位置移动一直喂饱、永远不触发——本预算只看
+        // 战利品增量，120 秒无新增即放弃交规划器。与看门狗同置于"技能忙"早退
+        // 之前：追杀空转恰恰发生在技能连环重派之间，放在后面会被饿死（同第四轮
+        // 修复 A 的教训）。生存层贴身自卫不是目标层追杀，不受此预算约束。
+        if (("hunt".equals(type) || "slay".equals(type)) && chaseNoGainExpired()) {
+            long chasedSec = (System.currentTimeMillis() - goalStartedMillis) / 1000;
+            String chaseTarget = "slay".equals(type) ? slayEntity
+                    : !huntNeed.isEmpty() ? "need:" + huntNeed : "animals";
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 追杀放弃 | type=" + type
+                    + " target=" + chaseTarget + " 已追秒=" + chasedSec
+                    + " 无战利品秒=120 gain=" + chaseGainSeen + "（fix106 追杀时限）");
+            skills.stop();
+            finish("追杀放弃：120 秒无新战利品（fix106 追杀时限）type=" + type
+                    + " target=" + chaseTarget + " 已追 " + chasedSec + " 秒");
             return;
         }
         // 技能还在执行（走路/挖矿）就等它结束，目标层只负责“下一步做什么”。
@@ -3863,6 +3898,30 @@ public final class GoalExecutor {
     }
 
     // ---------------------------------------------------------------- 狩猎
+
+    /**
+     * 【fix106】追杀无战利品计时：进度量与目标完成判定同源（存量驱动看存量、
+     * 计数狩猎看肉类总数、定点猎杀看对应掉落）。增量上涨即重置计时；
+     * 满 {@link #CHASE_NO_GAIN_LIMIT_MILLIS} 无新增返回 true。
+     * 只由 tick() 在猎杀类目标（hunt/slay）上、看门狗之后调用。
+     */
+    private boolean chaseNoGainExpired() {
+        int metric;
+        if ("hunt".equals(type)) {
+            metric = !huntNeed.isEmpty()
+                    ? ("leather".equals(huntNeed) ? countItem("leather") : foodNutrition())
+                    : countHuntLoot();
+        } else {
+            metric = countItem(slayDrop);
+        }
+        int gain = Math.max(0, metric - chaseBaseline);
+        if (gain > chaseGainSeen) {
+            chaseGainSeen = gain;
+            chaseLastGainMillis = System.currentTimeMillis();
+            return false;
+        }
+        return System.currentTimeMillis() - chaseLastGainMillis >= CHASE_NO_GAIN_LIMIT_MILLIS;
+    }
 
     private void tickHunt() {
         // 【第二十二轮】存量驱动（Fong 18:49 拍板）：规划器给了 need/stock 就不数

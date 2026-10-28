@@ -2,6 +2,7 @@ package com.example.aivillager.command;
 
 import com.example.aivillager.AiVillagerPlugin;
 import com.example.aivillager.brain.VillagerBrain;
+import com.example.aivillager.goals.GoalExecutor;
 import com.example.aivillager.intent.Intent;
 import com.example.aivillager.llm.LlmProvider;
 import com.example.aivillager.llm.LlmRouter;
@@ -265,6 +266,21 @@ public final class SpikeCommand implements CommandExecutor, TabCompleter {
             } else {
                 params.addProperty(key, value);
             }
+        }
+
+        // 目标层动作与 VillagerBrain 同口径路由到 GoalExecutor（【fix106】短验工具）：
+        // 否则 spike 只能验技能层，目标层机制（如追杀时限）永远造不了景。
+        if (GoalExecutor.isGoalAction(action)) {
+            GoalExecutor goals = plugin.goal(body.npcName());
+            if (goals == null) {
+                sender.sendMessage("[AIV] " + body.npcName() + " 没有目标执行器");
+                return;
+            }
+            boolean goalAccepted = goals.start(new Intent("", action, params));
+            sender.sendMessage("[AIV] act(goal) " + action + " => " + goalAccepted + " params=" + params);
+            plugin.getLogger().info("[AIV][ACT] " + body.npcName() + " goal=" + action
+                    + " accepted=" + goalAccepted + " params=" + params);
+            return;
         }
 
         String listenerName = sender instanceof Player player ? player.getName() : "Console";
