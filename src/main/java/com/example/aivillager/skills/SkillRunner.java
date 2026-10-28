@@ -1614,11 +1614,29 @@ public final class SkillRunner {
              * 200 轮（约 30 秒）一到按已站稳强制放行，窗口判定只作快路。
              */
             private int airTotalRounds;
+            /**
+             * 【fix94】泡水累计轮数（本 descend 内）：真步数推进时清零。
+             * descend 是挖楼梯、不是游泳——入口选在湖/河里时身体会长期泡水，
+             * 旧口径靠步数看门狗单次磨 3 分钟、dig 再重派同点，farm54 实证
+             * 一个湖岸挖点空转 827 秒 0/2、hp 还被磨掉。累计约 22 秒
+             * （150 轮×3 tick）仍在水里就快速认输，让目标层换区挖干地。
+             */
+            private int waterRounds;
 
             @Override
             public void run() {
                 if (runId != id) {
                     return;
+                }
+                if (npc.isInWater()) {
+                    if (++waterRounds > 150) {
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 水体快速失败 | 累计泡水轮数=" + waterRounds
+                                + " Y=" + Math.round(npc.getY()));
+                        finish(id, "descend", "下潜路径在水体中（入口选在水里） Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    }
                 }
                 // 总进度看门狗：failedSteps 只在少数分支累加，四方向轮换/垂直下挖之间
                 // 存在步数永远不变、失败计数也永远不涨的空转组合（只能等 10 分钟技能看门狗）。
@@ -1628,6 +1646,7 @@ public final class SkillRunner {
                     lastStepsSeen = steps;
                     roundsWithoutProgress = 0;
                     lateralMoves = 0;
+                    waterRounds = 0;
                 } else if (++roundsWithoutProgress > 1200) {
                     finish(id, "descend", "长时间无进展（步数约3分钟未变） Y="
                             + Math.round(npc.getY()) + " 步数=" + steps);
