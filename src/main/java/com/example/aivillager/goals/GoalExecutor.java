@@ -145,11 +145,12 @@ public final class GoalExecutor {
      */
     private boolean relocateBeforeStrip;
     /** 【第四十七轮】挖石头时 strip 连败计数：沼泽式地表无石时改下挖取石的触发量。 */
+    /** 【fix104】strip 结局水位线（序号制，见 handledStripSeq 注释）。 */
     private int stoneStripFails;
-    /** 已经处理过的 strip 结果：同一个结果字符串不要每 tick 重复触发"换点"。 */
-    private String handledStripOutcome = "-";
-    /** 【fix100】已经处理过的浇铸目标技能结果（水位线，防同一结果每 tick 重复计数）。 */
-    private String handledObsidianOutcome = "-";
+    /** 【fix104】strip/浇铸结局水位线改序号制：旧字符串水位会被同文案
+     * 结局击穿（同地点同死因逐字相同、第二份起被当已消费吞掉）。 */
+    private int handledStripSeq = -1;
+    private int handledObsidianSeq = -1;
     /** 【fix100】浇铸目标内 descend 连续失败计数：攒满 3 次即收场交规划层补镐。 */
     private int obsidianDescendFails;
     /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
@@ -584,7 +585,7 @@ public final class GoalExecutor {
         bedLastActionKey = "";
         sleepPhase = 0;
         obsidianDescendFails = 0;
-        handledObsidianOutcome = "-";
+        handledObsidianSeq = skills.outcomeSeq();
         sleepStartMillis = 0L;
         sleepDayTime0 = -1L;
         sleepActionStuck = 0;
@@ -1818,11 +1819,15 @@ public final class GoalExecutor {
      * 同一个结果字符串如果每 tick 都判断，会反复触发 goto 而永远开不了新矿道。
      */
     private void noteStripOutcome() {
-        String outcome = skills.lastOutcome();
-        if (outcome.equals(handledStripOutcome)) {
+        // 【fix104】序号水位：同一结局字符串不要每 tick 重复触发"换点"，
+        // 但同文案的新结局（同地点同死因）必须照常计入——字符串水位会把
+        // 第二份起全吞掉（浇铸 noteObsidianOutcome 同病，farm66 实证）。
+        int seq = skills.outcomeSeq();
+        if (seq == handledStripSeq) {
             return;
         }
-        handledStripOutcome = outcome;
+        handledStripSeq = seq;
+        String outcome = skills.lastOutcome();
         // "未发现 + 已挖=0"是正常挖到头没矿；"前方无路可掘"是撞上悬空/流体/基岩。
         // 两种都说明这片区域已经挖不出东西了。
         if (outcome.startsWith("strip ")
@@ -4440,13 +4445,17 @@ public final class GoalExecutor {
     }
 
     /** 【fix100】消费浇铸目标的 descend 结果：只认新出现的结果（水位线），
-     * 到达清零、其余 descend 结局计一次失败。 */
+     * 到达清零、其余 descend 结局计一次失败。
+     * 【fix104】水位线改序号制（skills.outcomeSeq）：字符串水位被同文案
+     * 结局击穿——farm66 实证 descend 在滴石洞底同地点同死因 1.5 秒一轮，
+     * 结局逐字相同、计数永远停在 1，436 次重派热循环复发。 */
     private void noteObsidianOutcome() {
-        String outcome = skills.lastOutcome();
-        if (outcome.equals(handledObsidianOutcome)) {
+        int seq = skills.outcomeSeq();
+        if (seq == handledObsidianSeq) {
             return;
         }
-        handledObsidianOutcome = outcome;
+        handledObsidianSeq = seq;
+        String outcome = skills.lastOutcome();
         if (!outcome.startsWith("descend ")) {
             return;
         }
