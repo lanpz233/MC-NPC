@@ -1641,6 +1641,20 @@ public final class SkillRunner {
             private BlockPos lastAirWalkPos;
             private int lastAirWalkY = Integer.MIN_VALUE;
             private int airWalkStuck;
+            /**
+             * 【fix113】本级落地复位已用标记：结算分支落地等待超时先给一次
+             * 横移复位站稳的机会，复位无路或复位后同级再超时才判失败。
+             */
+            private boolean settleRecentered;
+            /**
+             * 【fix113】真降看门狗三件套：上次出现 ≥0.5 格真实下降时的精确 Y
+             * 与当时步数、以及步数已增长但无真降的累计轮数。幻影步（结算在
+             * 涨、高度不降）会喂饱步数看门狗和目标层位置进展，farm76 实证
+             * 地表横漂 9 分钟零真降，必须以精确高度为准单独设线。
+             */
+            private double lastRealY = Double.NaN;
+            private int stepsAtLastReal = -1;
+            private int roundsWithoutRealDescent;
             /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
             private int lastStepsSeen;
             private int roundsWithoutProgress;
@@ -1716,6 +1730,29 @@ public final class SkillRunner {
                             + Math.round(npc.getY()) + " 步数=" + steps);
                     return;
                 }
+                // 【fix113】真降看门狗：步数看门狗只看 steps 涨没涨，幻影步
+                // （边缘悬挂放行后横向漂移进低一格列、靠 blockY 比较结算出
+                // 的假步数）会把它和目标层位置进展一起喂饱——farm76 实证
+                // 地表横漂 9 分钟、steps 一直在涨、精确高度零下降。这里以
+                // 精确 Y 为准：steps 较上次真降时有增长、且累计约 90 秒
+                // （600 轮×3 tick）无 ≥0.5 格真降，即判状态机失同步收场，
+                // 交目标层换位/换区。正常阶梯每级真降约 1 格、数秒一记，
+                // 90 秒窗口永不误杀。
+                double yPrecise = npc.getY();
+                if (Double.isNaN(lastRealY)) {
+                    lastRealY = yPrecise;
+                    stepsAtLastReal = steps;
+                }
+                if (yPrecise <= lastRealY - 0.5D) {
+                    lastRealY = yPrecise;
+                    stepsAtLastReal = steps;
+                    roundsWithoutRealDescent = 0;
+                } else if (steps > stepsAtLastReal
+                        && ++roundsWithoutRealDescent > 600) {
+                    finish(id, "descend", "无实际下降（步数=" + steps
+                            + " 但高度约 90 秒未降） Y=" + Math.round(npc.getY()));
+                    return;
+                }
                 // 诊断心跳（第八轮补充）：descend 曾出现"步数看门狗按时收手、但中间
                 // 3 分钟零日志零挖掘"的静默卡死，所有动作分支都会打日志，唯独等待类
                 // 分支全静默。这里每约 30 秒把完整状态打出来，卡在哪条分支一眼可见。
@@ -1747,11 +1784,30 @@ public final class SkillRunner {
                             stepWaitRounds = 0;
                             steps++;
                             failedSteps = 0;
+                            settleRecentered = false;
                         } else if (!npc.isWalking() && ++landWaitRounds > 200) {
                             // 落地等待死线（第十轮）：卡在边缘小数高度时不在走、不落地，
                             // stepWait 的"在走"分支管不到——30 秒落不了地按一级失败处理
                             // （清目标+转向+计数），换方向挖通常能把它带出边缘状态。
                             landWaitRounds = 0;
+                            // 【fix113】先复位再判失败：身体多半挂在目标列边缘
+                            // （与 farm67 山顶桥头同几何，但发生在结算分支，
+                            // fix107 的复位在「脚下悬空」分支内够不着——farm76
+                            // 实证入口第一级就挂住、随后幻影步横漂 9 分钟）。
+                            // 每级给一次横移站回有支撑实地的机会：成功清目标、
+                            // 不计失败不转向，主步从新站位重评方向（洞列若在
+                            // 邻列，下一级自然踩得进去）；无路或复位后同级再
+                            // 超时，才走下面原失败口径（兜底不缺位）。
+                            if (!settleRecentered
+                                    && descendRecenterFromEdge(npc.blockPosition())) {
+                                settleRecentered = true;
+                                lastTarget = null;
+                                LOG.info("[AIV][SKILL] " + npc.npcName()
+                                        + " descend 落地等待超时，先复位站稳 | Y="
+                                        + Math.round(npc.getY()));
+                                return;
+                            }
+                            settleRecentered = false;
                             lastTarget = null;
                             dirIndex++;
                             failedSteps++;
@@ -1822,6 +1878,7 @@ public final class SkillRunner {
                         stepWaitRounds = 0;
                         steps++;
                         failedSteps = 0;
+                        settleRecentered = false;
                     } else if (!npc.isWalking()) {
                         // 走位被身体层判超时放弃（掉坑、被方块卡住）：换方向重挖，
                         // 否则这里会一直等一个永远到不了的目标。
@@ -1956,6 +2013,7 @@ public final class SkillRunner {
                         }
                         stepStartY = feet.getY();
                         lastTarget = belowFeet;
+                        settleRecentered = false;
                         npc.walkTo(new Vec3(belowFeet.getX() + 0.5D, belowFeet.getY(),
                                 belowFeet.getZ() + 0.5D), false, null);
                         LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 脚下悬空，向下走一格 | Y="
@@ -1978,6 +2036,7 @@ public final class SkillRunner {
                     stepStartY = feet.getY();
                     npc.mineWithBestTool(belowFeet);
                     lastTarget = belowFeet;
+                    settleRecentered = false;
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 垂直下挖 | 脚下="
                             + belowState.getBlock() + " Y=" + feet.getY());
                     return;
@@ -2039,6 +2098,7 @@ public final class SkillRunner {
                 npc.walkTo(new Vec3(nextFeet.getX() + 0.5D + dir[0] * 0.4D, nextFeet.getY(),
                         nextFeet.getZ() + 0.5D + dir[1] * 0.4D), false, null);
                 lastTarget = nextFeet;
+                settleRecentered = false;
                 if (steps % 8 == 0) {
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 进度 | 步数=" + steps
                             + " Y=" + npc.blockPosition().getY() + " " + ahead.toShortString());
