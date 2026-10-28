@@ -216,6 +216,15 @@ public final class StagePlan {
                 plan.add(def);
             }
         }
+        // 【fix102·兜底审计 #18】全部请求都被剔除（未知 id + 缺前置连锁）时
+        // 旧口径返回空计划：规划层零阶段启用、NPC 只剩生存层原地待命，
+        // 配置写错的人也看不到出路。空计划按「没写计划」处理——回落模式
+        // 预设（resolvePlan 返回 null 的既有语义），并打警告说明原因。
+        if (plan.isEmpty()) {
+            log.warning("[AIV][PLAN] plan-invalid | npc=" + npcName
+                    + " 自定义计划校验后为空，已回落模式预设计划——请检查 config 里的阶段 id 与前置");
+            return null;
+        }
         return plan;
     }
 

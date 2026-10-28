@@ -6297,9 +6297,12 @@ public final class GoalExecutor {
         return freed;
     }
 
-    /** 【fix90】二线兜底可丢的大宗消耗料：非耐久、不能吃、不在硬保名单。
-     * 圆石族不在此列（fix89 已钉死永不扔）；名单外的大宗囤积（滴石块等）
-     * 天然落入本线——按最小堆挑，先小后大。 */
+    /** 【fix90】二线兜底可丢的大宗消耗料。
+     * 【fix102·兜底审计 #20】旧实现是「默认放行 + 黑名单」：名单外的东西
+     * 一律可丢，而黑名单没跟上一线 isEssential 的历次补漏（fix83 床/
+     * fix66 羊毛主粮等）——farm61 实证合成好的白床被二线当最小堆扔掉
+     * （同族第 4 例）。改白名单 fail-closed：只有点名的大宗消耗料可丢，
+     * 名单外一律不动；今后新增关键物默认安全，不再靠「记得补黑名单」。 */
     private boolean isLastResortDroppable(ItemStack stack) {
         if (stack.isDamageableItem()) {
             return false;
@@ -6311,16 +6314,15 @@ public final class GoalExecutor {
             return false;
         }
         return switch (path) {
-            case "diamond", "iron_ingot", "gold_ingot", "raw_iron", "raw_gold",
-                    "ender_pearl", "ender_eye", "blaze_rod", "blaze_powder",
-                    "obsidian", "bucket", "water_bucket", "crafting_table",
-                    "furnace", "torch", "cobblestone", "cobbled_deepslate",
-                    "blackstone" -> false;
+            // 真大宗消耗料：烧的（煤/木炭）、攒的（燧石/青金石）、种剩的
+            // （小麦种子）、打剩的（箭）——玩家满包时先扔的也是这几样。
+            case "coal", "charcoal", "flint", "lapis_lazuli",
+                    "wheat_seeds", "arrow" -> true;
             // 【fix92·Fong 2026-10-28】红石最多留一组：总量 ≤64 时二线
             // 也不许动；超出时才可丢——二线按最小堆挑受害者，丢掉最小的
             // 红石堆后总量仍 ≥64 或收敛到一组内，不会把留存组扔穿。
             case "redstone" -> countItem("redstone") > 64;
-            default -> true;
+            default -> false;
         };
     }
 
