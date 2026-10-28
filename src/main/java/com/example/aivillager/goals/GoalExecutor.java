@@ -6026,7 +6026,15 @@ public final class GoalExecutor {
                 // 木料类是整条科技树的根基（木棍→工具/箭、木板→工作台/木棍），
                 // 兜底清理时把它当关键材料保住，否则"背包满"会先把木棍丢掉。
                 || path.equals("stick") || path.equals("bamboo") || path.equals("bamboo_block")
-                || path.endsWith("_planks") || path.endsWith("_log") || path.endsWith("_stem")) {
+                || path.endsWith("_planks") || path.endsWith("_log") || path.endsWith("_stem")
+                // 【fix89】圆石族兜底保护（圆石/深板岩圆石/黑石）：Fong 明规
+                // 「圆石是功能材料（垫脚/小屋/脱困）、永不扔」，超量由
+                // trimOverflow 的配额（128）管，不归兜底。兜底按最小堆挑，
+                // 刚挖到的小堆圆石永远是第一受害者——farm48 实证满包兜底
+                // 把刚挖的圆石 ×11 整堆扔掉（04:00:43），同一秒派发的石镐
+                // 合成随即因缺圆石失败，挖石→扔石→合成败循环 ×3。
+                || path.equals("cobblestone") || path.equals("cobbled_deepslate")
+                || path.equals("blackstone")) {
             return true;
         }
         // 能吃的都不丢：饿死比背包乱更糟。
