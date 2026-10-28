@@ -1491,6 +1491,16 @@ public final class ProgressionPlanner {
         if (planHas(StagePlan.FOOD) && hasSword
                 && (foodNutrition() < FOOD_RESERVE_NUTRITION
                     || countFood() < FOOD_RESERVE_PORTIONS)) {
+            // 【fix97】地下不派 hunt：农场动物只在地表，地下 hunt 的 relocate
+            // 只会在洞网里挖石空转（farm57 实证：地表派单被 relocate 带进出生
+            // 点旧井区洞网、数分钟无果；死亡 #8 地下 restock 同型）。步 0/6.6
+            // 都有 underground→ascend 先回地表，唯独步 13 漏了，此处补齐。
+            // 夜里升到地表后由步 13 夜闸在下一轮拦，不会半夜地表裸猎。
+            if (underground()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备食物 hunt 不在地下派：先回地表 | foodNutrition="
+                        + foodNutrition());
+                return skill("储备食物：先回地表", "ascend");
+            }
             // 【fix39·夜晚总闸】储备是顺路型软向导：夜里地表不为囤食远行打
             // 猎，落到补仓/维持步，天亮再补。挨饿急救走步 0/6.6，不经这里。
             if (isNight() && !underground()) {
