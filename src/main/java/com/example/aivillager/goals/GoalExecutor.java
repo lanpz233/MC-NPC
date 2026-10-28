@@ -153,6 +153,10 @@ public final class GoalExecutor {
     private int handledObsidianSeq = -1;
     /** 【fix100】浇铸目标内 descend 连续失败计数：攒满 3 次即收场交规划层补镐。 */
     private int obsidianDescendFails;
+    /** 【fix105】黑曜石路线：false=挖矿主路（mineobsidian），true=浇铸兜底（castobsidian）。 */
+    private boolean obsidianRouteCasting;
+    private int obsidianRouteFails;
+    private boolean obsidianRouteLogged;
     /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
     private int oreScanCooldown;
     /** 上次探矿扫描选中的目标格：单格复核（方块还在、仍然裸露）通过就直接复用，省掉重复全扫。 */
@@ -585,6 +589,9 @@ public final class GoalExecutor {
         bedLastActionKey = "";
         sleepPhase = 0;
         obsidianDescendFails = 0;
+        obsidianRouteCasting = false;
+        obsidianRouteFails = 0;
+        obsidianRouteLogged = false;
         handledObsidianSeq = skills.outcomeSeq();
         sleepStartMillis = 0L;
         sleepDayTime0 = -1L;
@@ -4456,6 +4463,32 @@ public final class GoalExecutor {
         }
         handledObsidianSeq = seq;
         String outcome = skills.lastOutcome();
+        // 【fix105】挖矿/浇铸两条黑曜石路线结局同样消费：有进账清零、无进账
+        // 计失败；挖矿主路连败 3 次降级切浇铸兜底，浇铸兜底再连败 3 次
+        // 交回规划层（两路都走不通时不许在目标层无限重派）。
+        if (outcome.startsWith("mineobsidian ") || outcome.startsWith("castobsidian ")) {
+            boolean got = !outcome.contains("未挖到")
+                    && (outcome.contains("success=true") || outcome.contains("挖到")
+                    || (outcome.contains("mined=") && !outcome.contains("mined=0")));
+            if (got) {
+                obsidianRouteFails = 0;
+                return;
+            }
+            obsidianRouteFails++;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 黑曜石路线失败计数 | fails="
+                    + obsidianRouteFails + " route="
+                    + (obsidianRouteCasting ? "casting" : "mining")
+                    + " outcome=" + outcome);
+            if (!obsidianRouteCasting && obsidianRouteFails >= 3) {
+                obsidianRouteCasting = true;
+                obsidianRouteFails = 0;
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " obsidian-route | route=mining→casting reason=挖矿路线连败3次，降级浇铸兜底");
+            } else if (obsidianRouteCasting && obsidianRouteFails >= 3) {
+                finish("黑曜石失败：挖矿与浇铸两路连败，交回规划层 outcome=" + outcome);
+            }
+            return;
+        }
         if (!outcome.startsWith("descend ")) {
             return;
         }
@@ -4469,12 +4502,16 @@ public final class GoalExecutor {
     }
 
     /**
-     * 浇铸黑曜石：水桶浇岩浆源 → 钻石镐采集 → 收水回桶。
-     * 附近没有岩浆时先阶梯下挖到 Y≈-52 的岩浆层。
+     * 黑曜石（fix105 路线制）：主路=挖矿路线——下潜到岩浆层、水桶浇湖面
+     * 成壳、钻石镐挖走（mineobsidian）；浇铸（castobsidian）降为兜底，
+     * 挖矿连败 3 次才切换。附近没有岩浆时先阶梯下挖到 Y≈-52 的岩浆层。
+     * 无钻镐时两路都产不出黑曜石（浇铸产物同样要钻镐才掉落，硬走浇铸
+     * 只会把岩浆源白白转成挖不走的黑曜石块），直接交规划层补钻镐链。
      */
     private void tickObsidian() {
         int have = countItem("obsidian");
-        status = "浇铸黑曜石 " + have + "/" + targetCount
+        status = "黑曜石 " + have + "/" + targetCount
+                + (obsidianRouteCasting ? "（浇铸兜底）" : "（挖矿路线）")
                 + (countItem("water_bucket") > 0 ? "（水桶就绪）" : "（需要装水）");
         if (have >= targetCount) {
             finish("黑曜石完成 " + have + "/" + targetCount);
@@ -4483,6 +4520,13 @@ public final class GoalExecutor {
         if (!hasUsableDiamondPickaxe()) {
             finish("采集黑曜石需要钻石镐");
             return;
+        }
+        if (!obsidianRouteLogged) {
+            obsidianRouteLogged = true;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " obsidian-route | route="
+                    + (obsidianRouteCasting ? "casting" : "mining")
+                    + " reason=" + (obsidianRouteCasting
+                    ? "挖矿路线连败降级" : "有可用钻石镐，挖矿主路"));
         }
         if (countItem("bucket") <= 0 && countItem("water_bucket") <= 0) {
             finish("缺少铁桶（3 个铁锭合成）");
@@ -4523,12 +4567,20 @@ public final class GoalExecutor {
             lastProgress = have;
             staleChecks = 0;
             obsidianDescendFails = 0;
+            obsidianRouteFails = 0;
         }
 
         BlockPos lava = nearbyLavaSource(24, 8);
         if (lava != null) {
             JsonObject params = params("x", lava.getX(), "y", lava.getY(), "z", lava.getZ());
-            if (skills.run(new Intent("", "castobsidian", params), "目标")) {
+            boolean started;
+            if (obsidianRouteCasting) {
+                started = skills.run(new Intent("", "castobsidian", params), "目标");
+            } else {
+                params.addProperty("count", targetCount - have);
+                started = skills.run(new Intent("", "mineobsidian", params), "目标");
+            }
+            if (started) {
                 attempts = 0;
                 return;
             }

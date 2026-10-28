@@ -239,6 +239,9 @@ public final class SkillRunner {
             case "castobsidian" -> {
                 return runCastObsidian(intent, id);
             }
+            case "mineobsidian" -> {
+                return runMineObsidian(intent, id);
+            }
             case "buildportal" -> {
                 return runBuildPortal(intent, id);
             }
@@ -3147,7 +3150,438 @@ public final class SkillRunner {
     }
 
     /**
+     * 【fix105·Fong 2026-10-28 纠正：黑曜石主路】真玩家拿黑曜石就是挖：
+     * 走到岩浆湖边，水桶往湖面一浇，水流漫过的岩浆源全结成黑曜石壳，
+     * 再拿钻石镐把壳一块块挖走（Wiki：黑曜石硬度 50、须钻石镐以上才掉落；
+     * 身体层 destroyBlock 瞬时挖掘不走原版耗时，但工具等级正确性照常校验）。
+     * 浇铸（runCastObsidian）自 fix105 起降为兜底：本路线连败 3 次才切过去。
+     * 浇水用 {@code DispensibleContainerItem.emptyContents}——发射器同款的
+     * 原版放流体入口：放下的是真水源，之后水流与岩浆的相遇全走原版流体
+     * 结算结壳，不做逐格 setBlock 转置（旧浇铸正是逐格转置+setBlock 收水，
+     * 把 descend 守卫/热循环一串故障全绑在它身上）。
+     * 安全口径：先浇后挖；绝不挖脚下格（站立面）；着火/落岩浆立刻收手，
+     * 捡命交生存层；收尾把浇出去的水源舀回桶里循环用。
+     * 参数：x/y/z=岩浆源提示点（过时无妨，附近 6 格内重找露面岩浆源）、
+     * count=本趟要挖的块数。
+     */
+    private boolean runMineObsidian(Intent intent, int id) {
+        int x = intent.intParam("x", 0);
+        int y = intent.intParam("y", 0);
+        int z = intent.intParam("z", 0);
+        int want = Math.max(1, intent.intParam("count", 20));
+        BlockPos hint = new BlockPos(x, y, z);
+        // 选浇水中心：够得着的露面岩浆源里挑离 NPC 最远的一块（深进湖面）。
+        // staging 实证：浇在湖边最近格，水流要逐格爬到对岸、还被先挖的坑
+        // 引流，3×3 小池远端结壳拖到 1 分钟开外；浇在够得着的最深处
+        // （真玩家也是探身往湖里倒），水流四面铺开、整片 12 秒结齐。
+        // 够不着任何一块时退回最近的一块，站位判定会诚实失败交目标层。
+        BlockPos surface = null;
+        BlockPos nearest = null;
+        double bestFar = -1.0D;
+        double bestNear = Double.MAX_VALUE;
+        for (int dx = -6; dx <= 6; dx++) {
+            for (int dz = -6; dz <= 6; dz++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    BlockPos p = hint.offset(dx, dy, dz);
+                    BlockState s = npc.level().getBlockState(p);
+                    if (!s.is(Blocks.LAVA) || !s.getFluidState().isSource()
+                            || !npc.level().getBlockState(p.above()).isAir()) {
+                        continue;
+                    }
+                    double d = npc.position().distanceToSqr(Vec3.atCenterOf(p));
+                    if (d < bestNear) {
+                        bestNear = d;
+                        nearest = p;
+                    }
+                    if (d <= 5.5D * 5.5D && d > bestFar) {
+                        bestFar = d;
+                        surface = p;
+                    }
+                }
+            }
+        }
+        if (surface == null) {
+            surface = nearest;
+        }
+        if (surface == null) {
+            finish(id, "mineobsidian", "mineobsidian 未挖到 reason=提示点附近无露面岩浆源");
+            return true;
+        }
+        armWatchdog(id, "mineobsidian");
+        startObsidianPourCycle(id, surface, want, 0, 3);
+        return true;
+    }
+
+    /**
+     * 一轮「浇→等壳→挖」：走到 lavaCell 岸边站位、水浇到其上方一格、
+     * 等结壳后进挖壳状态机。本趟最多 4 轮（含首轮，cyclesLeft 递减），
+     * 每轮挖尽后由状态机舀水换下一片岩浆重浇——staging 实证：结壳在
+     * 有人边挖边等时会被挖坑引流拖慢（整片 30–60 秒），按轮推进比
+     * 死等一片可靠；纯等壳约 10 秒/片。
+     */
+    private void startObsidianPourCycle(int id, BlockPos lavaCell, int want, int mined,
+                                        int cyclesLeft) {
+        if (runId != id) {
+            return;
+        }
+        // 浇水前的位置 = 退避点：浇完立刻退回这里等壳。站在浇水点岸边等壳
+        // 会被漫开的水流一路冲走（staging 三度实证被冲下地形），真玩家
+        // 浇完水也会退后两步看着它结壳。
+        final BlockPos homeStand = npc.blockPosition();
+        final BlockPos pourAt = lavaCell.above();
+        BlockPos stand = findObsidianStand(lavaCell, pourAt);
+        if (stand == null) {
+            finish(id, "mineobsidian", mined > 0
+                    ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                    : "mineobsidian 未挖到 reason=岩浆边无安全站位 lava="
+                    + lavaCell.toShortString());
+            return;
+        }
+        Runnable pour = () -> {
+            if (runId != id) {
+                return;
+            }
+            if (countItem("water_bucket") <= 0) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=到湖边时水桶已空");
+                return;
+            }
+            net.minecraft.world.item.DispensibleContainerItem bucketItem =
+                    (net.minecraft.world.item.DispensibleContainerItem) Items.WATER_BUCKET;
+            boolean placed = bucketItem.emptyContents(null, npc.level(), pourAt, null);
+            if (!placed) {
+                placed = bucketItem.emptyContents(null, npc.level(), lavaCell, null);
+            }
+            if (!placed) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=浇水失败 pour="
+                        + pourAt.toShortString());
+                return;
+            }
+            replaceOneItem("water_bucket", "bucket");
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " obsidian-route | step=pour lava="
+                    + lavaCell.toShortString() + " pour=" + pourAt.toShortString()
+                    + " want=" + want + " mined=" + mined + " cyclesLeft=" + cyclesLeft);
+            // 浇完退回退避点等壳（约 10 秒）：站在浇水岸边会被漫开的水流
+            // 冲走（守位回走也顶不住持续水流，staging 三度实证被冲下
+            // 地形）；退避点是浇水前站的位置，水流漫不到。等满再开挖：
+            // 边结边挖时先挖出的坑会让上层水流优先灌进坑里、横流断链，
+            // 远处结壳被拖慢数倍。真玩家也是浇完退后看着壳结硬再挖。
+            Runnable beginMining = () -> Bukkit.getScheduler().runTaskLater(plugin,
+                    () -> mineObsidianNext(id, want, mined, new HashSet<>(), pourAt, 0,
+                            cyclesLeft, 3), 200L);
+            if (homeStand.equals(npc.blockPosition())) {
+                beginMining.run();
+            } else {
+                PathFinder.Result back = PathFinder.find(npc.level(), npc.blockPosition(),
+                        homeStand, !npc.wearingLeatherBoots());
+                if (back.found()) {
+                    npc.followPath(back.path(), false, beginMining, beginMining);
+                } else {
+                    beginMining.run();
+                }
+            }
+        };
+        if (stand.equals(npc.blockPosition())) {
+            pour.run();
+        } else {
+            PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand,
+                    !npc.wearingLeatherBoots());
+            if (!path.found()) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=到不了岩浆边 stand="
+                        + stand.toShortString());
+                return;
+            }
+            npc.followPath(path.path(), false, pour, () -> {
+                if (runId == id) {
+                    finish(id, "mineobsidian", mined > 0
+                            ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                            : "mineobsidian 未挖到 reason=前往岩浆边失败");
+                }
+            });
+        }
+    }
+
+    /** 岩浆边安全站位：够得着浇水点、脚下与头顶无流体、不在岩浆上。
+     * 高度优先：先找脚比岩浆面高 2 格的（站在高一格的岸上，水漫不到），
+     * 再退高 1 格/同层/低层——浇出的水在岩浆面上层横流，同层岸边站位
+     * 会被水流推走（staging 实证被冲下地形）。 */
+    private BlockPos findObsidianStand(BlockPos lavaCell, BlockPos pourAt) {
+        for (int dy : new int[] {2, 1, 0, -1}) {
+            for (int dx = -3; dx <= 3; dx++) {
+                for (int dz = -3; dz <= 3; dz++) {
+                    BlockPos p = lavaCell.offset(dx, dy, dz);
+                    if (p.equals(lavaCell) || p.equals(pourAt)
+                            || npc.level().getBlockState(p).is(Blocks.LAVA)
+                            || !npc.level().getBlockState(p).getFluidState().isEmpty()
+                            || !npc.level().getBlockState(p.above()).getFluidState().isEmpty()
+                            || !PathFinder.isStandable(npc.level(), p)) {
+                        continue;
+                    }
+                    Vec3 eye = new Vec3(p.getX() + 0.5, p.getY() + 1.62, p.getZ() + 0.5);
+                    if (eye.distanceToSqr(Vec3.atCenterOf(pourAt)) <= 4.6 * 4.6) {
+                        return p;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 被水流冲离工位时走回浇水点岸边站位再续挖（staging 实证：浇水后
+     * 站在岸边的身体会被漫过的水流推下地形边缘，扫描还在绕浇水点转、
+     * 人却越漂越远）。回位次数有上限，耗尽按已挖数收尾。
+     */
+    private void reanchorObsidian(int id, int want, int mined, Set<BlockPos> skipped,
+                                  BlockPos pourAt, int cyclesLeft, int anchorsLeft) {
+        BlockPos stand = findObsidianStand(pourAt.below(), pourAt);
+        if (stand == null) {
+            LOG.info("[AIV][SKILL] " + npc.npcName()
+                    + " obsidian-route | step=reanchor result=无站位可回，按已挖数收尾");
+            scoopMineObsidianWater(id, mined, want, pourAt);
+            return;
+        }
+        if (stand.equals(npc.blockPosition())) {
+            mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft, anchorsLeft);
+            return;
+        }
+        PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand,
+                !npc.wearingLeatherBoots());
+        if (!path.found()) {
+            LOG.info("[AIV][SKILL] " + npc.npcName()
+                    + " obsidian-route | step=reanchor result=寻路回位失败，按已挖数收尾 from="
+                    + npc.blockPosition().toShortString());
+            scoopMineObsidianWater(id, mined, want, pourAt);
+            return;
+        }
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " obsidian-route | step=reanchor stand="
+                + stand.toShortString() + " anchorsLeft=" + anchorsLeft);
+        npc.followPath(path.path(), false,
+                () -> mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft,
+                        anchorsLeft),
+                () -> scoopMineObsidianWater(id, mined, want, pourAt));
+    }
+
+    /**
+     * 本片挖尽后换下一片：找 NPC 附近下一块露面岩浆源——其上方是水流的
+     * 说明壳还在结（旧水流未尽），直接回挖壳状态机在那片继续等挖；上方
+     * 是空气的才舀水重浇。找不到下一片/水源丢失 → 按已挖数收尾。
+     */
+    private void repourObsidianCycle(int id, int want, int mined, int cyclesLeft,
+                                     BlockPos oldPourAt) {
+        if (runId != id) {
+            return;
+        }
+        BlockPos next = null;
+        double bestD = Double.MAX_VALUE;
+        BlockPos center = npc.blockPosition();
+        for (int dx = -14; dx <= 14; dx++) {
+            for (int dz = -14; dz <= 14; dz++) {
+                for (int dy = -3; dy <= 3; dy++) {
+                    BlockPos p = center.offset(dx, dy, dz);
+                    BlockState s = npc.level().getBlockState(p);
+                    if (!s.is(Blocks.LAVA) || !s.getFluidState().isSource()) {
+                        continue;
+                    }
+                    BlockState above = npc.level().getBlockState(p.above());
+                    if (!above.isAir() && !above.is(Blocks.WATER)) {
+                        continue;
+                    }
+                    double d = npc.position().distanceToSqr(Vec3.atCenterOf(p));
+                    if (d < bestD) {
+                        bestD = d;
+                        next = p;
+                    }
+                }
+            }
+        }
+        if (next == null) {
+            scoopMineObsidianWater(id, mined, want, oldPourAt);
+            return;
+        }
+        if (npc.level().getBlockState(next.above()).is(Blocks.WATER)) {
+            LOG.info("[AIV][SKILL] " + npc.npcName() + " obsidian-route | step=resume lava="
+                    + next.toShortString() + " mined=" + mined
+                    + " reason=上方水流未尽、结壳进行中");
+            mineObsidianNext(id, want, mined, new HashSet<>(), next.above(), 0, cyclesLeft, 3);
+            return;
+        }
+        if (countItem("water_bucket") <= 0 && !scoopObsidianSource(oldPourAt)) {
+            finish(id, "mineobsidian", mined > 0
+                    ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                    : "mineobsidian 未挖到 reason=水源丢失");
+            return;
+        }
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " obsidian-route | step=repour lava="
+                + next.toShortString() + " mined=" + mined + " cyclesLeft=" + cyclesLeft);
+        startObsidianPourCycle(id, next, want, mined, cyclesLeft);
+    }
+
+    /** 把 near 附近够得着的水源舀回桶里（fix70 同款模拟取水）；成功返回 true。 */
+    private boolean scoopObsidianSource(BlockPos near) {
+        if (countItem("bucket") <= 0) {
+            return countItem("water_bucket") > 0;
+        }
+        for (int dx = -4; dx <= 4; dx++) {
+            for (int dz = -4; dz <= 4; dz++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    BlockPos p = near.offset(dx, dy, dz);
+                    BlockState s = npc.level().getBlockState(p);
+                    if (s.is(Blocks.WATER) && s.getFluidState().isSource()
+                            && withinMineReach(p)) {
+                        npc.level().setBlockAndUpdate(p, Blocks.AIR.defaultBlockState());
+                        replaceOneItem("bucket", "water_bucket");
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " obsidian-route | step=scoop water=" + p.toShortString());
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 挖壳状态机：扫浇水点周边黑曜石，够得着直接挖、够不着走上壳面再挖。 */
+    private void mineObsidianNext(int id, int want, int mined, Set<BlockPos> skipped,
+                                  BlockPos pourAt, int emptyScans, int cyclesLeft,
+                                  int anchorsLeft) {
+        if (runId != id) {
+            return;
+        }
+        if (npc.level().getBlockState(npc.blockPosition()).is(Blocks.LAVA)
+                || npc.getRemainingFireTicks() > 40) {
+            finish(id, "mineobsidian", "mineobsidian 中止 reason=着火或落入岩浆 mined=" + mined);
+            return;
+        }
+        // 被水流冲离工位（掉下地形/漂出本片）：先回位再续挖。
+        BlockPos feetNow = npc.blockPosition();
+        double driftSq = (feetNow.getX() - pourAt.getX()) * (double) (feetNow.getX() - pourAt.getX())
+                + (feetNow.getZ() - pourAt.getZ()) * (double) (feetNow.getZ() - pourAt.getZ());
+        if ((feetNow.getY() < pourAt.getY() - 2 || driftSq > 121.0D) && anchorsLeft > 0) {
+            reanchorObsidian(id, want, mined, skipped, pourAt, cyclesLeft, anchorsLeft - 1);
+            return;
+        }
+        if (mined >= want) {
+            scoopMineObsidianWater(id, mined, want, pourAt);
+            return;
+        }
+        List<BlockPos> cands = new ArrayList<>();
+        for (int dx = -9; dx <= 9; dx++) {
+            for (int dz = -9; dz <= 9; dz++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    BlockPos p = pourAt.offset(dx, dy, dz);
+                    if (skipped.contains(p) || p.equals(npc.blockPosition().below())) {
+                        continue;
+                    }
+                    if (npc.level().getBlockState(p).is(Blocks.OBSIDIAN)) {
+                        cands.add(p);
+                    }
+                }
+            }
+        }
+        // 排序：近的先挖，但浇水格正下方那块壳必须最后挖——它是水源的
+        // 立足格，先挖掉水源会掉进坑里、上层横流断掉，整片结壳就此停摆
+        // （staging 实证：不留它时每趟只挖到 2 块）。真玩家也会留着水源
+        // 底下那块最后收。
+        BlockPos pourBelow = pourAt.below();
+        cands.sort((a, b) -> {
+            int pa = a.equals(pourBelow) ? 1 : 0;
+            int pb = b.equals(pourBelow) ? 1 : 0;
+            if (pa != pb) {
+                return Integer.compare(pa, pb);
+            }
+            return Double.compare(npc.position().distanceToSqr(Vec3.atCenterOf(a)),
+                    npc.position().distanceToSqr(Vec3.atCenterOf(b)));
+        });
+        if (cands.isEmpty()) {
+            // 结壳是渐进的，且有人在场边挖边等时会被挖坑引流拖慢
+            // （staging 实证整片可达 30–60 秒）：统一耐心 30 轮扫描
+            // （约 30 秒），挖尽后还有轮次就换下一片重浇。
+            int patience = 30;
+            if (emptyScans < patience) {
+                Bukkit.getScheduler().runTaskLater(plugin,
+                        () -> mineObsidianNext(id, want, mined, skipped, pourAt, emptyScans + 1, cyclesLeft, anchorsLeft), 20L);
+                return;
+            }
+            if (cyclesLeft > 0) {
+                repourObsidianCycle(id, want, mined, cyclesLeft - 1, pourAt);
+            } else if (mined > 0) {
+                scoopMineObsidianWater(id, mined, want, pourAt);
+            } else {
+                finish(id, "mineobsidian", "mineobsidian 未挖到 reason=浇水后未形成黑曜石壳");
+            }
+            return;
+        }
+        BlockPos target = cands.get(0);
+        if (withinMineReach(target)) {
+            boolean ok = npc.mineWithBestTool(target);
+            if (!ok) {
+                skipped.add(target);
+            }
+            int m2 = mined + (ok ? 1 : 0);
+            Bukkit.getScheduler().runTaskLater(plugin,
+                    () -> mineObsidianNext(id, want, m2, skipped, pourAt, 0, cyclesLeft, anchorsLeft), 2L);
+            return;
+        }
+        // 走上壳面再挖：站位 = 目标相邻实心格（壳面/岸石）的上方一格。
+        // 旧写法拿目标同层格当站位——那格要么是实心黑曜石（站不进去）、
+        // 要么是岩浆格（isStandable 只看碰撞，岩浆无碰撞会被误判可站，
+        // staging 实证 NPC 被引到岩浆格站位、掉出池外 mined=0 收场）。
+        BlockPos stand = null;
+        for (Direction dir : Direction.Plane.HORIZONTAL) {
+            BlockPos footing = target.relative(dir);
+            BlockState footingState = npc.level().getBlockState(footing);
+            if (!footingState.getFluidState().isEmpty()
+                    || footingState.getCollisionShape(npc.level(), footing).isEmpty()) {
+                continue;
+            }
+            BlockPos s = footing.above();
+            if (s.equals(pourAt)
+                    || !npc.level().getBlockState(s).getFluidState().isEmpty()
+                    || !PathFinder.isStandable(npc.level(), s)) {
+                continue;
+            }
+            stand = s;
+            break;
+        }
+        if (stand == null) {
+            skipped.add(target);
+            Bukkit.getScheduler().runTaskLater(plugin,
+                    () -> mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft, anchorsLeft), 1L);
+            return;
+        }
+        PathFinder.Result shellPath = PathFinder.find(npc.level(), npc.blockPosition(), stand,
+                !npc.wearingLeatherBoots());
+        if (!shellPath.found()) {
+            skipped.add(target);
+            Bukkit.getScheduler().runTaskLater(plugin,
+                    () -> mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft, anchorsLeft), 1L);
+            return;
+        }
+        npc.followPath(shellPath.path(), false,
+                () -> mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft, anchorsLeft),
+                () -> {
+                    skipped.add(target);
+                    mineObsidianNext(id, want, mined, skipped, pourAt, 0, cyclesLeft, anchorsLeft);
+                });
+    }
+
+    /** 收尾：浇出去的水源还在够得着处就舀回桶里，一桶水循环用。 */
+    private void scoopMineObsidianWater(int id, int mined, int want, BlockPos pourAt) {
+        scoopObsidianSource(pourAt);
+        finish(id, "mineobsidian", "mineobsidian 完成 mined=" + mined + " want=" + want);
+    }
+
+    /**
      * 浇铸一个黑曜石：水浇岩浆源 → 用钻石镐挖掉 → 把水收回桶里。
+     * 【fix105 起降为兜底路线：主路是 runMineObsidian 的挖矿路线，本路线只在
+     * 挖矿路线连败 3 次后由目标层切换过来；产物同样要钻石镐才挖得下，
+     * 无钻镐时目标层直接交规划层补镐、不会派到这里。】
      *
      * <p>为什么直接 setBlock 转黑曜石：原版水与岩浆的相遇要等流体刻，
      * 还会生成圆石/石头；这里只取"水源浇岩浆源=黑曜石"这一确定结果，
