@@ -1694,6 +1694,27 @@ public final class SurvivalController {
                     continue;
                 }
             }
+            // 【fix93·D8】下界金靴锁定（与上方细雪皮靴特例同构）：身在下界
+            // 时脚部只认金靴——猪灵只认金子，金靴防御分最低、纯评分口径下
+            // 进下界第一轮装备检查就会被铁/钻靴换掉，D8 等于白定。金靴在
+            // 脚上时不许被非金靴换下；包里有金靴而脚上不是，无视评分换上。
+            // 离开下界后恢复纯防御评分（主世界该穿钻靴穿钻靴）。
+            if (equipmentSlot == EquipmentSlot.FEET
+                    && npc.level().dimension().identifier().toString().contains("the_nether")) {
+                boolean candidateGold = candidate.is(Items.GOLDEN_BOOTS);
+                boolean currentGold = current.is(Items.GOLDEN_BOOTS);
+                if (currentGold && !candidateGold) {
+                    continue;
+                }
+                if (candidateGold && !currentGold) {
+                    npc.setItemSlot(equipmentSlot, candidate);
+                    inventory.setItem(slot, current);
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                            + " nether-gold | 下界换上金靴 替换="
+                            + (current.isEmpty() ? "空" : current.getItem().toString()));
+                    continue;
+                }
+            }
             if (candidateScore <= currentScore) {
                 continue;
             }

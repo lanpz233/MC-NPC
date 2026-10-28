@@ -1534,6 +1534,32 @@ public final class ProgressionPlanner {
             return sustainStep(food, hasSword, wood);
         }
         if (planHas(StagePlan.PORTAL_PREP) && eyes < 12) {
+            // 【fix93·D8】下界金装闸：Fong 定下界必穿一件金装（猪灵只认
+            // 身上的金子，没穿的当入侵者围殴）。金靴最便宜（4 锭），定为
+            // 指定件：脚上/包里都没有金靴时，先烧金、做金靴、缺料挖金，
+            // 全部排在造门/进门之前——门一走进去就是下界，没有补救窗口。
+            // 执行层 tickPortal/tickEnterPortal 还有强制换靴的最后一道闸。
+            boolean goldBootsReady = countItem("golden_boots") > 0
+                    || npc.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET)
+                            .is(net.minecraft.world.item.Items.GOLDEN_BOOTS);
+            if (!goldBootsReady) {
+                int goldIngots = countItem("gold_ingot");
+                int rawGold = countItem("raw_gold");
+                if (goldIngots >= 4) {
+                    return goal("制作金靴（下界金装）", "craft",
+                            params("item", "golden_boots", "count", 1));
+                }
+                if (rawGold > 0 && goldIngots + rawGold >= 4 && hasFurnace && canFuel()) {
+                    return goal("冶炼金锭（下界金装）", "smelt",
+                            params("item", "gold_ingot", "count", Math.min(rawGold, 4 - goldIngots)));
+                }
+                if (goldIngots + rawGold < 4) {
+                    return goal("挖金（下界金装）", "dig",
+                            params("resource", "gold", "count", 4 - goldIngots - rawGold));
+                }
+                // 有料但缺熔炉/燃料：不硬卡，落回下方常规链（熔炉在主线
+                // 更前处维护），执行层进门闸会兜底拦住无金装进门。
+            }
             BlockPos existingPortal = goals.nearbyPortal();
             if (existingPortal != null) {
                 // 附近已经有亮着的门：玩家不会浪费材料再造一座，直接走进去。

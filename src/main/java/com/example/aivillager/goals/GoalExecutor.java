@@ -4495,6 +4495,11 @@ public final class GoalExecutor {
                     finish("传送门选址丢失");
                     return;
                 }
+                // 【fix93·D8】自建门走进去之前同样过金装闸（主世界侧）。
+                if (!inNetherDim() && !ensureGoldBootsWorn()) {
+                    finish("进门中止：包里没有金靴（D8 下界须穿一件金装）");
+                    return;
+                }
                 double x = portalAlongX ? portalOrigin.getX() + 2.0D : portalOrigin.getX() + 0.5D;
                 double z = portalAlongX ? portalOrigin.getZ() + 0.5D : portalOrigin.getZ() + 2.0D;
                 double y = portalOrigin.getY() + 1.0D;
@@ -4524,10 +4529,46 @@ public final class GoalExecutor {
      * 玩家看到门的第一反应就是走进去，而不是再造一座。真正搬运身体的工作交给
      * {@code enterportal} 技能（持续贴门 + 维度变化检测），这里只负责重试和判定。
      */
+    /** 当前是否身处下界维度（与规划层 inNether 同口径）。 */
+    private boolean inNetherDim() {
+        return npc.level().dimension().identifier().toString().contains("the_nether");
+    }
+
+    /**
+     * 【fix93·D8】进门前把金靴换到脚上：主世界侧 AutoArmor 按防御分穿
+     * 最好的靴子，金靴（防御 1）永远轮不到——进下界前必须强制换装，
+     * 换不出来（包里没有金靴）就中止进门，宁可不进也不许裸装进下界
+     * 被猪灵围殴。下界内回程进门不拦（方向相反，且金靴本就该在脚上）。
+     */
+    private boolean ensureGoldBootsWorn() {
+        net.minecraft.world.entity.EquipmentSlot feet =
+                net.minecraft.world.entity.EquipmentSlot.FEET;
+        if (npc.getItemBySlot(feet).is(net.minecraft.world.item.Items.GOLDEN_BOOTS)) {
+            return true;
+        }
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (!stack.isEmpty() && stack.is(net.minecraft.world.item.Items.GOLDEN_BOOTS)) {
+                ItemStack old = npc.getItemBySlot(feet);
+                npc.setItemSlot(feet, stack);
+                npc.getInventory().setItem(slot, old);
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [NETHER] 进门前换上金靴 | 替换="
+                        + (old.isEmpty() ? "空" : old.getItem().toString()));
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void tickEnterPortal() {
         BlockPos portal = nearbyPortal();
         if (portal == null) {
             finish("附近找不到已点亮的传送门");
+            return;
+        }
+        // 【fix93·D8】主世界侧进门先过金装闸（下界内回程不拦）。
+        if (!inNetherDim() && !ensureGoldBootsWorn()) {
+            finish("进门中止：包里没有金靴（D8 下界须穿一件金装）");
             return;
         }
         attempts++;
@@ -5927,10 +5968,16 @@ public final class GoalExecutor {
             case "spider_eye", "poisonous_potato", "pufferfish" -> {
                 return 0;
             }
+            // 【fix93·D8】金靴是下界金装指定件（进下界的钥匙），不是低阶
+            // 废品：单列保留 1——旧口径把它混在下方低阶护甲组里（有石镐就
+            // 保留=0），做出来也会被配额裁剪扔掉，金装闸永远齐不了料。
+            case "golden_boots" -> {
+                return 1;
+            }
             // 低阶工具/护甲：有更好的就丢，留着只会占槽位。
             case "wooden_pickaxe", "wooden_sword", "wooden_axe", "wooden_shovel", "wooden_hoe",
                  "leather_helmet", "leather_chestplate", "leather_leggings", "leather_boots",
-                 "golden_helmet", "golden_chestplate", "golden_leggings", "golden_boots",
+                 "golden_helmet", "golden_chestplate", "golden_leggings",
                  "chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots" -> {
                 // 用"可用口径"（countItemFor，滤掉只剩 1 耐久的）判断有没有更好的镐：
                 // 以前用 countItem，一把只剩 1 耐久的石镐也会让木镐保留量变 0，
