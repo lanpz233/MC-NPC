@@ -6600,6 +6600,15 @@ public final class GoalExecutor {
                 if (slot == protectedPickaxe) {
                     continue;
                 }
+                // 【fix119】耐久物一律不做一线受害者（与二线硬保对齐）：
+                // farm83 实证——钻剑磨到 1 耐久时 isEssential 首行判「废品」
+                //（同后缀石剑/铁剑可用 → 不算唯一），count=1 又是全包最小堆，
+                // 被兜底扔掉给腐肉腾位。武器再破也是武器（钻剑 1 耐久照样
+                // 8 点伤害），玩家满包先扔大宗垃圾、绝不扔神装。腾不出就
+                // 如实返回不足、调用方失败退避（兜底通则的降级路径）。
+                if (stack.isDamageableItem()) {
+                    continue;
+                }
                 if (isEssential(stack)) {
                     continue;
                 }
