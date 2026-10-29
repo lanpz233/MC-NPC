@@ -1281,9 +1281,13 @@ public final class ProgressionPlanner {
             if (baseForStore != null
                     && npc.blockPosition().distSqr(baseForStore.anchor()) <= 48.0D * 48.0D) {
                 if (baseForStore.chestPos() == null && countItem("chest") == 0
-                        && countSuffix("_planks") >= 8) {
-                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 做箱子触发 | 木板="
-                            + countSuffix("_planks"));
+                        && wood >= 8) {
+                    // 【fix128】触发量改木材当量：旧版只数现成木板，NPC 常年
+                    // 只带原木（36 原木/0 木板）→ 箱子永远不做、存箱从未触发、
+                    // 贵重物只进不出把包结构性塞满。玩家做箱子看的是木头
+                    // 够不够（2 原木=8 木板），与全篇 wood 当量口径对齐。
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 做箱子触发 | 木材当量="
+                            + wood + "（木板=" + countSuffix("_planks") + "）");
                     return goal("制作箱子", "craft", params("item", "chest", "count", 1));
                 }
                 if ((baseForStore.chestPos() != null || countItem("chest") > 0)
