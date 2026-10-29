@@ -1420,6 +1420,12 @@ public final class GoalExecutor {
     private String craftMissing(org.bukkit.inventory.RecipeChoice choice, int depth,
                                 java.util.Set<String> visiting) {
         String lastError = null;
+        // 【fix126】「背包已满」优先报真因：farm89 实证——木板候选里橡木/白桦
+        // 明明有原木、真因是背包已满产物放不下，其余树种真缺料；旧版返回
+        // 最后一个候选的错误（樱花原木），把真因掩盖成「缺少材料」，规划层
+        // 按文案触发的退避（fix116）随之落空、主线热循环。任一候选报背包
+        // 已满就优先返回第一个该错误，其余维持 lastError 口径。
+        String firstFullError = null;
         for (String candidate : candidatePaths(choice)) {
             org.bukkit.Material material = org.bukkit.Material.matchMaterial(candidate);
             if (material == null || !material.isItem()) {
@@ -1439,7 +1445,13 @@ public final class GoalExecutor {
             if (OK.equals(error)) {
                 return null;
             }
+            if (firstFullError == null && error != null && error.contains("背包已满")) {
+                firstFullError = error;
+            }
             lastError = error;
+        }
+        if (firstFullError != null) {
+            return firstFullError;
         }
         return lastError != null ? lastError : "缺少材料：" + describeChoice(choice);
     }

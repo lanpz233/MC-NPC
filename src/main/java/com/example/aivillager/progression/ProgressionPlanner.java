@@ -370,13 +370,19 @@ public final class ProgressionPlanner {
         if (goalNewOutcome) {
             // 【fix116】备用镐合成"背包已满"专属记账（与上面的阶段名链独立：
             // 触发条件是阶段名前缀 + 失败文案，只堵不疏的软向导必须让位）。
-            if (lastStage != null && lastStage.startsWith("补一把备用")) {
+            // 【fix126】扩面：farm89 实证主线步「制作石镐」同病热循环 29 次
+            // （阶段名前缀不匹配、文案又被 craftMissing 掩盖——掩盖已由
+            // fix126-A 修）。条件扩为：（备用步前缀 ∨ 合成失败文案）∧ 背包
+            // 已满，同字段记账；派单侧 L880/L936 制作石镐与木镐支同加闸。
+            if (lastStage != null && lastStage.startsWith("补一把备用")
+                    || (goalOutcomeText != null && goalOutcomeText.contains("合成失败")
+                            && goalOutcomeText.contains("背包已满"))) {
                 if (goalFailed && goalOutcomeText != null && goalOutcomeText.contains("背包已满")) {
                     pickCraftFailStreak++;
                     pickCraftBackoffUntil = now + Math.min(600_000L, 120_000L * pickCraftFailStreak);
-                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 备用镐合成退避 | 连败=" + pickCraftFailStreak
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成退避 | 连败=" + pickCraftFailStreak
                             + " 退避秒=" + (pickCraftBackoffUntil - now) / 1000L
-                            + "（背包已满做不出来，先干主线）");
+                            + "（背包已满做不出来，先干别的）阶段=" + lastStage);
                 } else if (!goalFailed) {
                     pickCraftFailStreak = 0;
                     pickCraftBackoffUntil = 0L;
@@ -638,6 +644,18 @@ public final class ProgressionPlanner {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 跳过刚失败的阶段 | " + step.stage);
             return;
         }
+        // 【fix127】合成退避派单总闸：退避记账（fix116/126）已覆盖一切
+        // 「合成失败+背包已满」，但派单侧靠逐个派单位加闸——fix126 部署
+        // 当晚「制作钻石靴子」绕过全部已加闸的补镐派单位：记账涨到
+        // 连败=8、退避恒 600 秒，仍每 60 秒照派照败。收口到派单总口：
+        // 候选是 craft 目标且退避未到期 → 本轮不派（专行日志），到期后
+        // decide 自然重派。全 craft 步一致口径、新派单位自动受闸。
+        if (step.kind == Kind.GOAL && "craft".equals(step.intent.action())
+                && System.currentTimeMillis() < pickCraftBackoffUntil) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成退避中跳过派单 | 阶段=" + step.stage
+                    + " 剩余秒=" + (pickCraftBackoffUntil - System.currentTimeMillis()) / 1000L);
+            return;
+        }
 
         lastStartAt = now;
         lastStage = step.stage;
@@ -876,13 +894,17 @@ public final class ProgressionPlanner {
         // 2) 镐子：没有镐就永远挖不到石头，整条科技树都卡住。
         if (!hasPickaxe && planHas(StagePlan.WOOD_TOOLS)) {
             // 能直接做石镐就做石镐：131 点耐久是木镐的两倍多，圆石在地表到处都是。
-            if (cobble >= 3 && stickMaterial) {
+            // 【fix126】背包已满退避期不派合成（同备用镐派单位口径）：落到
+            // 下面的 ascend/gatherLogs 支先改变处境，不原地热循环。
+            if (cobble >= 3 && stickMaterial
+                    && System.currentTimeMillis() >= pickCraftBackoffUntil) {
                 return goal("制作石镐", "craft", params("item", "stone_pickaxe", "count", 1));
             }
             // 木镐配方 = 3 木板 + 2 木棍；2 根木棍自己还要 2 块木板，
             // 所以没有存货木棍时需要 5 块木板当量，不是 4（1 根原木只出 4 块，必须再砍一棵）。
             // 另外必须有真实木棍材料（stickMaterial），只有竹子也做不出木棍来。
-            if (stickMaterial && wood >= (sticks >= 2 ? 3 : 5)) {
+            if (stickMaterial && wood >= (sticks >= 2 ? 3 : 5)
+                    && System.currentTimeMillis() >= pickCraftBackoffUntil) {
                 return goal("制作木镐", "craft", params("item", "wooden_pickaxe", "count", 1));
             }
             // 两手空空（镐全碎、连做木镐的木料都没有）又在地下：靠手挖阶梯回地表。
@@ -932,7 +954,9 @@ public final class ProgressionPlanner {
 
         // 5) 石镐 → 石剑。
         if (planHas(StagePlan.STONE_TOOLS) && !hasStonePickaxe) {
-            if (cobble >= 3 && stickMaterial) {
+            // 【fix126】同退避闸：背包已满时穿过合成支，落到补石头/gather 支。
+            if (cobble >= 3 && stickMaterial
+                    && System.currentTimeMillis() >= pickCraftBackoffUntil) {
                 return goal("制作石镐", "craft", params("item", "stone_pickaxe", "count", 1));
             }
             if (!stickMaterial) {
