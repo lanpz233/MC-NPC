@@ -826,26 +826,38 @@ public final class ProgressionPlanner {
                     }
                 }
             }
-            if (hasSword) {
+            // 【fix122】夜猎 hp 闸：夜里且血已到惜命线（≤35%）时步 0 整体
+            // 暂缓——#12/#13 都是 hp 1.7 入夜开猎、被一击收尾。落到下面
+            // 睡觉（5.55）/小屋（5.6）步过夜，天亮 decide 自然回到本步续猎；
+            // 饿一晚掉血有限，被怪打死是全损，玩家也是先躲后吃。
+            boolean hungerNightHold = isNight() && npc.getHealth() <= 7.0D;
+            if (hungerNightHold) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿夜猎暂缓（fix122） | hp="
+                        + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                        + " foodLevel=" + foodLevel + "（落睡觉/小屋步过夜，天亮再猎）");
+            }
+            if (!hungerNightHold && hasSword) {
                 return goal("饥饿求生", "hunt",
                         params("need", "food", "stock", 12, "radius", 12));
             }
             // 【第三十二轮】材料够就先合一把武器再去找吃的：长跑#9 工具全灭后，
             // 背包里原木/圆石/铁锭明明够合剑，这一支却只派「采集木头」，
             // 在雪原找树连败 5 次死锁到收尾。合成只要几秒，先有武器 hunt 才派得出去。
-            if (ingots >= 2 && stickMaterial) {
+            if (!hungerNightHold && ingots >= 2 && stickMaterial) {
                 return goal("饥饿求生：先造铁剑", "craft",
                         params("item", "iron_sword", "count", 1));
             }
-            if (cobble >= 2 && stickMaterial) {
+            if (!hungerNightHold && cobble >= 2 && stickMaterial) {
                 return goal("饥饿求生：先造石剑", "craft",
                         params("item", "stone_sword", "count", 1));
             }
-            if (stickMaterial && wood >= (sticks >= 1 ? 2 : 4)) {
+            if (!hungerNightHold && stickMaterial && wood >= (sticks >= 1 ? 2 : 4)) {
                 return goal("饥饿求生：先造木剑", "craft",
                         params("item", "wooden_sword", "count", 1));
             }
-            return gatherLogs("饥饿但无武器");
+            if (!hungerNightHold) {
+                return gatherLogs("饥饿但无武器");
+            }
         }
 
         // 1) 工作台（玩家发展的第一个标志物）。
@@ -1042,9 +1054,13 @@ public final class ProgressionPlanner {
             // 【fix39·夜晚总闸】夜里在地表不为补口粮远行打猎（#12 两死型）：
             // 未挨饿（foodLevel>6）时跳过 hunt，落到冶炼/合成/下矿等原地或
             // 地下步骤；真饿了照旧先补给——饿死比夜怪更确定。
-            if (isNight() && npc.getFoodData().getFoodLevel() > 6) {
+            // 【fix122】真饿放行加 hp 下限：血已到惜命线（≤7）时同禁——
+            // #13 即 food=4、hp 1.7 夜猎开打、一击致死；先过夜、天亮再补。
+            if (isNight() && (npc.getFoodData().getFoodLevel() > 6
+                    || npc.getHealth() <= 7.0D)) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 口粮 hunt 夜里跳过（夜晚总闸） | foodLevel="
-                        + npc.getFoodData().getFoodLevel());
+                        + npc.getFoodData().getFoodLevel()
+                        + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth()));
             } else {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 随身口粮见底，先补口粮 | foodNutrition=0");
                 return goal("补随身口粮", "hunt",
@@ -2338,9 +2354,13 @@ public final class ProgressionPlanner {
         // boot-farm14 实锤）。照步 6.6 夜间闸先例：夜里且并不真饿（foodLevel>6）时
         // 暂缓补猎、放行下潜——地下不分昼夜，储备 13 够用，饥饿升井链是硬兜底；
         // 真饿（foodLevel≤6）夜里照旧先猎，不拿命赌。
-        if (isNight() && npc.getFoodData().getFoodLevel() > 6) {
+        // 【fix122】真饿放行同加 hp 下限（惜命线 ≤7 同禁，与步 0/6.6 同口径）。
+        if (isNight() && (npc.getFoodData().getFoodLevel() > 6
+                || npc.getHealth() <= 7.0D)) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 下矿口粮门夜间暂缓 | foodNutrition=" + value
-                    + " foodLevel=" + npc.getFoodData().getFoodLevel() + "（夜里无猎物，天亮再补）");
+                    + " foodLevel=" + npc.getFoodData().getFoodLevel()
+                    + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                    + "（夜里无猎物或低血保命，天亮再补）");
             return null;
         }
         if (underground()) {
