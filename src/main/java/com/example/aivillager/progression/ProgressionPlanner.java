@@ -528,7 +528,7 @@ public final class ProgressionPlanner {
                 if (goalFailed) {
                     hungerHuntFailStreak++;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿狩猎连败=" + hungerHuntFailStreak
-                            + "（≥3 且离补给点 >48 格时改走回农场）");
+                            + "（≥3 且未到家（水平>48 或高差>12）时改走回农场）");
                 } else {
                     hungerHuntFailStreak = 0;
                 }
@@ -807,11 +807,18 @@ public final class ProgressionPlanner {
                 if (hungerHome != null) {
                     double hDx = hungerHome.getX() + 0.5D - npc.getX();
                     double hDz = hungerHome.getZ() + 0.5D - npc.getZ();
-                    if (hDx * hDx + hDz * hDz > 48.0D * 48.0D) {
+                    double hDy = npc.getY() - hungerHome.getY();
+                    // 【fix118】「未到家」须算垂直差：悬在农场上方高原时水平
+                    // 距离 ≤48 会误判已到家（farm83 实证：水平 32 格、高差
+                    // 37 格，退避到期后回头高原空猎、hp 钉在 1.7）。高差
+                    // >12（与 fix114 柱顶分档同量级）同样派 travel，让目标层
+                    // 竖向对齐（fix107）把它带下崖。
+                    if (hDx * hDx + hDz * hDz > 48.0D * 48.0D || Math.abs(hDy) > 12.0D) {
                         LOG.info("[AIV][PLAN] " + npc.npcName()
                                 + " 饥饿回程触发 | 目标=" + (hungerFarm != null ? "农场" : "落脚点")
                                 + " " + hungerHome.toShortString()
                                 + " 距离=" + Math.round(Math.sqrt(hDx * hDx + hDz * hDz))
+                                + " 高差=" + Math.round(hDy)
                                 + " 饥饿狩猎连败=" + hungerHuntFailStreak);
                         return goal("饥饿求生：回农场", "travel",
                                 params("x", hungerHome.getX(), "y", hungerHome.getY(),
