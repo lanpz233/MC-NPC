@@ -1853,19 +1853,33 @@ public final class ProgressionPlanner {
                 }
                 return goal("制作弓", "craft", params("item", "bow", "count", 1));
             }
-            return goal("猎杀蜘蛛取线", "slay", params("entity", "spider", "count", 3));
+            // 【fix120】步 13.2 夜闸：夜里不出去猎蜘蛛取线——天黑还在野外
+            // 晃正是 #9/#13 的死型。穿过本段落到步 14 小屋等过夜步，天亮
+            // decide 自然回到本段续派。
+            if (isNight()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 猎蜘蛛取线夜里跳过（夜晚总闸·fix120）");
+            } else {
+                return goal("猎杀蜘蛛取线", "slay", params("entity", "spider", "count", 3));
+            }
         }
         if (planHas(StagePlan.BOW_ARROWS) && countItem("arrow") < 24) {
-            if (countItem("feather") < 6) {
-                return goal("猎杀鸡取羽毛", "slay", params("entity", "chicken", "count", 6));
+            // 【fix120】箭的野外材料步（猎鸡取羽毛/找燧石）同闸：缺任一野外
+            // 材料时夜里整段跳过，避免穿到合成步空转失败。
+            if (isNight() && (countItem("feather") < 6 || countItem("flint") < 6)) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 箭材料野外步夜里跳过（夜晚总闸·fix120）"
+                        + " | feather=" + countItem("feather") + " flint=" + countItem("flint"));
+            } else {
+                if (countItem("feather") < 6) {
+                    return goal("猎杀鸡取羽毛", "slay", params("entity", "chicken", "count", 6));
+                }
+                if (countItem("flint") < 6) {
+                    return goal("找燧石", "flint", params("count", 6));
+                }
+                if (!stickMaterial) {
+                    return gatherLogs("箭缺木棍");
+                }
+                return goal("制作箭", "craft", params("item", "arrow", "count", 24));
             }
-            if (countItem("flint") < 6) {
-                return goal("找燧石", "flint", params("count", 6));
-            }
-            if (!stickMaterial) {
-                return gatherLogs("箭缺木棍");
-            }
-            return goal("制作箭", "craft", params("item", "arrow", "count", 24));
         }
 
         // 13.4) 眼睛齐了：找要塞，走到末地传送门房间并镶满眼睛。
