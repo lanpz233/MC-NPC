@@ -3490,6 +3490,43 @@ public final class GoalExecutor {
                 instanceof net.minecraft.world.level.block.BedBlock;
     }
 
+    /** 床的另一格：账本存脚格时按 FACING 定头格，存头格时反之。非床返回 null。 */
+    private BlockPos bedOtherCell(BlockPos bed) {
+        BlockState state = npc.level().getBlockState(bed);
+        if (!(state.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+            return null;
+        }
+        net.minecraft.core.Direction facing =
+                state.getValue(net.minecraft.world.level.block.BedBlock.FACING);
+        return state.getValue(net.minecraft.world.level.block.BedBlock.PART)
+                == net.minecraft.world.level.block.state.properties.BedPart.FOOT
+                ? bed.relative(facing) : bed.relative(facing.getOpposite());
+    }
+
+    /**
+     * 【fix130】床边可站立格（与 SurvivalController fix95 复活站位同规则）：
+     * 床占两格，按 PART 定出另一格，两格的四邻逐个验 PathFinder.isStandable，
+     * 首个可站的返回；床已不在或四邻全堵返回 null（睡觉 phase 0 回落锚点口径）。
+     */
+    private BlockPos findBedStandCell(BlockPos bed) {
+        BlockPos other = bedOtherCell(bed);
+        if (other == null) {
+            return null;
+        }
+        for (BlockPos cell : new BlockPos[]{bed, other}) {
+            for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                BlockPos stand = cell.relative(dir);
+                if (stand.equals(bed) || stand.equals(other)) {
+                    continue;
+                }
+                if (PathFinder.isStandable(npc.level(), stand)) {
+                    return stand;
+                }
+            }
+        }
+        return null;
+    }
+
     /**
      * 【fix115】原版床阻挡判定复刻（Leaves 1.21.11 ServerPlayer.bedBlocked
      * 字节码实证）：startSleepInBed 只查两格——床格（账本存脚位）上方、
@@ -3793,7 +3830,35 @@ public final class GoalExecutor {
             case 0 -> {
                 status = "睡觉：回床边";
                 clearDoorPlugs(anchor);
-                if (npc.blockPosition().distSqr(anchor) <= 1.0D) {
+                // 【fix130】到达判定改床边口径：旧版只认 distSqr(anchor)≤1，
+                // 而 moveToStand 的 goto 只带 x/z、Y 由寻路解析——NPC 站到锚点
+                // 正下方 3 格（farm94：站 (733,62,-129)、anchor Y=65）时水平
+                // 贴死却永不达标，每秒原地 goto 磨 46 秒判败（连败 6 次）。
+                // 玩家判到达看离床近不近：按 fix95 同规则找床边可站立格作
+                // 站位目标，到达=「水平距床 ≤2 格且 |dy|≤2」与旧锚点判定取或；
+                // 找不到床边格时回落旧锚点口径，兜底不缺位。
+                BlockPos bedStand = findBedStandCell(bed);
+                BlockPos standTarget = bedStand != null ? bedStand : anchor;
+                boolean atAnchor = npc.blockPosition().distSqr(anchor) <= 1.0D;
+                // 【fix131】按床两格邻域判：fix130 首试量到床脚中心——床占
+                // 两格、站位在床头外侧时中心距恰 2.0 格、dist²=4.026 卡在
+                // ≤4.0 门槛外 0.026（farm95 实证：人站在床边格上仍判不到）。
+                // 改为方块位与床脚/床头任一格水平偏差 ≤1 且 |dy|≤2 即到达。
+                boolean atBedside = false;
+                {
+                    BlockPos other = bedOtherCell(bed);
+                    BlockPos me = npc.blockPosition();
+                    for (BlockPos cell : new BlockPos[]{bed, other}) {
+                        if (cell != null
+                                && Math.abs(me.getX() - cell.getX()) <= 1
+                                && Math.abs(me.getZ() - cell.getZ()) <= 1
+                                && Math.abs(me.getY() - cell.getY()) <= 2) {
+                            atBedside = true;
+                            break;
+                        }
+                    }
+                }
+                if (atAnchor || atBedside) {
                     plugDoor(anchor);
                     sleepPhase = 1;
                     return;
@@ -3809,7 +3874,7 @@ public final class GoalExecutor {
                     finish("睡觉放弃：到不了床边");
                     return;
                 }
-                moveToStand(anchor, sleepActionStuck, "[BED]");
+                moveToStand(standTarget, sleepActionStuck, "[BED]");
             }
             case 1 -> {
                 status = "睡觉：上床";
@@ -3818,17 +3883,23 @@ public final class GoalExecutor {
                 // 两格），挖掉后不收场、下 tick 复查清净了才真正上床——
                 // 旧行为是秒败 finish + 规划层约 1 秒一轮重派热循环
                 // （farm79 首睡实证：墙基圆石压住判定格）。
+                // 【fix132】清障改定点拆格：fix115 旧调用走 mine 技能只带
+                // x/y/z，而 SkillRunner.runMine 只认 block 名参——出生即
+                // 「mine 参数非法」恒失败、清障从未执行过（farm97 实证：
+                // 门塞后紧跟参数非法行，随即撞 OBSTRUCTED 秒败）。玩家是
+                // 哪格挡着敲哪格：照 clearDoorPlugs 同口径定点拆掉该格
+                // （setBlockAndUpdate AIR + 方块回包），不按名满屋找同类块。
                 BlockPos plugCell = bedObstructionCell(bed);
                 if (plugCell != null) {
-                    if (skills.run(new Intent("", "mine", params("x", plugCell.getX(),
-                            "y", plugCell.getY(), "z", plugCell.getZ())), "目标")) {
-                        status = "睡觉：清床上方块";
-                        LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 床被上方方块堵住，先挖掉 | cell="
-                                + plugCell.toShortString() + " block="
-                                + BuiltInRegistries.BLOCK.getKey(
-                                        npc.level().getBlockState(plugCell).getBlock()).getPath());
-                        return;
-                    }
+                    String plugPath = BuiltInRegistries.BLOCK.getKey(
+                            npc.level().getBlockState(plugCell).getBlock()).getPath();
+                    npc.level().setBlockAndUpdate(plugCell,
+                            net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
+                    give(plugPath, 1);
+                    status = "睡觉：清床上方块";
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 床被上方方块堵住，定点拆掉 | cell="
+                            + plugCell.toShortString() + " block=" + plugPath);
+                    return;
                 }
                 var result = npc.startSleepInBed(bed, false);
                 if (result.left().isPresent()) {
