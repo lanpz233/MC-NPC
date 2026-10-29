@@ -190,6 +190,15 @@ public final class ProgressionPlanner {
     private int homeReturnFailStreak;
     private long homeReturnBackoffUntil;
     private boolean homeReturnActive;
+    /** 【fix117】饥饿求生专属记账：步 0 是 decide() 顶部绝对抢占（零食物
+     * 时只派 hunt 半径 12），fix103 回程步（6.65）与 tend（6.7）都在它之下、
+     * 永远轮不到——动物荒芜带里 hunt 连败没有任何出口（farm82 实证空转
+     * 20+ 分钟、hp 磨到 9.1）。hunt 专属连败 ≥3 时步 0 自己开回程出口
+     * （派 travel 回农场/落脚点，形态照 fix103）；回程 travel 连败退避
+     * 120 秒×连败、上限 600 秒，退避期内照旧 hunt 兜底不干等。 */
+    private int hungerHuntFailStreak;
+    private int hungerReturnFailStreak;
+    private long hungerReturnBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -511,6 +520,31 @@ public final class ProgressionPlanner {
                     homeReturnBackoffUntil = 0L;
                 }
             }
+            // 【fix117】饥饿求生专属记账（独立于 else-if 链）：步 0 的 hunt
+            // 连败攒够 3 次，步 0 才开「回农场」出口（见步 0 分支）；hunt
+            // 成功即清零。「饥饿求生：回农场」的 travel 连败走自己的退避，
+            // 退避期内步 0 照旧 hunt，不把 NPC 钉在原地干等。
+            if ("饥饿求生".equals(lastStage)) {
+                if (goalFailed) {
+                    hungerHuntFailStreak++;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿狩猎连败=" + hungerHuntFailStreak
+                            + "（≥3 且离补给点 >48 格时改走回农场）");
+                } else {
+                    hungerHuntFailStreak = 0;
+                }
+            }
+            if ("饥饿求生：回农场".equals(lastStage)) {
+                if (goalFailed) {
+                    hungerReturnFailStreak++;
+                    hungerReturnBackoffUntil = now + Math.min(600_000L, 120_000L * hungerReturnFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿回程退避 | 连败=" + hungerReturnFailStreak
+                            + " 退避秒=" + (hungerReturnBackoffUntil - now) / 1000L);
+                } else {
+                    hungerReturnFailStreak = 0;
+                    hungerReturnBackoffUntil = 0L;
+                    hungerHuntFailStreak = 0;
+                }
+            }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
             // 原因后缀，只认前缀）。供步 6.5 木料安全线放行阀读取。
             if (lastStage.startsWith("采集木头")) {
@@ -754,6 +788,36 @@ public final class ProgressionPlanner {
             // NPC 在 Y=55 原地空转到饿死。真人玩家的做法是先回地表再找吃的。
             if (underground()) {
                 return skill("饥饿求生：先回地表", "ascend");
+            }
+            // 【fix117】hunt 连败 ≥3 次的回家出口：本地猎物已被实证打不着、
+            // 再原地转圈只是磨血——真玩家会回农场（口粮源头）/落脚点。
+            // 白天才派长途（夜里长途是 #7/#8/#9 死型，夜里照旧本地 hunt）；
+            // 退避期（回程 travel 刚失败过）照旧 hunt 兜底、不干等。
+            if (hungerHuntFailStreak >= 3
+                    && System.currentTimeMillis() >= hungerReturnBackoffUntil
+                    && !isNight()) {
+                com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.FarmMemory.Farm hungerFarm =
+                        com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+                com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.BaseMemory.Base hungerBase =
+                        com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+                BlockPos hungerHome = hungerFarm != null ? hungerFarm.anchor()
+                        : (hungerBase != null ? hungerBase.anchor() : null);
+                if (hungerHome != null) {
+                    double hDx = hungerHome.getX() + 0.5D - npc.getX();
+                    double hDz = hungerHome.getZ() + 0.5D - npc.getZ();
+                    if (hDx * hDx + hDz * hDz > 48.0D * 48.0D) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 饥饿回程触发 | 目标=" + (hungerFarm != null ? "农场" : "落脚点")
+                                + " " + hungerHome.toShortString()
+                                + " 距离=" + Math.round(Math.sqrt(hDx * hDx + hDz * hDz))
+                                + " 饥饿狩猎连败=" + hungerHuntFailStreak);
+                        return goal("饥饿求生：回农场", "travel",
+                                params("x", hungerHome.getX(), "y", hungerHome.getY(),
+                                        "z", hungerHome.getZ()));
+                    }
+                }
             }
             if (hasSword) {
                 return goal("饥饿求生", "hunt",
