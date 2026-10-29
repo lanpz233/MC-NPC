@@ -159,6 +159,17 @@ public final class GoalExecutor {
      * 抵消（farm73 实证整轮净位移约 2 格），改每目标定一个方向沿走廊
      * 直进、新目标重新定方向（等效换区）。 */
     private double lavaSearchDir = Double.NaN;
+    /** 【fix124】黑曜石换区（回地表换位再下井）状态：0=不在换区，
+     * 1=ascend 回地表中，2=地面 goto 换位中。井底是封闭口袋时走廊 goto
+     * 目标全「不可站立」、直线兜底零位移（farm87 实证 518 秒净位移约
+     * 15 格判败）——地下没有路时唯一的玩家解法是回地表换个地方下井。
+     * 每个黑曜石目标只换一次，换位后仍找不到才诚实判败。 */
+    private int obsidianRelocPhase;
+    private boolean obsidianRelocated;
+    private int obsidianRelocAscendTries;
+    private int obsidianRelocGotoTries;
+    private double obsidianRelocFromX;
+    private double obsidianRelocFromZ;
     /** 【fix112】坏岩浆提示点（本目标内）：目标层扫描只认岩浆源方块、
      * 不问露面与落脚，技能层到场才发现挖不了/站不住（farm74 实证同一
      * 坏点连喂 6 次、3 秒烧光两路连败计数）。技能以「未挖到/没有落脚点」
@@ -628,6 +639,10 @@ public final class GoalExecutor {
         sleepPhase = 0;
         obsidianDescendFails = 0;
         lavaSearchDir = Double.NaN;
+        obsidianRelocPhase = 0;
+        obsidianRelocated = false;
+        obsidianRelocAscendTries = 0;
+        obsidianRelocGotoTries = 0;
         badLavaHints.clear();
         lastObsidianHint = null;
         obsidianRouteCasting = false;
@@ -4742,6 +4757,55 @@ public final class GoalExecutor {
             finish("浇铸黑曜石：下挖连续失败（多为石镐烧光待补镐），交回规划器");
             return;
         }
+        // 【fix124】换区编排（回地表→地面换位→原流程 descend 自然接管）：
+        // phase 1 等 ascend 把人带出地下（Y>-10 视为已回地表层）；phase 2
+        // 沿走廊方向地面 goto 40 格、实走 ≥30 格算换位完成。两段都只在
+        // 技能空闲时推进（tick 入口已挡技能忙），失败有次数上限、超限回
+        // 落原流程就地续搜，绝不把目标钉死在换区里。
+        if (obsidianRelocPhase == 1) {
+            if (npc.blockPosition().getY() > -10) {
+                obsidianRelocPhase = 2;
+                obsidianRelocFromX = npc.getX();
+                obsidianRelocFromZ = npc.getZ();
+                obsidianRelocGotoTries = 0;
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " 黑曜石换区 | 已回地表，沿走廊方向地面换位 40 格（fix124）");
+            } else {
+                if (obsidianRelocAscendTries >= 5) {
+                    obsidianRelocPhase = 0;
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " 黑曜石换区 | ascend 五试未回地表，放弃换区就地续搜（fix124）");
+                } else {
+                    obsidianRelocAscendTries++;
+                    skills.run(new Intent("", "ascend", new JsonObject()), "目标");
+                    return;
+                }
+            }
+        }
+        if (obsidianRelocPhase == 2) {
+            double rdx = npc.getX() - obsidianRelocFromX;
+            double rdz = npc.getZ() - obsidianRelocFromZ;
+            if (rdx * rdx + rdz * rdz >= 30.0D * 30.0D) {
+                obsidianRelocPhase = 0;
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " 黑曜石换区 | 地面换位完成，重新下井续搜（fix124）");
+            } else if (obsidianRelocGotoTries >= 3) {
+                obsidianRelocPhase = 0;
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " 黑曜石换区 | 地面换位三试不动，就地重新下井（fix124）");
+            } else {
+                obsidianRelocGotoTries++;
+                if (Double.isNaN(lavaSearchDir)) {
+                    lavaSearchDir = java.util.concurrent.ThreadLocalRandom.current()
+                            .nextDouble() * Math.PI * 2.0D;
+                }
+                JsonObject params = new JsonObject();
+                params.addProperty("x", obsidianRelocFromX + Math.cos(lavaSearchDir) * 40.0D);
+                params.addProperty("z", obsidianRelocFromZ + Math.sin(lavaSearchDir) * 40.0D);
+                skills.run(new Intent("", "goto", params), "目标");
+                return;
+            }
+        }
         // 先到地下层：地表附近常常找不到水（草原/沙漠/平原），
         // 但 Y=-50 附近既有岩浆湖（浇铸材料）也有地下水（装水），
         // 一次 descend 解决两个前置条件。
@@ -4786,6 +4850,19 @@ public final class GoalExecutor {
         }
         attempts++;
         if (attempts >= 10) {
+            // 【fix124】第一次找遍无岩浆不直接判败：井底若是封闭口袋，
+            // 走廊 goto 目标全不可站立、原地磨到判败（farm87 实证）。先
+            // 回地表换位再下井（玩家口径），换过一次仍找不到才诚实收场。
+            if (!obsidianRelocated && npc.blockPosition().getY() <= -45) {
+                obsidianRelocated = true;
+                obsidianRelocPhase = 1;
+                obsidianRelocAscendTries = 0;
+                attempts = 0;
+                LOG.info("[AIV][GOAL] " + npc.npcName()
+                        + " 黑曜石换区 | 井底找不到岩浆源，回地表换位再下井（fix124）"
+                        + " pos=" + npc.blockPosition().toShortString());
+                return;
+            }
             finish("找不到岩浆源，黑曜石失败 " + have + "/" + targetCount);
             return;
         }
