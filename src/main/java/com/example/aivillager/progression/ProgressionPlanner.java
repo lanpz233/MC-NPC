@@ -647,6 +647,11 @@ public final class ProgressionPlanner {
             issuedDigStage = step.stage;
             issuedDigResource = step.intent.param("resource", "");
         }
+        // 【fix121】阶段名透传给目标层：入夜收工要认派单来源
+        // （stage=饥饿求生 的 hunt 豁免，见 GoalExecutor.checkNightAbort）。
+        if (step.kind == Kind.GOAL) {
+            step.intent.params().addProperty("stage", step.stage);
+        }
         boolean accepted = switch (step.kind) {
             case GOAL -> goals.start(step.intent);
             case SKILL -> skills.run(step.intent, "规划");

@@ -1087,6 +1087,12 @@ public final class FakePlayerBody extends ServerPlayer {
      * 圆石（含深板岩圆石，fix57 口径）≥3、木棍料够（存货木棍 ≥2，或木板 ≥2，
      * 或原木 ≥1——1 原木出 4 木板、2 木板出 4 木棍）、工作台够得着（包里有，
      * 或身边 4 格内有一台）。缺哪件写进 missing（日志取证用）。
+     *
+     * <p>【fix123】补「产物放得下」：石镐不可叠加，背包 0 空槽时就算材料
+     * 全齐也做不出来（合成产物无处放，farm86 实证：craft 连败「背包已满」
+     * +fix116 退避 600 秒，而本判定仍报「可立即合」→守卫拒挖铁镐、主线
+     * 死锁）。放得下的口径：有空槽，或消耗本身会腾出一格（圆石总量恰好
+     * 3、或存货木棍恰好 2 根——合成吃光该堆、产物落回原格）。
      */
     public boolean stonePickCraftableNow(StringBuilder missing) {
         Inventory inventory = this.getInventory();
@@ -1095,9 +1101,11 @@ public final class FakePlayerBody extends ServerPlayer {
         int sticks = countInventoryItem(inventory, Items.STICK);
         int planks = 0;
         int logs = 0;
+        int emptySlots = 0;
         for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = inventory.getItem(slot);
             if (stack.isEmpty()) {
+                emptySlots++;
                 continue;
             }
             String path = itemPathOf(stack);
@@ -1110,6 +1118,7 @@ public final class FakePlayerBody extends ServerPlayer {
         boolean stickMaterial = sticks >= 2 || planks >= 2 || logs >= 1;
         boolean bench = countInventoryItem(inventory, Items.CRAFTING_TABLE) > 0
                 || nearbyCraftingTable();
+        boolean placeable = emptySlots >= 1 || cobble == 3 || sticks == 2;
         if (cobble < 3) {
             missing.append("圆石=").append(cobble).append("/3 ");
         }
@@ -1120,7 +1129,10 @@ public final class FakePlayerBody extends ServerPlayer {
         if (!bench) {
             missing.append("工作台=无 ");
         }
-        return cobble >= 3 && stickMaterial && bench;
+        if (!placeable) {
+            missing.append("空槽=0(产物无处放) ");
+        }
+        return cobble >= 3 && stickMaterial && bench && placeable;
     }
 
     /** 身边 4 格内有没有放着的工作台（包里没有时合成路径要靠它）。 */

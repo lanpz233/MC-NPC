@@ -95,6 +95,8 @@ public final class GoalExecutor {
     private boolean active;
     private String type = "-";
     private String targetId = "-";
+    /** 【fix121】派单来源阶段名（规划层写入 intent 的 stage 参数；模型/手动派单为空）。入夜收工认来源豁免用。 */
+    private String goalStage = "";
     /**
      * 目标开始时所处的维度。
      * 传送门会把 NPC 送到另一个维度，旧目标（挖矿/采集）在新维度里已经不成立，
@@ -549,6 +551,7 @@ public final class GoalExecutor {
             skills.stop();
         }
         type = action;
+        goalStage = intent.param("stage", "");
         goalStartedMillis = System.currentTimeMillis();
         goalStartX = npc.getBlockX();
         goalStartY = npc.getBlockY();
@@ -753,6 +756,12 @@ public final class GoalExecutor {
         // 只能干等 LONG 看门狗 480 秒位置处决（farm67 实证）。与 fix106
         // 同置于"技能忙"早退之前检查：对齐带内 300 秒高差无改善即收场。
         if (checkVerticalAlignDeadline()) {
+            return;
+        }
+        // 【fix121】入夜收工（夜间低口粮死因专案病灶 2）：与 fix106/107 同
+        // 置于"技能忙"早退之前——野外目标入夜时恰恰是技能连环执行中，
+        // 放在后面会被饿死。
+        if (checkNightAbort()) {
             return;
         }
         // 技能还在执行（走路/挖矿）就等它结束，目标层只负责“下一步做什么”。
@@ -5119,6 +5128,55 @@ public final class GoalExecutor {
      *
      * @return 是否已收场（调用方直接 return）
      */
+    /**
+     * 【fix121】入夜收工：规划层夜闸只是派单时点闸——白天派出的
+     * hunt/slay/travel/revisit 黄昏后一路跑进夜里，规划层在目标运行期
+     * 间不 decide、插不进睡觉/小屋步（#7/#8/#11 长途跨入夜 + 夜猎续跑）。
+     * 目标层自查：入夜（dayTime%24000≥13000，与规划层 isNight 同口径）
+     * ∧ 主世界 ∧ 头顶见天（地下/室内本就安全、不扰）→ 停技能收场，
+     * 交回规划器走过夜链。收场文案不带失败关键词，不喂各步连败退避。
+     *
+     * <p>豁免两条：①stage=「饥饿求生」的 hunt——步 0 故意夜猎，派单已由
+     * fix122 的 hp 闸把关；这里断了规划层会立即重派、成热循环。
+     * ②travel 距目标水平 ≤24 格——快到安全点了，赶完比半路停下过夜
+     * 更安全（玩家口径）。
+     *
+     * @return true 表示已收场，tick 应立即返回
+     */
+    private boolean checkNightAbort() {
+        if (!"hunt".equals(type) && !"slay".equals(type)
+                && !"travel".equals(type) && !"revisit".equals(type)) {
+            return false;
+        }
+        if ("hunt".equals(type) && "饥饿求生".equals(goalStage)) {
+            return false;
+        }
+        if (!net.minecraft.world.level.Level.OVERWORLD.equals(npc.level().dimension())) {
+            return false;
+        }
+        long dayTime = npc.level().getDayTime() % 24000L;
+        if (dayTime < 13000L) {
+            return false;
+        }
+        if (!npc.level().canSeeSky(npc.blockPosition())) {
+            return false;
+        }
+        if ("travel".equals(type)) {
+            double dx = travelX - npc.getX();
+            double dz = travelZ - npc.getZ();
+            if (dx * dx + dz * dz <= 24.0D * 24.0D) {
+                return false;
+            }
+        }
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 入夜收工 | type=" + type
+                + " stage=" + (goalStage.isEmpty() ? "-" : goalStage)
+                + " pos=" + npc.blockPosition().toShortString()
+                + " dayTime=" + dayTime + "（fix121：地表野外目标入夜中止，交规划器过夜）");
+        skills.stop();
+        finish("入夜收工：地表野外目标入夜中止（fix121）type=" + type);
+        return true;
+    }
+
     private boolean checkVerticalAlignDeadline() {
         double tx;
         double ty;
