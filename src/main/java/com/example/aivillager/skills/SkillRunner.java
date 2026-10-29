@@ -1347,6 +1347,10 @@ public final class SkillRunner {
         current = "travel";
         LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 开始 | 目标="
                 + String.format(Locale.ROOT, "(%.1f, %.1f, %.1f)", targetX, targetY, targetZ));
+        // 【fix114】寻路终点先沿终点列解析到可站立格（到达判定仍用原始
+        // targetY，见 resolveTravelGoal 注释）。
+        final BlockPos pathGoal = resolveTravelGoal(new BlockPos(
+                (int) Math.floor(targetX), (int) Math.floor(targetY), (int) Math.floor(targetZ)));
 
         tasks.add(Bukkit.getScheduler().runTaskTimer(plugin, new Runnable() {
             private int noPathRounds;
@@ -1377,8 +1381,7 @@ public final class SkillRunner {
                 if (npc.isFollowingPath() || npc.isWalking()) {
                     return;
                 }
-                BlockPos goal = new BlockPos((int) Math.floor(targetX),
-                        (int) Math.floor(targetY), (int) Math.floor(targetZ));
+                BlockPos goal = pathGoal;
                 PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(),
                         goal, 24000, !npc.wearingLeatherBoots());
                 if (result.found()) {
@@ -1404,6 +1407,37 @@ public final class SkillRunner {
         }, 1L, 10L));
         armWatchdog(id, "travel", 12000);
         return true;
+    }
+
+    /**
+     * 【fix114】travel 寻路终点 Y 解析：目标层传的 y 是派单瞬间的身体高度
+     * （寻路平面口径——A* 只能在地形里找路，见 GoalExecutor.tickTravel
+     * 注释），不是目的地地表。NPC 半路被搭桥棘轮带上高空后目标层重派，
+     * y 悬在目的地列半空（farm78 死后回程实证：柱顶 Y=198 重派 y=197、
+     * 目的地表 64），PathFinder 对终点只做 ±2 可站修正、够不着真地面，
+     * 直接判「终点不可站立」，技能约 5 秒一轮秒败、直到目标看门狗
+     * 480 秒处决。这里在技能内沿终点列向下解析第一个可站立格作寻路
+     * 终点：传入格 ±2 内可站（常态）则原样返回、行为不变；向下扫上限
+     * 260 格，扫不到保持原值让 PathFinder 如实失败（兜底不缺位）。
+     * 到达/竖直对齐判定仍用原始 targetY（归目标层），本解析只喂寻路。
+     */
+    private BlockPos resolveTravelGoal(BlockPos goal) {
+        for (int dy = 0; dy <= 2; dy++) {
+            if (PathFinder.isStandable(npc.level(), goal.offset(0, dy, 0))
+                    || PathFinder.isStandable(npc.level(), goal.offset(0, -dy, 0))) {
+                return goal;
+            }
+        }
+        for (int dy = 3; dy <= 260; dy++) {
+            BlockPos cand = goal.offset(0, -dy, 0);
+            if (PathFinder.isStandable(npc.level(), cand)) {
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 终点 Y 解析 | 传入="
+                        + goal.toShortString() + " 解析=" + cand.toShortString()
+                        + "（fix114：传入 Y 悬空，沿终点列向下找可站立格）");
+                return cand;
+            }
+        }
+        return goal;
     }
 
     /**

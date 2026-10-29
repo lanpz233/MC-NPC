@@ -1846,11 +1846,29 @@ public final class GoalExecutor {
         // 还在地表附近会再触发、逐次换位下探（relocate 换区也在并行）。
         if ("stone".equals(oreTarget.block()) && stoneStripFails >= 2
                 && npc.blockPosition().getY() >= surfaceY - 3) {
+            // 【fix114】下挖深度分两档：高度图会把人造柱/台地本身当成自家
+            // 列的"地表"（surfaceY 读到柱顶），站在柱顶时 feetY≈surfaceY、
+            // 旧口径只下挖 6 格穿"土层"，130 多格的柱子要磨二十多轮。
+            // 改用 3×3 列高度图的最小值当真地面：脚比真地面高出 12 格
+            // 以上判悬空（柱顶/台地边），一次 descend 到真地面；邻列高差
+            // ≤12 的正常地表维持原 -6 穿土口径（山坡/崖边不误触发全程
+            // 下潜——崖下也是石头，下去挖同样成立）。
+            int feetY = npc.blockPosition().getY();
+            int groundY = surfaceY;
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    groundY = Math.min(groundY, npc.level().getHeight(
+                            net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                            npc.blockPosition().getX() + dx, npc.blockPosition().getZ() + dz));
+                }
+            }
+            int digDownY = feetY > groundY + 12 ? groundY : feetY - 6;
             JsonObject params = new JsonObject();
-            params.addProperty("y", npc.blockPosition().getY() - 6);
+            params.addProperty("y", digDownY);
             if (skills.run(new Intent("", "descend", params), "目标")) {
                 LOG.info("[AIV][GOAL] " + npc.npcName() + " dig-down-for-stone | strip 连败 "
-                        + stoneStripFails + " 次，地表无石，改为向下挖穿土层找石");
+                        + stoneStripFails + " 次，地表无石，改为向下挖穿土层找石"
+                        + " 目标Y=" + digDownY + " 真地面=" + groundY);
                 stoneStripFails = 0;
                 attempts = 0;
                 return;
@@ -1902,9 +1920,14 @@ public final class GoalExecutor {
         String outcome = skills.lastOutcome();
         // "未发现 + 已挖=0"是正常挖到头没矿；"前方无路可掘"是撞上悬空/流体/基岩。
         // 两种都说明这片区域已经挖不出东西了。
+        // 【fix114】"timeout"（技能看门狗掐断）同列：strip 在空中/绝地里
+        // 一块都挖不到、磨到超时才收场，同样是"此地挖不出东西"——旧口径
+        // 不认 timeout 结局，farm78 实证 NPC 栖在 Y=197 柱顶 strip 40 秒
+        // 一轮超时、连败永不计数，四十七轮的下挖取石兜底永远武装不起来。
         if (outcome.startsWith("strip ")
                 && ((outcome.contains("未发现") && outcome.contains("已挖=0"))
-                || outcome.contains("前方无路可掘"))) {
+                || outcome.contains("前方无路可掘")
+                || outcome.contains("timeout"))) {
             relocateBeforeStrip = true;
             // 【第四十七轮】挖石头连败单独记账，给 tickDig 的下挖取石兜底当触发量。
             if (oreTarget != null && "stone".equals(oreTarget.block())) {
@@ -3415,6 +3438,42 @@ public final class GoalExecutor {
                 instanceof net.minecraft.world.level.block.BedBlock;
     }
 
+    /**
+     * 【fix115】原版床阻挡判定复刻（Leaves 1.21.11 ServerPlayer.bedBlocked
+     * 字节码实证）：startSleepInBed 只查两格——床格（账本存脚位）上方、
+     * 与上方再往床 FACING 反方向一格；任一格方块 isSuffocating 即判
+     * OBSTRUCTED。返回堵住的那格（挖掉即可睡），两格都空返回 null。
+     * farm79 首睡实证：床贴西墙安置、墙基圆石正落在第二格上，安置校验
+     * 从没验过这两格，床一出生就睡不了、拖到首睡才爆。
+     */
+    private BlockPos bedObstructionCell(BlockPos bed) {
+        BlockState state = npc.level().getBlockState(bed);
+        if (!(state.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+            return null;
+        }
+        net.minecraft.core.Direction facing = state.getValue(
+                net.minecraft.world.level.block.BedBlock.FACING);
+        BlockPos above = bed.above();
+        if (npc.level().getBlockState(above).isSuffocating(npc.level(), above)) {
+            return above;
+        }
+        BlockPos behind = above.relative(facing.getOpposite());
+        if (npc.level().getBlockState(behind).isSuffocating(npc.level(), behind)) {
+            return behind;
+        }
+        return null;
+    }
+
+    /** 【fix115】拟放床位可睡性：按拟定 foot/facing 查原版判定两格。 */
+    private boolean bedSleepableAt(BlockPos foot, net.minecraft.core.Direction facing) {
+        BlockPos above = foot.above();
+        if (npc.level().getBlockState(above).isSuffocating(npc.level(), above)) {
+            return false;
+        }
+        BlockPos behind = above.relative(facing.getOpposite());
+        return !npc.level().getBlockState(behind).isSuffocating(npc.level(), behind);
+    }
+
     /** 床格可放：本格空/植被无流体，且脚下是实心（屋内地面）。 */
     private boolean bedCellFree(BlockPos pos) {
         BlockState state = npc.level().getBlockState(pos);
@@ -3452,12 +3511,14 @@ public final class GoalExecutor {
             for (int dz = -1; dz <= 1; dz++) {
                 for (int dx = -1; dx <= 1; dx++) {
                     BlockPos cell = anchor.offset(dx, dy, dz);
-                    if (dx < 1 && bedCellFree(cell) && bedCellFree(cell.east())) {
+                    if (dx < 1 && bedCellFree(cell) && bedCellFree(cell.east())
+                            && bedSleepableAt(cell, net.minecraft.core.Direction.EAST)) {
                         bedFootPos = cell;
                         bedFacing = net.minecraft.core.Direction.EAST;
                         return true;
                     }
-                    if (dz < 1 && bedCellFree(cell) && bedCellFree(cell.south())) {
+                    if (dz < 1 && bedCellFree(cell) && bedCellFree(cell.south())
+                            && bedSleepableAt(cell, net.minecraft.core.Direction.SOUTH)) {
                         bedFootPos = cell;
                         bedFacing = net.minecraft.core.Direction.SOUTH;
                         return true;
@@ -3577,8 +3638,9 @@ public final class GoalExecutor {
                     finish("安置床放弃：床物品无对应方块 " + bedItemPath);
                     return;
                 }
-                if (!bedCellFree(bedFootPos) || !bedCellFree(bedFootPos.relative(bedFacing))) {
-                    finish("安置床放弃：选位被占（选位后环境变化）");
+                if (!bedCellFree(bedFootPos) || !bedCellFree(bedFootPos.relative(bedFacing))
+                        || !bedSleepableAt(bedFootPos, bedFacing)) {
+                    finish("安置床放弃：选位被占或不可睡（选位后环境变化）");
                     return;
                 }
                 if (!consume(bedItemPath, 1)) {
@@ -3699,6 +3761,23 @@ public final class GoalExecutor {
             }
             case 1 -> {
                 status = "睡觉：上床";
+                // 【fix115】睡前清障：床被上方方块堵住时先挖掉再睡（玩家
+                // 做法）。判定格照 bedObstructionCell 的原版复刻口径（只
+                // 两格），挖掉后不收场、下 tick 复查清净了才真正上床——
+                // 旧行为是秒败 finish + 规划层约 1 秒一轮重派热循环
+                // （farm79 首睡实证：墙基圆石压住判定格）。
+                BlockPos plugCell = bedObstructionCell(bed);
+                if (plugCell != null) {
+                    if (skills.run(new Intent("", "mine", params("x", plugCell.getX(),
+                            "y", plugCell.getY(), "z", plugCell.getZ())), "目标")) {
+                        status = "睡觉：清床上方块";
+                        LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 床被上方方块堵住，先挖掉 | cell="
+                                + plugCell.toShortString() + " block="
+                                + BuiltInRegistries.BLOCK.getKey(
+                                        npc.level().getBlockState(plugCell).getBlock()).getPath());
+                        return;
+                    }
+                }
                 var result = npc.startSleepInBed(bed, false);
                 if (result.left().isPresent()) {
                     clearDoorPlugs(anchor);

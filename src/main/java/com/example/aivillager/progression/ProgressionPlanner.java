@@ -123,6 +123,14 @@ public final class ProgressionPlanner {
      * 主线（附近真没动物不能把整条科技树堵死），退避到期仍由它优先重试。 */
     private int foodFailStreak;
     private long foodBackoffUntil;
+    /** 【fix116】备用镐合成专属退避：第十八轮"常备 ≥2 把石镐"是软向导，
+     * 却无退避——背包塞满做不出来时（farm80 实证：41 槽皆贵重/重复物、
+     * dropJunk 无可扔、合成失败 26 次）它排在阶段链前部，把 PORTAL 等
+     * 全部后续阶段饿死。照皮革/口粮模式：只认"背包已满"失败，连败退避
+     * 120 秒起、随连败增长、上限 600 秒；退避期铁镐/钻镐顶上干主线
+     * （fix101 镐子兜底的规划层镜像），成功清零。 */
+    private int pickCraftFailStreak;
+    private long pickCraftBackoffUntil;
     /** 【fix49】开田专属连败与退避：与皮革/口粮同理——没水没平地的地形里
      * 开田注定连败，不能让它每轮 decide 都抢在铁线前面重试；退避到期再试。 */
     private int farmFailStreak;
@@ -351,6 +359,20 @@ public final class ProgressionPlanner {
         // 【第二十四轮】皮革/口粮专属退避记账：只认目标层结果、只认各自阶段名，
         // 与共享 failStreak 分开（理由见字段注释）。退避时长随各自连败增长。
         if (goalNewOutcome) {
+            // 【fix116】备用镐合成"背包已满"专属记账（与上面的阶段名链独立：
+            // 触发条件是阶段名前缀 + 失败文案，只堵不疏的软向导必须让位）。
+            if (lastStage != null && lastStage.startsWith("补一把备用")) {
+                if (goalFailed && goalOutcomeText != null && goalOutcomeText.contains("背包已满")) {
+                    pickCraftFailStreak++;
+                    pickCraftBackoffUntil = now + Math.min(600_000L, 120_000L * pickCraftFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 备用镐合成退避 | 连败=" + pickCraftFailStreak
+                            + " 退避秒=" + (pickCraftBackoffUntil - now) / 1000L
+                            + "（背包已满做不出来，先干主线）");
+                } else if (!goalFailed) {
+                    pickCraftFailStreak = 0;
+                    pickCraftBackoffUntil = 0L;
+                }
+            }
             if ("找皮革做皮靴".equals(lastStage)) {
                 if (goalFailed) {
                     leatherFailStreak++;
@@ -809,7 +831,8 @@ public final class ProgressionPlanner {
         // NPC 就再也挖不动石头，只能在矿道里无限空转。
         int woodenPickaxes = countUsableItem("wooden_pickaxe");
         if (planHas(StagePlan.WOOD_TOOLS) && !hasStonePickaxe && woodenPickaxes < 2 && stickMaterial
-                && wood >= (sticks >= 4 ? 6 : 8)) {
+                && wood >= (sticks >= 4 ? 6 : 8)
+                && System.currentTimeMillis() >= pickCraftBackoffUntil) {
             // 一次只排"再补一把"：一把木镐要 2 根木棍，直接排 2 把但只够 1 把的材料时，
             // 目标会在第二把失败，整轮时间全浪费（材料虽然回滚了，但节奏空转）。
             return goal("补一把备用木镐", "craft",
@@ -852,7 +875,8 @@ public final class ProgressionPlanner {
                 + " stonePickaxes=" + stonePickaxes + " hasIronPickaxe=" + hasIronPickaxe
                 + " logs=" + logs + " planks=" + planks + " sticks=" + sticks
                 + " bamboo=" + bamboo + " ingots=" + ingots);
-        if (planHas(StagePlan.STONE_TOOLS) && stonePickaxes < 2) {
+        if (planHas(StagePlan.STONE_TOOLS) && stonePickaxes < 2
+                && System.currentTimeMillis() >= pickCraftBackoffUntil) {
             if (stonePickaxes == 0 && cobble < 3 && hasPickaxe) {
                 return goal("补圆石做石镐", "dig", params("resource", "stone", "count", 8));
             }
@@ -1430,7 +1454,8 @@ public final class ProgressionPlanner {
         int usableIronPickaxes = countUsableItem("iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
         int ironPickDurability = totalRemainingDurability(
                 "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
-        if (planHas(StagePlan.SPARE_PICKS) && (usableIronPickaxes < 2 || ironPickDurability < 250)) {
+        if (planHas(StagePlan.SPARE_PICKS) && (usableIronPickaxes < 2 || ironPickDurability < 250)
+                && System.currentTimeMillis() >= pickCraftBackoffUntil) {
             if (!stickMaterial) {
                 return gatherLogs("备用铁镐缺木棍");
             }
