@@ -1432,6 +1432,18 @@ public final class SurvivalController {
         LivingEntity best = null;
         double bestDistanceSq = Double.MAX_VALUE;
         for (net.minecraft.world.entity.Entity entity : candidates) {
+            // 【fix125·死亡#14】中立怪不许主动惹：末影人/僵尸猪灵在 Enemy 名册
+            // 里，未被激怒时会被本扫描当威胁主动开战（farm86 实证：末影人
+            // hurt=false 仍被「自卫」惹怒、传送追杀致死）。它们没把 NPC 列为
+            // 目标、也没刚打过 NPC 时，一律不算威胁；真被激怒后照常走逃/战
+            // 逻辑（低血仍逃）。末影人击杀是 D15 目标层的活，不是生存层反射。
+            if ((entity instanceof net.minecraft.world.entity.monster.EnderMan
+                    || entity instanceof net.minecraft.world.entity.monster.zombie.ZombifiedPiglin)
+                    && npc.getLastHurtByMob() != entity
+                    && (!(entity instanceof net.minecraft.world.entity.Mob neutralMob)
+                            || neutralMob.getTarget() != npc)) {
+                continue;
+            }
             // 之前判定"打不到"的怪在有效期内直接跳过，避免目标层被永久卡住。
             Long until = ignoredThreats.get(entity.getUUID());
             if (until != null) {
