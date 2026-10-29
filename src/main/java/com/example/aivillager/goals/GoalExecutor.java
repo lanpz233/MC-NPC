@@ -1260,8 +1260,24 @@ public final class GoalExecutor {
 
         // 合成前先保证有落脚槽位：递归合成会产出木板/木棍/成品三次，
         // 背包满时第一步就失败，看起来像"缺材料"，实际是没地方放。
-        if (!hasEmptyMainSlot()) {
-            dropJunk(2);
+        // 【fix129】门槛由 ≥1 格改 ≥3 格：中途产物要占缓冲格（原木→木板 1 格
+        // →木棍 1 格→成品 1 格），旧版只保 1 格时链做到一半产物无处落、整链
+        // 回滚，结局文案却报回滚后的空槽数（1~2 格），看着像有空位实则中途
+        // 峰值不够（farm93 实证：stone_pickaxe 放不下|空槽=2 等同型 14 次）。
+        // 玩家口径：做东西前先腾够地方再上台。腾不动（全是必需品）就维持
+        // 现状失败+退避，靠退避让位与回锚点存箱自解，不硬扔名单外物品。
+        {
+            int emptyBefore = countEmptyMainSlots();
+            for (int guard = 0; guard < 4 && countEmptyMainSlots() < 3; guard++) {
+                if (dropJunk(3 - countEmptyMainSlots()) <= 0) {
+                    break;
+                }
+            }
+            int emptyAfter = countEmptyMainSlots();
+            if (emptyAfter != emptyBefore) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成前腾格 | 空槽 "
+                        + emptyBefore + "→" + emptyAfter + "（递归合成要 3 格缓冲）阶段=" + targetId);
+            }
         }
 
         // 一次 tick 内尽量把整批做完；有上限，避免配方写错时死循环。
