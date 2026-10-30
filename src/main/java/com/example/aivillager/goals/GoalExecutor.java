@@ -6127,15 +6127,40 @@ public final class GoalExecutor {
 
     // ---------------------------------------------------------------- 建造
 
+    /** 小屋建材候选表（顺序即优先级）：规划层派单门与执行层选料共用同一口径。 */
+    public static final String[] SHELTER_MATERIALS = {"cobblestone", "cobbled_deepslate",
+            "blackstone", "stone", "dirt",
+            "oak_planks", "spruce_planks",
+            "birch_planks", "jungle_planks", "acacia_planks", "dark_oak_planks",
+            "mangrove_planks", "cherry_planks", "bamboo_planks", "pale_oak_planks",
+            "oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log",
+            "dark_oak_log", "mangrove_log", "cherry_log", "pale_oak_log"};
+
     private void tickBuild() {
         status = "建造 " + targetId;
         // 选一种背包里够 25 个的方块；优先圆石（抗爆），其次泥土，再木板/原木。
         String material = pickBuildingMaterial(SHELTER_BLOCKS);
         if (material == null) {
-            finish("建造失败：建筑方块不足 " + SHELTER_BLOCKS + " 个（需要先采集）");
+            // 【fix159】单料不够 25 不等于盖不了：圆石+泥土+木板混着盖是玩家
+            // 常识。farm127 #32 实证：回程腿把圆石耗到 ~20、泥土 17，单一口径
+            // 处处 <25，保持门落原地等待、幻翼磨死。候选总量够就走混料逐格取材。
+            int total = 0;
+            for (String candidate : SHELTER_MATERIALS) {
+                total += countItem(candidate);
+            }
+            if (total < SHELTER_BLOCKS) {
+                finish("建造失败：建筑方块不足 " + SHELTER_BLOCKS + " 个（需要先采集）");
+                return;
+            }
+            int placedMixed = buildShelter(null);
+            finishShelterBuild(placedMixed, "混合");
             return;
         }
         int placed = buildShelter(material);
+        finishShelterBuild(placed, material);
+    }
+
+    private void finishShelterBuild(int placed, String material) {
         if (placed <= 0) {
             // 【fix108】放置=0 = 站位周围根本没法下块（已建满/被占）：旧版按
             // 「部分完成」成功口径收场，规划层连败被清零、每个 decide 都重派，
@@ -6153,13 +6178,7 @@ public final class GoalExecutor {
         // 顺序即优先级：圆石最结实，木板其次，泥土最后。
         // 【fix58】补深板岩圆石/黑石：深挖时代包里最多的就是深板岩圆石，选料表不认它
         // 会在泥土耗尽后整夜瞬间失败「建筑方块不足」（boot-farm13 实锤），与 fix57 同病。
-        String[] candidates = {"cobblestone", "cobbled_deepslate", "blackstone", "stone", "dirt",
-                "oak_planks", "spruce_planks",
-                "birch_planks", "jungle_planks", "acacia_planks", "dark_oak_planks",
-                "mangrove_planks", "cherry_planks", "bamboo_planks", "pale_oak_planks",
-                "oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log",
-                "dark_oak_log", "mangrove_log", "cherry_log", "pale_oak_log"};
-        for (String candidate : candidates) {
+        for (String candidate : SHELTER_MATERIALS) {
             if (countItem(candidate) >= needed) {
                 return candidate;
             }
@@ -6173,12 +6192,18 @@ public final class GoalExecutor {
      * 服务端直接改方块结果一致，且能保证不会把 NPC 自己封死（内部两格始终跳过）。
      */
     private int buildShelter(String materialPath) {
-        Item item = item(materialPath);
-        if (item == Items.AIR) {
-            LOG.warning("[AIV][GOAL] " + npc.npcName() + " 建筑方块映射失败 item=" + materialPath);
-            return 0;
+        // 【fix159】materialPath=null 为混料模式：逐格按 SHELTER_MATERIALS
+        // 优先序取当前有货的材料（圆石用完自动接深板岩圆石/泥土/木板/原木）。
+        boolean mixed = materialPath == null;
+        Block block = null;
+        if (!mixed) {
+            Item item = item(materialPath);
+            if (item == Items.AIR) {
+                LOG.warning("[AIV][GOAL] " + npc.npcName() + " 建筑方块映射失败 item=" + materialPath);
+                return 0;
+            }
+            block = Block.byItem(item);
         }
-        Block block = Block.byItem(item);
         BlockPos base = npc.blockPosition();
         int placed = 0;
         outer:
@@ -6206,20 +6231,35 @@ public final class GoalExecutor {
                     if (!current.isAir() && !current.canBeReplaced()) {
                         continue;
                     }
-                    if (countItem(materialPath) <= 0) {
+                    String use = materialPath;
+                    if (mixed) {
+                        use = null;
+                        for (String candidate : SHELTER_MATERIALS) {
+                            if (countItem(candidate) > 0) {
+                                use = candidate;
+                                break;
+                            }
+                        }
+                        if (use == null) {
+                            LOG.info("[AIV][GOAL] " + npc.npcName() + " 建筑材料用完，已放置 " + placed + " 个");
+                            break outer;
+                        }
+                    }
+                    if (countItem(use) <= 0) {
                         LOG.info("[AIV][GOAL] " + npc.npcName() + " 建筑材料用完，已放置 " + placed + " 个");
                         break outer;
                     }
-                    if (!consume(materialPath, 1)) {
+                    if (!consume(use, 1)) {
                         break outer;
                     }
-                    npc.level().setBlockAndUpdate(pos, block.defaultBlockState());
+                    Block useBlock = mixed ? Block.byItem(item(use)) : block;
+                    npc.level().setBlockAndUpdate(pos, useBlock.defaultBlockState());
                     placed++;
                 }
             }
         }
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 建造小屋 | base=" + base.toShortString()
-                + " 材料=" + materialPath + " 放置=" + placed);
+                + " 材料=" + (mixed ? "混合" : materialPath) + " 放置=" + placed);
         return placed;
     }
 

@@ -940,6 +940,15 @@ public final class ProgressionPlanner {
         return npc.blockPosition().distSqr(shelterFailPos) < 64.0D;
     }
 
+    /** 【fix159】可放置建材总量（与 GoalExecutor.SHELTER_MATERIALS 同表）。 */
+    private int shelterBuildBlockCount() {
+        int total = 0;
+        for (String material : com.example.aivillager.goals.GoalExecutor.SHELTER_MATERIALS) {
+            total += countItem(material);
+        }
+        return total;
+    }
+
     /** 当前 day 索引（dayTime/24000）：跨夜判定口径，fix146 保持记账用。 */
     private long currentDayIndex() {
         return Math.floorDiv(npc.level().getDayTime(), 24000L);
@@ -1022,6 +1031,11 @@ public final class ProgressionPlanner {
         // 完全等价，只数 cobblestone 会让包里躺着 55 块深板岩圆石却判定「没石头」
         // 在地表无限重派挖石头（boot-farm12 实锤）。黑石仅下界产出、不入此口径。
         int cobble = countItem("cobblestone") + countItem("cobbled_deepslate");
+        // 【fix159】小屋建材总量口径：与执行层 SHELTER_MATERIALS 同表求和
+        // （圆石/深板岩圆石/黑石/石头/泥土/木板/原木混着数）。旧口径只认
+        // cobble≥25，farm127 #32 实证圆石被回程腿耗到 ~20、泥土 17 躺包里
+        // 却建不了棚——三处小屋派单门（5.6/14/保持门 d 支）统一改用本量。
+        int buildBlocks = shelterBuildBlockCount();
         int coal = countItem("coal") + countItem("charcoal");
         int rawIron = countItem("raw_iron");
         int ingots = countItem("iron_ingot");
@@ -1210,7 +1224,7 @@ public final class ProgressionPlanner {
         // 其次就地补建小屋，都不行就原地等待至天亮（返回 null 待命）。
         // 地下与生存层不受此门影响（豁免面沿 fix121 口径）。
         overnightHoldEngaged = false;
-        Step overnightHold = overnightHoldGate(foodLevel, cobble);
+        Step overnightHold = overnightHoldGate(foodLevel, buildBlocks);
         if (overnightHold != null) {
             return overnightHold;
         }
@@ -1482,7 +1496,7 @@ public final class ProgressionPlanner {
         // 两死皆夜间地表补给——小屋原排第 14 步、主线没走完轮不到，夜里照样
         // 被派去地表打猎砍树）。与步 14 同条件、排位提前到木料/口粮补给步
         // 之前；步 14 保留作主线走完后的兜底。
-        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25
+        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && buildBlocks >= 25
                 && !shelterCoolingDown()) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
@@ -2431,7 +2445,7 @@ public final class ProgressionPlanner {
         }
 
         // 14) 夜晚没遮蔽就搭个 3x3 小屋：避免整夜被怪追着跑。
-        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && cobble >= 25
+        if (planHas(StagePlan.SHELTER) && isNight() && !underRoof() && buildBlocks >= 25
                 && !shelterCoolingDown()) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
@@ -2460,7 +2474,7 @@ public final class ProgressionPlanner {
      * 照常往下走。地下不进门（夜里地下作业与昼夜无关，fix121 同口径）；
      * 生存层（逃跑/自卫/进食）在规划层之外，不受此门影响。
      */
-    private Step overnightHoldGate(int foodLevel, int cobble) {
+    private Step overnightHoldGate(int foodLevel, int buildBlocks) {
         long today = currentDayIndex();
         if (!isNight()) {
             if (overnightHoldActiveNight >= 0L) {
@@ -2553,7 +2567,8 @@ public final class ProgressionPlanner {
             }
         }
         // d) 还没有遮蔽且材料够：就地补建小屋（5.6 同口径，仅触发态提前）。
-        if (!underRoof() && planHas(StagePlan.SHELTER) && cobble >= 25
+        // 【fix159】材料口径 = 可放置建材总量（混料可建），非圆石单项。
+        if (!underRoof() && planHas(StagePlan.SHELTER) && buildBlocks >= 25
                 && !shelterCoolingDown()) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
