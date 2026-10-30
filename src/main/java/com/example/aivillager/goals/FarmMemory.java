@@ -123,6 +123,19 @@ public final class FarmMemory {
         }
     }
 
+    /** 注销一块田（fix161 全毁重开）：清缓存 + 删账本文件，下轮起按无田走开田分支。 */
+    public static synchronized void clear(String npcName) {
+        BY_NPC.remove(npcName);
+        File file = fileFor(npcName);
+        if (file != null && file.isFile()) {
+            try {
+                Files.delete(file.toPath());
+            } catch (Exception e) {
+                LOG.warning("[AIV][GOAL] 农田账本删除失败 " + npcName + " | " + e.getMessage());
+            }
+        }
+    }
+
     /** 作物方块 → 作物种类；不是作物返回 null。 */
     public static String cropOf(Block block) {
         if (block == Blocks.WHEAT) {

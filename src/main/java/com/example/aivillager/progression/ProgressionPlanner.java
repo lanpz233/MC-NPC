@@ -1681,6 +1681,21 @@ public final class ProgressionPlanner {
                 if (!isNight() && farmDistSq <= 48.0D * 48.0D) {
                     com.example.aivillager.goals.FarmMemory.Scan scan =
                             com.example.aivillager.goals.FarmMemory.scan(npc.level(), npc.npcName());
+                    // 【fix161】全毁注销：注册格全 lost 且无活作物/空耕地 = 田已
+                    // 死透（土被挖空/淹没）。旧版僵尸注册既进不了 tend（无活可
+                    // 干）又挡住下方开田分支（farm!=null），种田线整体假死
+                    // （farm121 起实证：1 格死田（土格为空气）躺了多棒、产出
+                    // 为零）。32 格内才判死——保格子区块已加载，scan 不被未加
+                    // 载的假 air 骗；注销后本轮不再评估 tend，下轮走开田分支。
+                    if (farmDistSq <= 32.0D * 32.0D && scan.lost() >= farm.cells().size()
+                            && scan.mature() == 0 && scan.growing() == 0
+                            && scan.emptyFarmland() == 0) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 农田全毁注销（fix161） | 注册格=" + farm.cells().size()
+                                + " 全 lost，注销账本，下轮起重新开田 | 锚点="
+                                + farm.anchor().toShortString());
+                        com.example.aivillager.goals.FarmMemory.clear(npc.npcName());
+                    } else {
                     // 骨粉先行：田里有在长的、口粮紧、手里有骨头没骨粉——先把
                     // 骨头磨成骨粉（原版无序合成 1 骨=3 粉，不需工作台），
                     // 下一轮 decide 的维护步才带得动催熟。
@@ -1700,6 +1715,7 @@ public final class ProgressionPlanner {
                                 + " 空=" + scan.emptyFarmland() + " 坏=" + scan.lost()
                                 + " 长=" + scan.growing());
                         return goal("农田维护", "farm", params("mode", "tend"));
+                    }
                     }
                 }
             } else if (!isNight() && foodNutrition() < MINING_FOOD_NUTRITION
