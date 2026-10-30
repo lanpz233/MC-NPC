@@ -121,6 +121,17 @@ public final class SurvivalController {
      */
     private net.minecraft.core.BlockPos fluidEscapeDir;
     /**
+     * 【fix135】流体被困「集锚」：计数起涨时的脚位与该列水面 Y。旧干清（离水
+     * 2 查即清零）被唇口栖息反复满足、计数永不达门槛（死亡 #23），改按集锚
+     * 判真脱困才清（见流体自救干清分支）。
+     */
+    private net.minecraft.core.BlockPos fluidTrapAnchor;
+    private int fluidTrapSurfaceY;
+    /** 【fix135】本集是否已选过挖岸方向（选向触发由计数 ==12 改为状态闩）。 */
+    private boolean fluidEscapeDirPicked;
+    /** 【fix137】挖岸/挖顶升级试挖失败的节流诊断上次打行时刻（毫秒）：旧版失败无声、空转 1 小时零证据（farm104）。 */
+    private long lastEscapeMissLogMillis;
+    /**
      * "原地不动"锚点与计数（第六轮补充·树干顶脱困）：水平离开锚点 2 格以上清零，
      * 垂直下落不算移动（逐层挖树干时每挖一层只落 1 格，不能被误判成"在动")。
      * 约 10 次检查（约 10 秒）不动且脚下是原木，才判定困在树干顶上。
@@ -451,8 +462,7 @@ public final class SurvivalController {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " canopy-descent | pos="
                         + feet.toShortString());
             }
-            fluidStuckChecks = 0;
-            fluidEscapeDir = null;
+            resetFluidTrap();
             return;
         }
         // 困在树干顶（第六轮补充，fix8 长跑实测）：挖叶下树时落在 1 格宽的树干顶上，
@@ -470,8 +480,7 @@ public final class SurvivalController {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " trunk-descent | pos="
                         + feet.toShortString() + " stillSec=" + stillChecks);
             }
-            fluidStuckChecks = 0;
-            fluidEscapeDir = null;
+            resetFluidTrap();
             return;
         }
         // 【第十九轮】陷进细雪脱困（Fong 拍板）：没穿皮靴陷进细雪（脚格就是
@@ -489,8 +498,7 @@ public final class SurvivalController {
             npc.jumpNow();
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " powder-snow-escape | pos="
                     + feet.toShortString() + " dug=" + dug);
-            fluidStuckChecks = 0;
-            fluidEscapeDir = null;
+            resetFluidTrap();
             return;
         }
         // 【fix67】窒息兜底（保命线，必须排在下面空气早退之前）：头位块嵌进
@@ -560,9 +568,21 @@ public final class SurvivalController {
             // 到不了 12，挖岸升级从未触发（长跑#6 实测：泡水 10 分钟 fluid-escape
             // 事件 0 次、swim-timeout 循环 18 次）。浮沉时脚格是空气但身体还在水里，
             // 不走这条早退、落到下面的流体处理（其入口已按包围盒放宽）。
-            if (++fluidDryChecks >= 2) {
-                fluidStuckChecks = 0;
-                fluidEscapeDir = null;
+            // 【fix135】有集锚时改按真脱困清零：唇口栖息（包围盒搭岸沿块顶、底面
+            // 恰在水面之上）栖息数秒即满足 2 查干清，计数每轮清零重爬、19 分钟
+            // 到不了 12（死亡 #23 定谳）。真脱困 = 水平走开集锚 ≥3 格 ∨ 爬到集锚
+            // 水面 +2 以上 ∨ 连续离水 ≥15 查兜底；无集锚维持旧 2 查口径。
+            fluidDryChecks++;
+            if (fluidTrapAnchor == null) {
+                if (fluidDryChecks >= 2) {
+                    resetFluidTrap();
+                }
+            } else if (fluidDryChecks >= 15
+                    || (feet.getX() - fluidTrapAnchor.getX()) * (feet.getX() - fluidTrapAnchor.getX())
+                            + (feet.getZ() - fluidTrapAnchor.getZ())
+                                    * (feet.getZ() - fluidTrapAnchor.getZ()) >= 9
+                    || feet.getY() >= fluidTrapSurfaceY + 2) {
+                resetFluidTrap();
             }
             return;
         }
@@ -593,14 +613,62 @@ public final class SurvivalController {
                 // 【第十四轮】涉水早退不再清零泡水计数：浮沉中的 NPC 会间歇触底
                 // 站稳（眼出水面），旧版在此清零使计数永远到不了挖岸门槛。
                 // 计数只由流体入口上方的"连续 2 次完全离水"清零。
+                // 【fix135】唇口栖息计入被困：眼出水面+脚踩岸沿正是淹水口袋的
+                // 栖息态，旧版在此静默返回、深水碎片攒的计数又被干清（已改集锚
+                // 清零），两路合谋使计数永不达门槛（死亡 #23）。处置：原地不动
+                // ≥5 查且邻格有水时立集锚；集锚已立且栖息点仍在集锚 3 格内，
+                // 与深水同口径累积计数，且栖息态同享挖岸升级（纯栖息不滑回
+                // 深水时深水分支永不执行，升级必须在这里补发）。普通蹚水过河
+                // 是移动状态：立锚要原地不动、走开 3 格即清，不受影响。
+                if (fluidTrapAnchor == null && stillChecks >= 5) {
+                    net.minecraft.core.BlockPos wet = adjacentFluidCell(feet);
+                    if (wet != null) {
+                        fluidTrapAnchor = feet.immutable();
+                        fluidTrapSurfaceY = fluidSurfaceY(wet);
+                    }
+                }
+                if (fluidTrapAnchor != null
+                        && (feet.getX() - fluidTrapAnchor.getX()) * (feet.getX() - fluidTrapAnchor.getX())
+                                + (feet.getZ() - fluidTrapAnchor.getZ())
+                                        * (feet.getZ() - fluidTrapAnchor.getZ()) < 9) {
+                    fluidStuckChecks++;
+                    if (fluidStuckChecks >= 12 && stillChecks >= 5
+                            && fluidStuckChecks % 2 == 0) {
+                        if (!fluidEscapeDirPicked) {
+                            fluidEscapeDirPicked = true;
+                            fluidEscapeDir = pickFluidEscapeDir(feet);
+                            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dig start | fluid="
+                                    + fluidName + " pos=" + feet.toShortString()
+                                    + " dir=" + (fluidEscapeDir == null ? "none(全淹)"
+                                            : fluidEscapeDir.toShortString()));
+                        }
+                        boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
+                        if (dug) {
+                            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
+                                    + fluidName + " pos=" + feet.toShortString()
+                                    + " dir=" + (fluidEscapeDir == null ? "above"
+                                            : fluidEscapeDir.toShortString()));
+                        } else {
+                            logEscapeDigMiss(fluidName, feet);
+                        }
+                    }
+                }
                 return;
+            }
+            if (fluidTrapAnchor == null) {
+                fluidTrapAnchor = feet.immutable();
+                fluidTrapSurfaceY = fluidSurfaceY(feet);
             }
             fluidStuckChecks++;
             // 挖岸脱困的方向在进入升级阶段时选定一次（第四轮修复 B）：
             // 朝最近的旱地方向贴墙挖台阶；10 格内没有旱地（全淹洞穴）就保持 null。
             // 【第十四轮】仍用 ==12 触发：计数已改为跨浮沉连续累计且只与方向
             // 一起在真离水时清零，每轮泡水必恰好经过 12 一次，不会漏选/重选。
-            if (fluidStuckChecks == 12) {
+            // 【fix135】改「未选 ∧ ≥12 ∧ 静止 ≥5」状态闩：栖息累积（见涉水分支）
+            // 会让计数越过 12，==12 一次性触发可能被栖息/移动组合错过；静止闸
+            // 防止游向真岸途中误选向误挖。选向后本集不再重选（方向中途不变）。
+            if (!fluidEscapeDirPicked && fluidStuckChecks >= 12 && stillChecks >= 5) {
+                fluidEscapeDirPicked = true;
                 fluidEscapeDir = pickFluidEscapeDir(feet);
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dig start | fluid="
                         + fluidName + " pos=" + feet.toShortString()
@@ -626,7 +694,7 @@ public final class SurvivalController {
                     npc.swimTo(shore);
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，游泳上岸 | fluid="
                             + fluidName + " pos=" + feet.toShortString() + " 岸边=" + shore.toShortString());
-                } else if (fluidStuckChecks >= 12 && fluidEscapeDir != null) {
+                } else if (fluidStuckChecks >= 12 && fluidEscapeDir != null && stillChecks >= 5) {
                     // 没有能爬的岸：朝岸壁方向贴过去，配合下面的挖岸台阶脱困。
                     npc.swimTo(feet.offset(fluidEscapeDir.getX() * 3, 0, fluidEscapeDir.getZ() * 3));
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-press | fluid="
@@ -644,13 +712,15 @@ public final class SurvivalController {
             // 有岸壁方向就贴墙把水面以上两格挖成台阶口，挖通后那一格自然成为合格的岸，
             // 上面的找岸逻辑会把 NPC 领进去站稳；全淹洞穴没有岸壁方向时挖头顶开气腔。
             // 只挖和走，全程无传送。挖岸节奏约 2 秒一次，给身体留出贴墙/上浮的时间。
-            if (fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0) {
+            if (fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0 && stillChecks >= 5) {
                 boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
                 if (dug) {
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
                             + fluidName + " pos=" + feet.toShortString()
                             + " dir=" + (fluidEscapeDir == null ? "above"
                                     : fluidEscapeDir.toShortString()));
+                } else if (fluidEscapeDirPicked) {
+                    logEscapeDigMiss(fluidName, feet);
                 }
             } else if (fluidStuckChecks >= 3 && fluidStuckChecks % 5 == 3 && npc.digOutAbove()) {
                 // 未进入挖岸阶段前的旧升级：泡约 3 秒先试挖头顶（被水洞顶盖住时凿开继续上浮）。
@@ -659,8 +729,7 @@ public final class SurvivalController {
             }
             return;
         }
-        fluidStuckChecks = 0;
-        fluidEscapeDir = null;
+        resetFluidTrap();
         // === 实心方块自救：挖开脱困 ===
         // 【fix66】耕地/小径豁免：farmland 与 dirt_path 的碰撞盒高 15/16≈0.9375，
         // 人立于其上时脚部格就是它们本身（身体底面 y=62.94 → 脚格=62），会被下面
@@ -751,6 +820,47 @@ public final class SurvivalController {
         return best;
     }
 
+    /** 流体被困记账整组清零（计数/方向/集锚/选向闩）。 */
+    private void resetFluidTrap() {
+        fluidStuckChecks = 0;
+        fluidEscapeDir = null;
+        fluidTrapAnchor = null;
+        fluidEscapeDirPicked = false;
+    }
+
+    /**
+     * 【fix137】挖岸/挖顶升级已武装但试挖失败时的节流诊断（≥30 秒一行）：带计数、
+     * 静止查数、方向与头顶列探针。旧版失败无声——淹水洞里 +5 扫描封顶空转约
+     * 1 小时、日志零证据才被盘点抓到（farm104），此后任何同型空转 30 秒内必现形。
+     */
+    private void logEscapeDigMiss(String fluidName, net.minecraft.core.BlockPos feet) {
+        long now = System.currentTimeMillis();
+        if (now - lastEscapeMissLogMillis < 30_000L) {
+            return;
+        }
+        lastEscapeMissLogMillis = now;
+        LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dig-miss | fluid="
+                + fluidName + " pos=" + feet.toShortString()
+                + " checks=" + fluidStuckChecks + " still=" + stillChecks
+                + " dir=" + (fluidEscapeDir == null ? "above"
+                        : fluidEscapeDir.toShortString())
+                + " aboveProbe=" + npc.aboveColumnProbe());
+    }
+
+    /** 脚位四邻（同层与下一层）是否有流体格：唇口栖息立锚判据（身边就是水）。 */
+    private net.minecraft.core.BlockPos adjacentFluidCell(net.minecraft.core.BlockPos feet) {
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] d : dirs) {
+            for (int dy = 0; dy >= -1; dy--) {
+                net.minecraft.core.BlockPos cand = feet.offset(d[0], dy, d[1]);
+                if (!npc.level().getBlockState(cand).getFluidState().isEmpty()) {
+                    return cand;
+                }
+            }
+        }
+        return null;
+    }
+
     /**
      * 选挖岸脱困的方向（第四轮修复 B）：8 个水平方向逐格外探 10 格，
      * 哪边先碰到"可站立的旱地列"（任意高度，是岸壁就行）就朝哪边挖。
@@ -804,13 +914,37 @@ public final class SurvivalController {
      * @return 是否挖开了至少一块
      */
     private boolean digBankStep(net.minecraft.core.BlockPos feet) {
-        int surfaceY = fluidSurfaceY(feet);
-        net.minecraft.core.BlockPos lower = new net.minecraft.core.BlockPos(
-                feet.getX() + fluidEscapeDir.getX(), surfaceY + 1,
+        net.minecraft.core.BlockPos target = new net.minecraft.core.BlockPos(
+                feet.getX() + fluidEscapeDir.getX(), feet.getY(),
                 feet.getZ() + fluidEscapeDir.getZ());
-        net.minecraft.core.BlockPos upper = lower.above();
-        boolean dug = npc.mineWithBestTool(lower) || npc.mine(lower);
-        dug |= npc.mineWithBestTool(upper) || npc.mine(upper);
+        int surfaceY = fluidSurfaceY(target);
+        // 【fix135】挖点层位改并集：旧版只按自身列水面推目标列 +1/+2，唇口
+        // 栖息时岸壁堵点在脚位/胸位层，挖的全是空气、dug 恒 false（farm101
+        // 333 点 start 12 次而 dug 稀少同源）。并入自身脚位与脚位 +1 层——
+        // 正对身体贴着的那面墙；mine 系自跳空气/流体，逐格试挖、任一开即真。
+        java.util.LinkedHashSet<Integer> levels = new java.util.LinkedHashSet<>();
+        levels.add(surfaceY + 1);
+        levels.add(surfaceY + 2);
+        levels.add(feet.getY());
+        levels.add(feet.getY() + 1);
+        boolean dug = false;
+        for (int y : levels) {
+            net.minecraft.core.BlockPos cell = new net.minecraft.core.BlockPos(
+                    target.getX(), y, target.getZ());
+            // 【fix135b】空气/纯液体格不挖：水格挖不掉（见 FakePlayerBody.mine
+            // 的 fix135b 注），算进 dug 会让升级链对着水"假进展"。
+            net.minecraft.world.level.block.state.BlockState cellState =
+                    npc.level().getBlockState(cell);
+            if (cellState.isAir()
+                    || cellState.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) {
+                continue;
+            }
+            // 【fix152】第三路脱困挖：前两路被 fix101 分级守卫以「交规划层
+            // 补造」拒挖时，满包造不出镐则委托落空、挖岸永久恒 miss
+            // （farm120 实证 checks 300+）。mineEscapeBank 走 ascend 同款脱困
+            // 口径（无石镐素手挖、矿石格跳过防毁矿），守卫至此有兜底。
+            dug |= npc.mineWithBestTool(cell) || npc.mine(cell) || npc.mineEscapeBank(cell);
+        }
         return dug;
     }
 
@@ -822,6 +956,7 @@ public final class SurvivalController {
         // （上层全看它"在忙"而集体等待，只能等技能看门狗 40 秒~10 分钟后才醒），
         // fleeing/chasing 也会把目标层继续堵在复活点。
         skills.stop();
+        resetFluidTrap();
         fleeing = false;
         chasing = false;
         fleeCooldown = 0;

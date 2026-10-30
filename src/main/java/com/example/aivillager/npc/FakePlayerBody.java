@@ -394,13 +394,56 @@ public final class FakePlayerBody extends ServerPlayer {
      * 挖开自己头顶的方块（头格与头上一格）：淹水洞穴/被盖住的小坑里浮不出去时，
      * 玩家会凿开头顶继续往上游/爬。只挖硬度可挖的普通方块（基岩等挖不动的返回 false）。
      *
+     * <p>【fix133】两格都没挖开时（全淹竖井：头顶两格全是水、流体挖不动），
+     * 沿列继续向上扫描，凿穿水层上方的第一格实心顶盖——旧版到此恒失败，
+     * 生存层 fluid-escape 全淹分支武装了也挖不出（farm99 实证 escape-dug 全局 0 次、
+     * NPC 浮在淹井里 15 分钟）。tryDigBlocking 自会跳过流体与挖不动的块，
+     * 全列无可挖仍诚实返回 false。
+     *
+     * <p>【fix137】续扫上限 +5 → +16：farm104 实证淹水洞腔比 5 格深——NPC 在
+     * (550,48,-166) 挖开脚位上方数格后，上方 +1..+5 全是水，扫描恒空转且失败
+     * 无日志，困约 1 小时（地表在 +16）。玩家在淹水洞里会贴着自己这列一直往上
+     * 凿到空气为止，不会因为头顶 5 格全是水就停手；16 格仍是有界扫描，
+     * 全水/全挖不动时照旧诚实 false。
+     *
      * @return 是否挖开了至少一块
      */
     public boolean digOutAbove() {
         BlockPos feet = this.blockPosition();
         boolean dug = tryDigBlocking(feet.above(2));
         dug |= tryDigBlocking(feet.above());
+        if (!dug) {
+            for (int dy = 3; dy <= 16; dy++) {
+                if (tryDigBlocking(feet.above(dy))) {
+                    dug = true;
+                    break;
+                }
+            }
+        }
         return dug;
+    }
+
+    /**
+     * 【fix137】只读探针：报告头顶列 +1..+16 内第一格实心块（跳过空气与流体），
+     * 供生存层在挖顶失败时打诊断行——旧版 digOutAbove 失败无声，淹水洞里空转
+     * 1 小时日志零证据（farm104）。不改世界、不挖块。
+     *
+     * @return 形如 "dy=9 block=diorite diggable=true"，全列无实心块返回 "none"
+     */
+    public String aboveColumnProbe() {
+        BlockPos feet = this.blockPosition();
+        for (int dy = 1; dy <= 16; dy++) {
+            BlockPos pos = feet.above(dy);
+            BlockState state = this.level().getBlockState(pos);
+            if (state.isAir() || !state.getFluidState().isEmpty()) {
+                continue;
+            }
+            float hardness = state.getDestroySpeed(this.level(), pos);
+            boolean diggable = hardness >= 0.0F && hardness <= 3.0F;
+            String blockName = state.getBlock().getName().getString();
+            return "dy=" + dy + " block=" + blockName + " diggable=" + diggable;
+        }
+        return "none";
     }
 
     public boolean isSwimmingEscape() {
@@ -752,6 +795,13 @@ public final class FakePlayerBody extends ServerPlayer {
         // 抛 IAE、目标卡死刷屏。真玩家不会挖穿自家床，他家床同理——直接拒挖，
         // 调用方按"挖不开"诚实改道/放弃。
         BlockState targetState = this.level().getBlockState(pos);
+        // 【fix135b】纯液体格不可挖且必须诚实报失败：destroyBlock 对水格返回
+        // true 却不移除（邻格水源立刻回灌，before/after 全是 water）——fix135
+        // staging 实证 digBankStep 对着水格"挖开成功"刷屏、真墙一格没动。
+        // 含水方块（水渍台阶等）不是纯液体、不在此列，照常可挖。
+        if (targetState.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) {
+            return false;
+        }
         if (targetState.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
             if (this.tickCount - lastBedGuardLogTick >= 200) {
                 lastBedGuardLogTick = this.tickCount;
@@ -1162,6 +1212,34 @@ public final class FakePlayerBody extends ServerPlayer {
             }
         }
         return total;
+    }
+
+    /**
+     * 【fix152】流体脱困挖岸专用入口：生存层 digBankStep 的第三路。
+     *
+     * <p>病根（farm120 live 死局）：挖岸旧链只调默认口径 mineWithBestTool
+     * （allowLastResort=true），无石镐时命中 fix101 分级守卫——「合得出石镐」
+     * 只判材料不判空槽，直接拒挖「交规划层补造」；背包已满时规划层合成恒
+     * 失败，委托落空，NPC 困在水浸口袋里挖岸永久被拒（checks 冲过 300 仍
+     * 恒 miss）。ascend 脱困口径（allowLastResort=false）本有素手挖兜底，
+     * 挖岸唯独没接上——守卫无兜底，违 Fong 兜底通则。
+     *
+     * <p>口径：矿石格（注册名含 _ore 或 ancient_debris）不走本路——素手挖矿
+     * 无掉落等于毁矿，有可用镐时前两路（mineWithBestTool/mine）已处理；其余
+     * 格走脱困口径 mineWithBestTool(pos,false)：有石镐用石镐、无石镐素手挖
+     * （无掉落脱困、零耐久）、绝不顺位烧铁/钻镐，与 ascend 同款、合省镐规矩。
+     */
+    public boolean mineEscapeBank(BlockPos pos) {
+        BlockState state = this.level().getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+        String path = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                .getKey(state.getBlock()).getPath();
+        if (path.contains("_ore") || path.equals("ancient_debris")) {
+            return false;
+        }
+        return mineWithBestTool(pos, false);
     }
 
     /**

@@ -155,6 +155,15 @@ public final class GoalExecutor {
     private int handledObsidianSeq = -1;
     /** 【fix100】浇铸目标内 descend 连续失败计数：攒满 3 次即收场交规划层补镐。 */
     private int obsidianDescendFails;
+    /** 【fix142】dig/revisit 目标内 descend「无实际下降」结局的序号水位线与
+     * 连败计数：坡面幻影步（步数涨、精确 Y 零下降）旧版无人消费结局，dig 靠
+     * stale 计数约 30 分钟才收场、revisit 靠 attempts 与看门狗磨满超时。 */
+    private int handledDigDescendSeq = -1;
+    private int digDescendNoDropFails;
+    private int handledRevisitDescendSeq = -1;
+    private int revisitDescendNoDropFails;
+    /** 【fix144】过境记矿扫描节流（travel/revisit 共用，约 20 秒一次）。 */
+    private int transitOreScanCooldown;
     /** 【fix111】找岩浆走廊方向（弧度，NaN=本目标未定）：随机换位互相
      * 抵消（farm73 实证整轮净位移约 2 格），改每目标定一个方向沿走廊
      * 直进、新目标重新定方向（等效换区）。 */
@@ -267,6 +276,9 @@ public final class GoalExecutor {
     private int chaseGainSeen;
     /** 上次战利品增量上涨的时刻（目标开始时初始化为目标开始时刻）。 */
     private long chaseLastGainMillis;
+    /** 【fix134】中途撤退本地冷却：触发后 120 秒内不再触发（防到家后同目标
+     * 立刻重派→秒断的暖循环；撤退已把人带回安全区，冷却内归规划层处置）。 */
+    private long vitalRetreatCooldownUntilTick;
     /** 长途行进的目标坐标（travel 目标使用）。 */
     private double travelX;
     private double travelY;
@@ -649,6 +661,11 @@ public final class GoalExecutor {
         obsidianRouteFails = 0;
         obsidianRouteLogged = false;
         handledObsidianSeq = skills.outcomeSeq();
+        // 【fix142】descend 结局消费水位线随新目标复位（同 handledObsidianSeq 口径）。
+        handledDigDescendSeq = skills.outcomeSeq();
+        digDescendNoDropFails = 0;
+        handledRevisitDescendSeq = skills.outcomeSeq();
+        revisitDescendNoDropFails = 0;
         sleepStartMillis = 0L;
         sleepDayTime0 = -1L;
         sleepActionStuck = 0;
@@ -777,6 +794,11 @@ public final class GoalExecutor {
         // 置于"技能忙"早退之前——野外目标入夜时恰恰是技能连环执行中，
         // 放在后面会被饿死。
         if (checkNightAbort()) {
+            return;
+        }
+        // 【fix134】中途撤退线：与 fix121 同置——血/饭磨穿恰恰发生在技能
+        // 连环执行中，放在后面同样会被饿死。
+        if (checkVitalRetreat()) {
             return;
         }
         // 技能还在执行（走路/挖矿）就等它结束，目标层只负责“下一步做什么”。
@@ -1770,6 +1792,14 @@ public final class GoalExecutor {
         }
         // 上一条矿道如果挖空了，下一轮掘进前要先换位置（见下方步骤 3 前的处理）。
         noteStripOutcome();
+        // 【fix142】消费 descend 的「无实际下降」结局：坡面幻影步旧版无人
+        // 消费，dig 只能靠 stale 计数约 30 分钟收场（farm108 挖铁实证）。
+        // 连败 ≥2 即收场交规划层换位（玩家在坡面挖不下去两三次就换地方）。
+        noteDigDescendOutcome();
+        if (digDescendNoDropFails >= 2) {
+            finish("挖矿放弃：descend 两度无实际下降（坡面幻影步坏地形），交规划层换位");
+            return;
+        }
         // 【fix71·D5】矿道照明：技能空闲间隙顺手插火把（只在真黑、8 格内无火把时）。
         maybePlaceTorch();
         if (have >= targetCount) {
@@ -1799,6 +1829,7 @@ public final class GoalExecutor {
                 lastProgress = have;
                 staleChecks = 0;
                 stoneStripFails = 0;
+                digDescendNoDropFails = 0;
             }
         }
 
@@ -1984,6 +2015,91 @@ public final class GoalExecutor {
             // 【第四十七轮】挖石头连败单独记账，给 tickDig 的下挖取石兜底当触发量。
             if (oreTarget != null && "stone".equals(oreTarget.block())) {
                 stoneStripFails++;
+            }
+        }
+    }
+
+    /**
+     * 【fix142】消费 dig 目标内 descend 的结局（序号水位线，照 noteObsidianOutcome
+     * 范式）：只认 descend 结局——「到达」清零；含「无实际下降」（fix113 真降
+     * 看门狗的幻影步判词）计数并打专行，其余结局不计。收场判定在 tickDig
+     * 调用点（连败 ≥2），本方法只记账。
+     */
+    private void noteDigDescendOutcome() {
+        int seq = skills.outcomeSeq();
+        if (seq == handledDigDescendSeq) {
+            return;
+        }
+        handledDigDescendSeq = seq;
+        String outcome = skills.lastOutcome();
+        if (outcome == null || !outcome.startsWith("descend ")) {
+            return;
+        }
+        if (outcome.contains("到达")) {
+            digDescendNoDropFails = 0;
+            return;
+        }
+        if (!outcome.contains("无实际下降")) {
+            return;
+        }
+        digDescendNoDropFails++;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " dig descend 无实际下降计数 | fails="
+                + digDescendNoDropFails + " outcome=" + outcome + "（fix142）");
+    }
+
+    /**
+     * 【fix142】消费 revisit 目标内 descend 的结局：与 dig 同范式——竖向段
+     * （≤4 格分支）的 descend 旧版无人消费结局，坏地形悬停只能磨满
+     * attempts/目标超时（farm105–108 山顶悬停、farm111 地下 480 秒超时）。
+     * 收场判定在 tickRevisit 调用点（连败 ≥2），本方法只记账。
+     */
+    private void noteRevisitDescendOutcome() {
+        int seq = skills.outcomeSeq();
+        if (seq == handledRevisitDescendSeq) {
+            return;
+        }
+        handledRevisitDescendSeq = seq;
+        String outcome = skills.lastOutcome();
+        if (outcome == null || !outcome.startsWith("descend ")) {
+            return;
+        }
+        if (outcome.contains("到达")) {
+            revisitDescendNoDropFails = 0;
+            return;
+        }
+        if (!outcome.contains("无实际下降")) {
+            return;
+        }
+        revisitDescendNoDropFails++;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " revisit descend 无实际下降计数 | fails="
+                + revisitDescendNoDropFails + " outcome=" + outcome + "（fix142）");
+    }
+
+    /**
+     * 【fix144】过境记矿：travel/revisit 途中节流（约 20 秒一次）扫半径 8 的
+     * 裸露钻石/金矿，当前镐挖不了才记进 OreMemory（Fong fix40 口径：只记
+     * 真实见到的裸露矿、备好工具回访）。旧版过境零扫描——farm111 回访途中
+     * 在 (398,-16) 目击深板岩钻石矿、因无可用镐跳过却无人记账，矿就此丢失。
+     * 只记账不停步：行进节奏与行为不变，账本自带 4 格去重/16 条上限/2 小时
+     * 过期。铁/青金过境不记（dig 链与 recordSeenOre 已覆盖其主场景）。
+     */
+    private void maybeRecordTransitOre() {
+        if (transitOreScanCooldown > 0) {
+            transitOreScanCooldown--;
+            return;
+        }
+        transitOreScanCooldown = 40;
+        OreMemory.bindWorld(npc.level());
+        for (String block : new String[]{"diamond_ore", "gold_ore"}) {
+            if (hasHarvestPickaxe(block)) {
+                continue;
+            }
+            BlockPos seen = scanExposedOre(block, 8);
+            if (seen != null) {
+                OreMemory.record(npc.npcName(), block, seen);
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 过境记矿 | block=" + block
+                        + " pos=" + seen.toShortString()
+                        + "（fix144：途中目击、当前镐挖不了）");
             }
         }
     }
@@ -4370,10 +4486,25 @@ public final class GoalExecutor {
                                 + recorded.toShortString() + "），重新选位");
                     }
                     BlockPos anchor = base.anchor();
+                    // 【fix155】候选补齐 ring-1 八邻格 + ring-2 十六格兜底：
+                    // 旧版只有 6 格（还漏了 (-1,0,-1)/(0,0,-1)），火柴盒里
+                    // 床/熔炉/墙占满即「屋内没有放箱子的空位」放弃——fix136
+                    // 专程腿到了门口死在这一步（round40 账）。玩家做法是屋里
+                    // 放不下就放门口/外墙边；仍走 bedCellFree 同口径（空/植被
+                    // +无流体+脚下实心），锚点本身永不入选（留作站位）。
                     BlockPos[] candidates = {
                             anchor.offset(1, 0, 1), anchor.offset(1, 0, -1),
-                            anchor.offset(-1, 0, 1), anchor.offset(1, 0, 0),
-                            anchor.offset(-1, 0, 0), anchor.offset(0, 0, 1)};
+                            anchor.offset(-1, 0, 1), anchor.offset(-1, 0, -1),
+                            anchor.offset(1, 0, 0), anchor.offset(-1, 0, 0),
+                            anchor.offset(0, 0, 1), anchor.offset(0, 0, -1),
+                            anchor.offset(2, 0, 0), anchor.offset(-2, 0, 0),
+                            anchor.offset(0, 0, 2), anchor.offset(0, 0, -2),
+                            anchor.offset(2, 0, 1), anchor.offset(2, 0, -1),
+                            anchor.offset(-2, 0, 1), anchor.offset(-2, 0, -1),
+                            anchor.offset(1, 0, 2), anchor.offset(1, 0, -2),
+                            anchor.offset(-1, 0, 2), anchor.offset(-1, 0, -2),
+                            anchor.offset(2, 0, 2), anchor.offset(2, 0, -2),
+                            anchor.offset(-2, 0, 2), anchor.offset(-2, 0, -2)};
                     storeChestPos = null;
                     for (BlockPos cell : candidates) {
                         // bedCellFree 要求空/植被+脚下实心：床格是实体块天然被排除，
@@ -4386,6 +4517,12 @@ public final class GoalExecutor {
                     if (storeChestPos == null) {
                         finish("存箱放弃：屋内没有放箱子的空位");
                         return;
+                    }
+                    if (Math.max(Math.abs(storeChestPos.getX() - anchor.getX()),
+                            Math.abs(storeChestPos.getZ() - anchor.getZ())) > 1) {
+                        LOG.info("[AIV][GOAL] " + npc.npcName()
+                                + " [STORE] 屋内无空位，箱位选到外圈（fix155） | pos="
+                                + storeChestPos.toShortString());
                     }
                     if (countItem("chest") == 0) {
                         finish("存箱放弃：包里没箱子");
@@ -5234,6 +5371,14 @@ public final class GoalExecutor {
     private void tickRevisit() {
         OreMemory.bindWorld(npc.level());
         status = "回访记账矿 " + oreTarget.block() + " @ " + revisitX + "," + revisitY + "," + revisitZ;
+        // 【fix144】过境记矿：回访本身就是长途过境，途中目击的珍贵矿顺手记账。
+        maybeRecordTransitOre();
+        // 【fix142】消费竖向 descend 的「无实际下降」结局，连败 ≥2 收场计次。
+        noteRevisitDescendOutcome();
+        if (revisitDescendNoDropFails >= 2) {
+            finish("回访放弃：竖向 descend 两度无实际下降（坏地形悬停），交规划层");
+            return;
+        }
         if (!hasHarvestPickaxe(oreTarget.block())) {
             finish("回访中止：又没有能挖 " + oreTarget.block() + " 的镐了");
             return;
@@ -5353,6 +5498,73 @@ public final class GoalExecutor {
         return true;
     }
 
+    /**
+     * 【fix134】中途撤退线（与 fix122 入场闸成对的「中途」一面）：fix121 管
+     * 入夜、fix122 只管入场那一刻——目标进行中自身血/饭被磨穿没有任何自查
+     * （#15 入场 hp16.6/food8 合法、缠斗磨穿被收尾；#20/#21 地下磨穿；
+     * #22 饥饿地表 hunt 磨到 hp1.2）。作业类目标（hunt/slay/gather/dig）
+     * 执行中 hp ≤ 7.0（35% 惜命线，与 fix122/isLowHealth 同值）∨
+     * foodLevel ≤ 3（回血余地归零）→ 停技能收场，交规划层撤退步（步 -1）
+     * 送回安全点。只收目标、不碰生存层：贴身自卫/逃跑照旧，脱离战斗后由
+     * 规划层接手回家，而不是原样续跑原目标。
+     *
+     * <p>口径边界：只查主世界（下界链有 fix96/93 入境闸把关）；地下同查
+     * （血线与昼夜无关，夜闸的 canSeeSky 口径不适用）；travel 自 fix151
+     * 起分口径纳入（救援腿阶段名豁免，见方法内注释），revisit 仍不查
+     * （记账面刚收口、留观）；目标开始 10 秒内不查（入场合法性归各步闸）；
+     * 触发后本地冷却 120 秒。收场文案避开 isFailureText 关键词、不喂连败
+     * 退避（与 fix121 同口径），规划层以文案含「中途撤退」专认记账。
+     *
+     * @return true 表示已收场，tick 应立即返回
+     */
+    private boolean checkVitalRetreat() {
+        if (!"hunt".equals(type) && !"slay".equals(type)
+                && !"gather".equals(type) && !"dig".equals(type)
+                && !"travel".equals(type) && !"farm".equals(type)) {
+            return false;
+        }
+        // 【fix153】farm 补入类型面：#30 实证——开田目标白天派出、跨夜运行
+        // 449 秒、选址南漂 163 格，入夜开阔地被僵尸+骷髅轮番缠斗约 2 分钟
+        // 磨穿（hp 1.0 逃跑未脱身被收），farm 不在类型面、目标层无人中止。
+        // farm 是与 gather 同风险的长时户外作业目标、不是救援腿，不适用
+        // travel 的豁免逻辑，中止后同交步 -1 接管。
+        // 【fix151】travel 分口径扩面：救援腿本身豁免——步 -1「中途撤退：
+        // 回安全点」与步 -0.5「满包存箱：回落脚点」就是把人送回安全点的
+        // 动作，中止它等于自锯；其余 travel（回程补给/饥饿回农场/换区
+        // 换位/杂派长途）在 vitals 磨穿时同样收场交步 -1 改派豁免腿。
+        // #29 实证：回程补给 travel 崖面 descend 悬空磨 5.9 分钟、
+        // food 7→3 入夜被收，旧版 travel 整体豁免无人管。
+        if ("travel".equals(type)
+                && ("中途撤退：回安全点".equals(goalStage)
+                    || "满包存箱：回落脚点".equals(goalStage))) {
+            return false;
+        }
+        if (!net.minecraft.world.level.Level.OVERWORLD.equals(npc.level().dimension())) {
+            return false;
+        }
+        if (npc.tickCount - goalStartTick < 200L) {
+            return false;
+        }
+        if (npc.tickCount < vitalRetreatCooldownUntilTick) {
+            return false;
+        }
+        double hp = npc.getHealth();
+        int foodLevel = npc.getFoodData().getFoodLevel();
+        if (hp > 7.0D && foodLevel > 3) {
+            return false;
+        }
+        vitalRetreatCooldownUntilTick = npc.tickCount + 2400L;
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 中途撤退 | type=" + type
+                + " stage=" + (goalStage.isEmpty() ? "-" : goalStage)
+                + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", hp)
+                + " foodLevel=" + foodLevel
+                + " pos=" + npc.blockPosition().toShortString()
+                + "（fix134：血量/口粮见底，中止当前目标回安全点）");
+        skills.stop();
+        finish("中途撤退：血量/口粮见底，先回安全点休整（fix134）type=" + type);
+        return true;
+    }
+
     private boolean checkVerticalAlignDeadline() {
         double tx;
         double ty;
@@ -5401,6 +5613,8 @@ public final class GoalExecutor {
         double horizontalSq = dx * dx + dz * dz;
         status = "长途行进 剩余 " + Math.round(Math.sqrt(horizontalSq))
                 + " 格 高度差 " + Math.round(travelY - npc.getY());
+        // 【fix144】过境记矿：长途途中目击挖不了的珍贵矿记坐标待回访。
+        maybeRecordTransitOre();
         if (horizontalSq <= 16.0D && Math.abs(travelY - npc.getY()) <= 3.0D) {
             finish("到达目的地");
             return;

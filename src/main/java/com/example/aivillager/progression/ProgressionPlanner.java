@@ -143,6 +143,35 @@ public final class ProgressionPlanner {
     private int shelterFailStreak;
     private long shelterBackoffUntil;
     private net.minecraft.core.BlockPos shelterFailPos;
+    /** 【fix146】本夜小屋建成记账：夜间小屋目标以放置&gt;0 收场时置位（day 索引 +
+     * 收场站位），decide() 步 -0.25 就地过夜保持门据此认「本夜刚建过小屋」；
+     * 跨夜自动失效（只认与当前 day 索引相等）。 */
+    private long shelterHoldNight = -1L;
+    private net.minecraft.core.BlockPos shelterHoldPos;
+    /** 【fix146】保持门当夜已打过专行日志的 day 索引（每夜只打一次，防 decide 高频刷屏）。 */
+    private long overnightHoldLoggedNight = -1L;
+    /** 【fix146】保持门昨夜曾生效的 day 索引（天亮打一行解除用）；-1 表示未生效。 */
+    private long overnightHoldActiveNight = -1L;
+    /** 【fix146b】(c) 支「回小屋」当夜一次性闸：小屋站位距约 2.2 格时规划层
+     * 判「未到」、travel 目标层到达容差约 2.5 格判「到达」——两口径错位带内
+     * 1 Hz 连派（farm113 首夜实证）。派过一次即认 travel 口径、当夜落回等待。 */
+    private long shelterReturnNight = -1L;
+    /** 【fix146】本次 decide 调用中保持门是否已裁决「保持」（含原地等待的 null 情形，
+     * 由 overnightHoldGate 置位、decide 读后决定是否直接返回待命）。 */
+    private boolean overnightHoldEngaged;
+    /** 【fix147】换区 ascend 回读状态：派单时记 skills.outcomeSeq() 基线，结局
+     * 序号未变不许进 phase（phase 不得预进）；回读到「ascend 已回到地表」才放行。 */
+    private boolean relocationAscendIssued;
+    private int relocationAscendSeq;
+    /** 【fix147】换区 explore 派单起点站位：结局按水平位移 ≥24 格验收，
+     * 失败/未挪窝不许清标放行原地挖矿。 */
+    private net.minecraft.core.BlockPos relocationExploreStartPos;
+    /** 【fix150】换区 explore/travel 连败计数：≥3 次无位移后 explore 腿改走
+     * travel 分段寻路换位（崖面地形 explore 五向探路结构性全灭，farm117 实证）。 */
+    private int relocationExploreFailStreak;
+    /** 【fix150】换区原点（ascend 回读成功、进 explore 腿时记）：位移验收统一
+     * 按原点算，单腿失败不清原点（防每腿换基线把「没挪窝」洗成达标）。 */
+    private net.minecraft.core.BlockPos relocationOriginPos;
     /** 【fix50】采集木头专属连败计数：木料安全线（步 6.5）的放行阀原读共享
      * failStreak，但采集失败后规划层总会先插一个 0.5 秒必成的合成步（补石镐），
      * 成功即把共享连败清零，放行阀永远凑不满 2——fix49 短验实证 NPC 在
@@ -199,6 +228,53 @@ public final class ProgressionPlanner {
     private int hungerHuntFailStreak;
     private int hungerReturnFailStreak;
     private long hungerReturnBackoffUntil;
+    /** 【fix149】步 0「饥饿求生：先回地表」ascend 结局回读记账：旧版该支只认
+     * underground() 高度图口径、无条件重派 ascend——崖面列高度图在崖顶、
+     * 人在开阔坡面恒判地下，ascend 每约 35 秒以「四周悬空且没有垫脚方块」
+     * 收场也无人消费，hunt 永不派单、fix117 回家出口永不开启（farm114
+     * 实证同点连派 28 次）。改回读制（照 fix147 范式）：派单记序号基线，
+     * 结局回读成功清零、ascend 名下失败连败 ≥2 记放弃点落回地表口径处置；
+     * 放弃点水平位移 ≥16 格自动失效（换地方重试）。 */
+    private boolean hungerAscendIssued;
+    private long hungerAscendSeq;
+    private int hungerAscendFailStreak;
+    private net.minecraft.core.BlockPos hungerAscendGiveUpPos;
+    /** 【fix154】步 -1/-0.5 共用的回地表腿记账（surfaceAscendStep）：旧版两步
+     * 都是无条件重派 ascend、零结局消费——ascend 在死列恒以「连续 6 级上
+     * 不去」收场时步 -1 永远落不到地表口径分支，标记自清后步 0 接手、其
+     * hunt 被 A 环中止又生新标记，组合绕同一堵墙（farm122 (354,24,-121)
+     * 同点 30 秒一轮实证）。改回读制（照 fix147/fix149 范式）：ascend 同点
+     * （锚点水平 <4 格）连败 ≥3 → strip 同层掘进横移换列再 ascend；横移
+     * ≥2 轮仍连败 → 放弃本腿、落调用方地表口径（travel 自带竖向处理）。 */
+    private boolean surfAscendIssued;
+    private long surfAscendSeq;
+    private int surfAscendFailStreak;
+    private net.minecraft.core.BlockPos surfAscendAnchorPos;
+    /** 0=ascend 腿、1=strip 横移腿。 */
+    private int surfAscendPhase;
+    private boolean surfStripIssued;
+    private long surfStripSeq;
+    private int surfLateralRounds;
+    /** 【fix134】中途撤退专属记账：目标层自查（GoalExecutor.checkVitalRetreat）
+     * 以「中途撤退」结局收场后置位 retreatHomeSince，decide() 步 -1 据此把人
+     * 送回安全点（落脚点锚点优先、无则农场锚点）；回程 travel 专属连败与
+     * 退避 120 秒×连败、上限 600 秒（照 fix103/117 同款），退避期落回常规
+     * 链兜底、不钉人。标记 600 秒未清自动失效（同字段注释口径见步 -1）。 */
+    private long retreatHomeSince;
+    /** 【fix140】步 0 暂缓日志每段撤退只打一次（decide 高频调用防刷屏）。 */
+    private boolean retreatHoldLogged;
+    /** 【fix143】步 6.6 口粮 hunt 撤退暂缓日志每段撤退只打一次。 */
+    private boolean foodHuntHoldLogged;
+    private int retreatTravelFailStreak;
+    private long retreatTravelBackoffUntil;
+    /** 【fix136】满包存箱专属记账：合成因背包已满连败 ≥2、包真满（空槽=0）
+     * 且有可存物时置位 craftFullStoreSince，decide() 步 -0.5 专程送回落脚点
+     * 存箱腾格（存箱步 6.77 只在锚点 48 格内顺路触发，远地满包等不到——
+     * fix129 注释承诺的「回锚点存箱自解」在此补上专程腿）。回程 travel
+     * 专属退避同 fix134 口径；标记 900 秒未清自动失效。 */
+    private long craftFullStoreSince;
+    private int storeTripFailStreak;
+    private long storeTripBackoffUntil;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -383,6 +459,17 @@ public final class ProgressionPlanner {
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成退避 | 连败=" + pickCraftFailStreak
                             + " 退避秒=" + (pickCraftBackoffUntil - now) / 1000L
                             + "（背包已满做不出来，先干别的）阶段=" + lastStage);
+                    // 【fix136】满包死锁的专程存箱置标：连败 ≥2 且包真满
+                    // （腾格三档已实证腾不出：杂石/二档/白名单大宗皆无）且有
+                    // 可存物 → decide() 步 -0.5 专程回落脚点存箱。只置标一次，
+                    // 步内超时/到达自清，防与 pickCraft 退避互相锯齿。
+                    if (pickCraftFailStreak >= 2 && craftFullStoreSince == 0L
+                            && countEmptyMainSlots() == 0 && hasStorableLoot()) {
+                        craftFullStoreSince = now;
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱记账 | 合成连败="
+                                + pickCraftFailStreak + " 空槽=0 有可存物"
+                                + "（decide 步 -0.5 将专程回落脚点存箱）阶段=" + lastStage);
+                    }
                 } else if (!goalFailed) {
                     pickCraftFailStreak = 0;
                     pickCraftBackoffUntil = 0L;
@@ -463,6 +550,15 @@ public final class ProgressionPlanner {
                     shelterFailStreak = 0;
                     shelterBackoffUntil = 0L;
                     shelterFailPos = null;
+                    // 【fix146】放置>0 = 本夜小屋已建成：记当夜索引与站位，
+                    // 供步 -0.25 过夜保持门认「本夜刚建过小屋」触发。
+                    int placed = parsePlacedCount(goalOutcomeText);
+                    if (placed > 0) {
+                        shelterHoldNight = currentDayIndex();
+                        shelterHoldPos = npc.blockPosition();
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 本夜小屋建成记账（fix146） | 放置="
+                                + placed + " 位置=" + shelterHoldPos.toShortString());
+                    }
                 }
             } else if ("回箱存物".equals(lastStage)) {
                 if (goalFailed) {
@@ -537,6 +633,10 @@ public final class ProgressionPlanner {
                             + "（≥3 且未到家（水平>48 或高差>12）时改走回农场）");
                 } else {
                     hungerHuntFailStreak = 0;
+                    // 【fix149】吃到东西了：ascend 回读记账一并清零。
+                    hungerAscendFailStreak = 0;
+                    hungerAscendGiveUpPos = null;
+                    hungerAscendIssued = false;
                 }
             }
             if ("饥饿求生：回农场".equals(lastStage)) {
@@ -549,6 +649,111 @@ public final class ProgressionPlanner {
                     hungerReturnFailStreak = 0;
                     hungerReturnBackoffUntil = 0L;
                     hungerHuntFailStreak = 0;
+                }
+            }
+            // 【fix134】中途撤退记账（独立于 else-if 链）：目标层自查以
+            // 「中途撤退」结局收场 → 置位撤退状态，decide() 步 -1 送回安全点；
+            // 回程 travel（阶段名「中途撤退：回安全点」）失败专属退避、
+            // 成功清零（到达判定本身在步 -1 按距离清标记）。
+            if (goalOutcomeText != null && goalOutcomeText.contains("中途撤退")) {
+                retreatHomeSince = now;
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退记账 | 阶段=" + lastStage
+                        + "（decide 步 -1 将送回安全点）");
+            }
+            if ("中途撤退：回安全点".equals(lastStage)) {
+                if (goalFailed) {
+                    retreatTravelFailStreak++;
+                    retreatTravelBackoffUntil = now + Math.min(600_000L, 120_000L * retreatTravelFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退回程退避 | 连败=" + retreatTravelFailStreak
+                            + " 退避秒=" + (retreatTravelBackoffUntil - now) / 1000L);
+                } else {
+                    retreatTravelFailStreak = 0;
+                    retreatTravelBackoffUntil = 0L;
+                }
+            }
+            // 【fix136】满包存箱回程 travel 专属退避（镜像 fix134）：失败涨
+            // 连败、成功清零（到达清标记在步 -0.5 按距离判定）。
+            if ("满包存箱：回落脚点".equals(lastStage)) {
+                if (goalFailed) {
+                    storeTripFailStreak++;
+                    storeTripBackoffUntil = now + Math.min(600_000L, 120_000L * storeTripFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱回程退避 | 连败=" + storeTripFailStreak
+                            + " 退避秒=" + (storeTripBackoffUntil - now) / 1000L);
+                } else {
+                    storeTripFailStreak = 0;
+                    storeTripBackoffUntil = 0L;
+                }
+            }
+            // 【fix147】换区 explore 结局记账（独立于 else-if 链，只认阶段名）：
+            // 旧版 relocationStep 在派单同轮就把 phase 预进到 2，explore 0.5 秒
+            // 失败后下一轮直接打「换区完成」放行原地挖矿（farm112 同点 11+ 次
+            // 实证）。改：结局在此按水平位移验收——失败或位移 <24 格都不清标、
+            // 不放行，清起点待重试（通用失败退避照旧）；位移达标才算换区完成。
+            if ("挖矿连败换区：远距离移动".equals(lastStage) && relocationActive) {
+                // 【fix150】位移按换区原点算（原点未记时退回本腿起点）：单腿
+                // 失败不清原点，防逐腿换基线把「没挪窝」洗成达标。
+                net.minecraft.core.BlockPos relocBase = relocationOriginPos != null
+                        ? relocationOriginPos : relocationExploreStartPos;
+                double relocDx = relocBase == null ? 0.0D
+                        : npc.getX() - (relocBase.getX() + 0.5D);
+                double relocDz = relocBase == null ? 0.0D
+                        : npc.getZ() - (relocBase.getZ() + 0.5D);
+                double relocDist = Math.sqrt(relocDx * relocDx + relocDz * relocDz);
+                if (!goalFailed && relocBase != null && relocDist >= 24.0D) {
+                    relocationActive = false;
+                    relocationPhase = 0;
+                    relocationExploreStartPos = null;
+                    relocationOriginPos = null;
+                    relocationExploreFailStreak = 0;
+                    digAbandonStreak = 0;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 换区完成，重新尝试挖矿 | resource="
+                            + relocationResource + " 位移=" + Math.round(relocDist)
+                            + " 位置=" + npc.blockPosition().toShortString() + "（fix147：位移验收）");
+                    relocationResource = "";
+                } else {
+                    relocationPhase = 1;
+                    relocationExploreStartPos = null;
+                    relocationExploreFailStreak++;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 换区 explore 未产生位移，不放行挖矿（fix147） | outcome=" + goalOutcomeText
+                            + " 位移=" + Math.round(relocDist)
+                            + " 无位移连败=" + relocationExploreFailStreak
+                            + "（≥3 改走 travel 换位，fix150）"
+                            + " 位置=" + npc.blockPosition().toShortString());
+                }
+            }
+            // 【fix150】换区 travel 换位结局记账（与 explore 腿同验收口径）：
+            // explore 连败 ≥3 后改派的 travel 若也没挪出 24 格，换下一方位重试；
+            // 位移达标才算换区完成（清标口径与 explore 成功完全一致）。
+            if ("挖矿连败换区：travel 换位".equals(lastStage) && relocationActive) {
+                net.minecraft.core.BlockPos travelBase = relocationOriginPos != null
+                        ? relocationOriginPos : relocationExploreStartPos;
+                double travelDx = travelBase == null ? 0.0D
+                        : npc.getX() - (travelBase.getX() + 0.5D);
+                double travelDz = travelBase == null ? 0.0D
+                        : npc.getZ() - (travelBase.getZ() + 0.5D);
+                double travelDist = Math.sqrt(travelDx * travelDx + travelDz * travelDz);
+                if (!goalFailed && travelBase != null && travelDist >= 24.0D) {
+                    relocationActive = false;
+                    relocationPhase = 0;
+                    relocationExploreStartPos = null;
+                    relocationOriginPos = null;
+                    relocationExploreFailStreak = 0;
+                    digAbandonStreak = 0;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 换区完成，重新尝试挖矿 | resource="
+                            + relocationResource + " 位移=" + Math.round(travelDist)
+                            + " 位置=" + npc.blockPosition().toShortString()
+                            + "（fix150：travel 换位位移验收）");
+                    relocationResource = "";
+                } else {
+                    relocationPhase = 1;
+                    relocationExploreFailStreak++;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 换区 travel 未产生位移，不放行挖矿（fix150） | outcome=" + goalOutcomeText
+                            + " 位移=" + Math.round(travelDist)
+                            + " 无位移连败=" + relocationExploreFailStreak
+                            + "（换下一方位重试）"
+                            + " 位置=" + npc.blockPosition().toShortString());
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -583,6 +788,14 @@ public final class ProgressionPlanner {
                     relocationActive = true;
                     relocationResource = issuedDigResource;
                     relocationPhase = 0;
+                    // 【fix147】换区回读状态复位：ascend 结局序号以此刻为基线，
+                    // 未回读到「已回到地表」前 phase 不许前进。
+                    relocationAscendIssued = false;
+                    relocationAscendSeq = skills.outcomeSeq();
+                    relocationExploreStartPos = null;
+                    // 【fix150】换位连败与原点一并复位。
+                    relocationExploreFailStreak = 0;
+                    relocationOriginPos = null;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 挖矿连败换区 | resource="
                             + relocationResource + " 连弃=" + digAbandonStreak
                             + " 位置=" + npc.blockPosition().toShortString());
@@ -718,6 +931,35 @@ public final class ProgressionPlanner {
         return npc.blockPosition().distSqr(shelterFailPos) < 64.0D;
     }
 
+    /** 当前 day 索引（dayTime/24000）：跨夜判定口径，fix146 保持记账用。 */
+    private long currentDayIndex() {
+        return Math.floorDiv(npc.level().getDayTime(), 24000L);
+    }
+
+    /** 从建造结局文案里解析「放置=N」的 N；解析不到返回 -1。 */
+    private static int parsePlacedCount(String outcome) {
+        if (outcome == null) {
+            return -1;
+        }
+        int at = outcome.indexOf("放置=");
+        if (at < 0) {
+            return -1;
+        }
+        int start = at + "放置=".length();
+        int end = start;
+        while (end < outcome.length() && Character.isDigit(outcome.charAt(end))) {
+            end++;
+        }
+        if (end == start) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(outcome.substring(start, end));
+        } catch (NumberFormatException ignored) {
+            return -1;
+        }
+    }
+
     /** 结果文本是否算"失败"（第十九轮抽出）：目标层与技能层共用同一套关键词。 */
     private static boolean isFailureText(String text) {
         return text != null && (text.contains("失败") || text.contains("放弃")
@@ -804,13 +1046,185 @@ public final class ProgressionPlanner {
         // 强制砍树。crafting_table 只需木板（无木棍），直接用 wood >= 4 判断不受影响。
         int foodLevel = npc.getFoodData().getFoodLevel();
 
+        // -1) 【fix134】中途撤退：目标层以「中途撤退」收场后把人送回安全点
+        // 休整（与 fix122 入场闸成对的「中途」一面，步 0 之上）。安全点 =
+        // 落脚点锚点优先（小屋/床在那）、无则农场锚点；都没有（无家可回）
+        // 清标记落回常规，不把 NPC 钉在撤退状态里（只堵不疏不许出厂）；
+        // 标记 600 秒未清自动失效兜底。到家判定：水平 ≤16 且 |dy| ≤12
+        // （fix118 高差口径），到达即清标记落回常规链——到家后不设专管区，
+        // 吃饭/睡觉/就近步由常规链与生存层自理。夜里不派长途 travel（夜途
+        // 是 #7/#8/#9 死型，与 fix103/117 同口径）：落回夜链就地过夜，天亮
+        // 标记仍在、自会续派。回程 travel 退避期同样落回常规兜底。
+        if (retreatHomeSince > 0L) {
+            long retreatNow = System.currentTimeMillis();
+            // 【fix140】600 秒自清在夜里顺延：夜长与自清同量级，标记若在
+            // 黎明前自清、步 0 会压线重派 hunt（#25 边角）。夜里不自清——
+            // 到达清标与天亮后的自清照常，标记不会跨过白天赖着不走。
+            if (retreatNow - retreatHomeSince > 600_000L && !isNight()) {
+                retreatHomeSince = 0L;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 中途撤退标记超时清除（600 秒兜底，落回常规）");
+            } else {
+                com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.BaseMemory.Base retreatBase =
+                        com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+                com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.FarmMemory.Farm retreatFarm =
+                        com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+                BlockPos safePoint = retreatBase != null ? retreatBase.anchor()
+                        : (retreatFarm != null ? retreatFarm.anchor() : null);
+                // 【fix154】地下先走回读式回地表腿（surfaceAscendStep）：返回
+                // 技能步=本轮派它；返回 null=已回地表或横移放弃，本轮落入
+                // 下方地表口径分支（到达/黎明释放/回程 travel 同轮生效）。
+                // 旧版在此无条件重派 ascend、零结局消费，死列永不落分支。
+                Step retreatAscendStep = null;
+                if (safePoint != null && underground()) {
+                    retreatAscendStep = surfaceAscendStep("中途撤退：先回地表");
+                }
+                if (safePoint == null) {
+                    retreatHomeSince = 0L;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 中途撤退取消 | 无落脚点/农场锚点（无家可回，落回常规）");
+                } else if (retreatAscendStep != null) {
+                    return retreatAscendStep;
+                } else {
+                    double safeDx = safePoint.getX() + 0.5D - npc.getX();
+                    double safeDz = safePoint.getZ() + 0.5D - npc.getZ();
+                    double safeDist = Math.sqrt(safeDx * safeDx + safeDz * safeDz);
+                    double safeDy = npc.getY() - safePoint.getY();
+                    if (safeDist <= 16.0D && Math.abs(safeDy) <= 12.0D) {
+                        retreatHomeSince = 0L;
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退到达 | 安全点="
+                                + (retreatBase != null ? "落脚点" : "农场")
+                                + " " + safePoint.toShortString()
+                                + " 距离=" + Math.round(safeDist) + "（落回常规链休整）");
+                    } else if (!isNight() && retreatNow >= retreatTravelBackoffUntil
+                            && (npc.getHealth() <= 7.0D || foodLevel <= 3)) {
+                        // 【fix151】黎明 vitals 释放（#28 定谳）：夜里靠保持
+                        // 门活过，天亮步 -1 却以 hp 4.6/food 0 原样续派
+                        // 388 格长途、穿水带被夜余僵尸追死。危线时不带伤
+                        // 启程：清标记落回常规链——步 0 随即就地 hunt 补给
+                        // （白天近棚），连败攒够有 fix117 回农场出口接管。
+                        // 标记已清，本段撤退至多释放一次，不与步 -1 互锯。
+                        retreatHomeSince = 0L;
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 中途撤退黎明释放（fix151） | hp="
+                                + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                                + " foodLevel=" + foodLevel
+                                + " 距安全点=" + Math.round(safeDist)
+                                + "（vitals 危线不带伤启程，清标记落回常规链就地补给）");
+                    } else if (!isNight() && retreatNow >= retreatTravelBackoffUntil) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退回程 | 目标="
+                                + (retreatBase != null ? "落脚点" : "农场")
+                                + " " + safePoint.toShortString()
+                                + " 距离=" + Math.round(safeDist)
+                                + " 高差=" + Math.round(safeDy));
+                        return goal("中途撤退：回安全点", "travel",
+                                params("x", safePoint.getX(), "y", safePoint.getY(),
+                                        "z", safePoint.getZ()));
+                    }
+                }
+            }
+        }
+
+        // -0.5) 【fix136】满包存箱：合成被背包已满锁死（腾格三档腾不出、
+        // 存箱步 6.77 只在锚点 48 格内顺路触发）时专程回落脚点存箱腾格。
+        // 骨架镜像步 -1：标记超时（900 秒）自清、无落脚点锚点清标记落回
+        // 常规（箱子只在落脚点，农场不作存箱目的地）、已进 48 格清标记
+        // 交 6.77 顺路存箱接管、地下先 ascend、夜里不派长途（同 #7/#8/#9
+        // 口径，标记留待天亮）、回程 travel 退避期落回常规不钉人。
+        if (craftFullStoreSince > 0L) {
+            long storeNow = System.currentTimeMillis();
+            if (storeNow - craftFullStoreSince > 900_000L) {
+                craftFullStoreSince = 0L;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 满包存箱标记超时清除（900 秒兜底，落回常规）");
+            } else {
+                com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.BaseMemory.Base storeBase =
+                        com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+                if (storeBase == null) {
+                    craftFullStoreSince = 0L;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 满包存箱取消 | 无落脚点账本（无箱可存，落回常规）");
+                } else {
+                    BlockPos storeAnchor = storeBase.anchor();
+                    double storeDx = storeAnchor.getX() + 0.5D - npc.getX();
+                    double storeDz = storeAnchor.getZ() + 0.5D - npc.getZ();
+                    double storeDist = Math.sqrt(storeDx * storeDx + storeDz * storeDz);
+                    // 【fix154】同型回读式回地表腿（与步 -1 共用状态机）：仅
+                    // 未到 48 格且真地下时预调；返回 null=按地表口径落入下方
+                    // 回程 travel 支。旧版在此同为无条件重派 ascend。
+                    Step storeAscendStep = null;
+                    if (storeDist > 48.0D && underground()) {
+                        storeAscendStep = surfaceAscendStep("满包存箱：先回地表");
+                    }
+                    if (storeDist <= 48.0D) {
+                        craftFullStoreSince = 0L;
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱到达 | 落脚点 "
+                                + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist)
+                                + "（交存箱步 6.77 顺路存箱腾格）");
+                    } else if (storeAscendStep != null) {
+                        return storeAscendStep;
+                    } else if (!isNight() && storeNow >= storeTripBackoffUntil) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱回程 | 落脚点 "
+                                + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist));
+                        return goal("满包存箱：回落脚点", "travel",
+                                params("x", storeAnchor.getX(), "y", storeAnchor.getY(),
+                                        "z", storeAnchor.getZ()));
+                    }
+                }
+            }
+        }
+
+        // -0.25) 【fix146】就地过夜保持门：夜里、地表、且（撤退标记在 ∨ 本夜
+        // 刚建过小屋 ∨ 血/饭危线）时，不许 decide 再落到挖矿/采集等非豁免步
+        // 把人带出小屋——#27 实证小屋建成后 decide 落空、NPC 屋外 idle 被收。
+        // 门内优先回床睡（32 格内）/短途回安全点（≤24 格）/回小屋站位，
+        // 其次就地补建小屋，都不行就原地等待至天亮（返回 null 待命）。
+        // 地下与生存层不受此门影响（豁免面沿 fix121 口径）。
+        overnightHoldEngaged = false;
+        Step overnightHold = overnightHoldGate(foodLevel, cobble);
+        if (overnightHold != null) {
+            return overnightHold;
+        }
+        if (overnightHoldEngaged) {
+            this.stage = "就地过夜保持（fix146）";
+            return null;
+        }
+
+        // 【fix140】撤退休整中步 0 暂缓（#25 定谳）：fix134 A 环以血/饭
+        // 见底中止 hunt 后，步 -1 夜里不派长途、落回常规——旧版步 0 无视
+        // 撤退标记立刻重派同一 hunt（05:22/05:24 两轮，food 3→1→0），
+        // NPC 在猎物枯竭区被耗死。标记生效期间步 0 整体跳过：落后续步
+        // （睡觉/小屋/tend）就地休整，天亮步 -1 自会送回家、到达/自清后
+        // 步 0 恢复。生存层进食/逃跑不受规划层影响，兜底不缺。
+        if (retreatHomeSince <= 0L) {
+            retreatHoldLogged = false;
+            foodHuntHoldLogged = false;
+        } else if (planHas(StagePlan.HUNGER) && foodLevel <= 8 && food == 0
+                && !retreatHoldLogged) {
+            retreatHoldLogged = true;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 饥饿求生暂缓（fix140） | 中途撤退休整中，步 0 不重派 hunt"
+                    + "（落后续步就地休整，天亮/到家后恢复）");
+        }
+
         // 0) 快饿死了：先找吃的，其他都往后排。
-        if (planHas(StagePlan.HUNGER) && foodLevel <= 8 && food == 0) {
+        if (planHas(StagePlan.HUNGER) && foodLevel <= 8 && food == 0
+                && retreatHomeSince <= 0L) {
             // 但在地下打猎是死路（短验实测）：矿道里没有动物，hunt 每次必失败，
             // 却凭"最高优先级"把回地表的 ascend、换几何形状的挖矿步骤全挤掉，
             // NPC 在 Y=55 原地空转到饿死。真人玩家的做法是先回地表再找吃的。
             if (underground()) {
-                return skill("饥饿求生：先回地表", "ascend");
+                // 【fix149】改结局回读制（详见 hungerAscendStep）：崖面高度
+                // 图恒判地下、ascend 恒失败时旧版无条件重派把步 0 钉死。
+                // helper 返回技能步=继续派 ascend；返回 null=已回地表或
+                // 此地两度失败放弃，落回下方分支按地表口径处置。
+                Step hungerAscend = hungerAscendStep();
+                if (hungerAscend != null) {
+                    return hungerAscend;
+                }
             }
             // 【fix117】hunt 连败 ≥3 次的回家出口：本地猎物已被实证打不着、
             // 再原地转圈只是磨血——真玩家会回农场（口粮源头）/落脚点。
@@ -1085,9 +1499,22 @@ public final class ProgressionPlanner {
             // 地下步骤；真饿了照旧先补给——饿死比夜怪更确定。
             // 【fix122】真饿放行加 hp 下限：血已到惜命线（≤7）时同禁——
             // #13 即 food=4、hp 1.7 夜猎开打、一击致死；先过夜、天亮再补。
-            if (isNight() && (npc.getFoodData().getFoodLevel() > 6
-                    || npc.getHealth() <= 7.0D)) {
-                LOG.info("[AIV][PLAN] " + npc.npcName() + " 口粮 hunt 夜里跳过（夜晚总闸） | foodLevel="
+            // 【fix143】去掉真饿例外：例外与 fix121 目标层豁免（只认阶段名
+            // 「饥饿求生」）口径不一致——本步 hunt 被派单层放行、被目标层
+            // 0.5 秒入夜中止、规划层无记账，整夜热循环（farm110 实证 311
+            // 次连派、NPC 在东猎场 food=0 被僵尸收掉=#26）；且例外前提已
+            // 被 #12/#13/#25/#26 证伪。夜里一律跳过、落后续步熬到天亮；
+            // 撤退休整中（步 -1 标记在）不分昼夜同样跳过（与 fix140 同
+            // 理，防退避窗里抢派）。
+            if (retreatHomeSince > 0L) {
+                if (!foodHuntHoldLogged) {
+                    foodHuntHoldLogged = true;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 随身口粮 hunt 暂缓（fix143） | 中途撤退休整中"
+                            + "（落后续步，天亮/到家后恢复）");
+                }
+            } else if (isNight()) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 口粮 hunt 夜里跳过（夜晚总闸，fix143 起无真饿例外） | foodLevel="
                         + npc.getFoodData().getFoodLevel()
                         + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth()));
             } else {
@@ -1448,6 +1875,16 @@ public final class ProgressionPlanner {
             if (!tierOk) {
                 continue;
             }
+            // 【fix139】回访补派单夜闸：全 decide 里唯一漏挂 !isNight 的地表步。
+            // 夜里派出一律被 fix121 目标层 0.4 秒入夜收工、规划层无记账抑制，
+            // 同条目 ~2Hz 热循环整夜（farm105 revisit 被中止约 910 次、farm107
+            // 开机夜里 2 分钟约 163 次）；睡觉 5.55 限落脚点 48 格顺路、夜间小屋
+            // 5.6 有材料/退避门，远地夜里两步都够不着时本步就是整夜唯一出口。
+            // 口径与 fix121 对齐：只拦地表夜派，地下回访夜里照常（夜昼与洞里
+            // 无关）。拦下不钉死：落回后续步与夜链（睡觉/小屋/常规 decide）。
+            if (isNight() && !underground()) {
+                continue;
+            }
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 回访记账矿 | " + oreEntry.block()
                     + " @ " + oreEntry.x() + "," + oreEntry.y() + "," + oreEntry.z()
                     + " needTier=" + oreEntry.needTier());
@@ -1630,7 +2067,11 @@ public final class ProgressionPlanner {
             return goal("积攒铁锭", "dig", params("resource", "iron", "count", 4));
         }
         // usableIronPickaxes / ironPickDurability 已在前面算过了，直接复用。
-        if (planHas(StagePlan.DIAMOND) && diamonds < 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
+        // 【fix145】钻镐存量判定改 hasUsable：旧 hasAny 把只剩 1 点耐久、身体层
+        // 明约不用的废镐算作「有镐」，挖钻分支与下方制作步双双永不触发，
+        // PORTAL_PREP「无钻镐交规划层补钻镐」正好交回死步成闭环（farm111
+        // 钻镐 1/1561 盘面实证）。与铁镐步（1677）的 hasUsable 口径对齐。
+        if (planHas(StagePlan.DIAMOND) && diamonds < 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe")) {
             // 【第十七轮】钻石阶段内的保镐：下钻石层前和每轮重下挖钻目标前都复核——
             // 没有铁镐以上、或铁镐总耐久不足 60（挖一簇矿+容错都不够）时，先原地补镐
             // 再下，别再出现长跑#6d 那种"矿在眼前（58,-50,23）、手里只剩石镐、
@@ -1665,13 +2106,13 @@ public final class ProgressionPlanner {
                     + " stonePickaxes=" + stonePickaxes);
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
-        if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasAny("diamond_pickaxe", "netherite_pickaxe")) {
+        if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe")) {
             if (!stickMaterial) {
                 return gatherLogs("钻石镐缺木棍");
             }
             return goal("制作钻石镐", "craft", params("item", "diamond_pickaxe", "count", 1));
         }
-        if (planHas(StagePlan.DIAMOND_SWORD) && diamonds >= 2 && !hasAny("diamond_sword", "netherite_sword")) {
+        if (planHas(StagePlan.DIAMOND_SWORD) && diamonds >= 2 && !hasUsable("diamond_sword", "netherite_sword")) {
             if (!stickMaterial) {
                 return gatherLogs("钻石剑缺木棍");
             }
@@ -1975,31 +2416,396 @@ public final class ProgressionPlanner {
     }
 
     /**
+     * 【fix146】就地过夜保持门（decide 步 -0.25）：夜里地表处于「回不了家、
+     * 只能就地过夜」的状态（撤退标记在/本夜刚建过小屋/血饭危线）时，把人
+     * 留在安全处熬到天亮，而不是让 decide 落到挖矿、采集等步把人带出小屋
+     * （#27 死因）。返回非 null 表示本轮就派这一步（回床睡/短途回安全点/
+     * 回小屋/补建小屋）；返回 null 且 {@link #overnightHoldEngaged} 为真表示
+     * 原地等待（decide 待命）；返回 null 且未置位表示保持门不适用、decide
+     * 照常往下走。地下不进门（夜里地下作业与昼夜无关，fix121 同口径）；
+     * 生存层（逃跑/自卫/进食）在规划层之外，不受此门影响。
+     */
+    private Step overnightHoldGate(int foodLevel, int cobble) {
+        long today = currentDayIndex();
+        if (!isNight()) {
+            if (overnightHoldActiveNight >= 0L) {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 就地过夜保持解除（fix146） | 天亮，落回常规链");
+                overnightHoldActiveNight = -1L;
+            }
+            return null;
+        }
+        boolean retreatTrigger = retreatHomeSince > 0L;
+        boolean shelterTrigger = shelterHoldNight == today && shelterHoldPos != null;
+        boolean vitalsTrigger = npc.getHealth() <= 7.0D || foodLevel <= 3;
+        if (!retreatTrigger && !shelterTrigger && !vitalsTrigger) {
+            return null;
+        }
+        // 【fix146c】近棚口径：小屋常建在洼地里，该列高度图顶面比站位高 >3 格
+        // 时 underground() 误判「地下」、本门被豁免口径整夜绕过（farm115 实证：
+        // 回小屋 travel 落进洼地小屋后 decide 转手派了夜间挖铁）。shelterTrigger
+        // 成立且人就在小屋站位 4 格内时，「人在棚边」比高度图更接近事实，
+        // 视同地表进门；真矿洞与小屋站位的距离天然隔开，不误伤地下作业豁免。
+        if (underground()) {
+            boolean atShelter = false;
+            if (shelterTrigger) {
+                double holdDx = shelterHoldPos.getX() + 0.5D - npc.getX();
+                double holdDz = shelterHoldPos.getZ() + 0.5D - npc.getZ();
+                atShelter = holdDx * holdDx + holdDz * holdDz <= 16.0D
+                        && Math.abs(npc.getY() - shelterHoldPos.getY()) <= 4.0D;
+            }
+            if (!atShelter) {
+                return null;
+            }
+        }
+        overnightHoldEngaged = true;
+        overnightHoldActiveNight = today;
+        if (overnightHoldLoggedNight != today) {
+            overnightHoldLoggedNight = today;
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 就地过夜保持（fix146） | 触发="
+                    + (retreatTrigger ? "撤退休整 " : "") + (shelterTrigger ? "本夜已建小屋 " : "")
+                    + (vitalsTrigger ? "血/饭危线" : "")
+                    + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                    + " foodLevel=" + foodLevel
+                    + " pos=" + npc.blockPosition().toShortString()
+                    + "（夜里地表不派新活，进/守小屋或原地等待至天亮）");
+        }
+        // a) 床在 32 格内且血量过线：复用 5.55 回床睡觉（同口径）。
+        if (planHas(StagePlan.BASE) && npc.getHealth() > 7.0D) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base holdBase =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (holdBase != null && holdBase.bedPos() != null
+                    && npc.blockPosition().distSqr(holdBase.bedPos()) <= 32.0D * 32.0D) {
+                return goal("回床睡觉", "sleep", params());
+            }
+        }
+        // b) 撤退态且安全点在短途内（≤24 格）：复用步 -1 同款回程 travel
+        // （fix121 短途豁免口径；长途夜行仍禁，留待天亮由步 -1 续派）。
+        if (retreatTrigger) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base holdRetreatBase =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.FarmMemory.Farm holdRetreatFarm =
+                    com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+            BlockPos safePoint = holdRetreatBase != null ? holdRetreatBase.anchor()
+                    : (holdRetreatFarm != null ? holdRetreatFarm.anchor() : null);
+            if (safePoint != null) {
+                double safeDx = safePoint.getX() + 0.5D - npc.getX();
+                double safeDz = safePoint.getZ() + 0.5D - npc.getZ();
+                double safeDist = Math.sqrt(safeDx * safeDx + safeDz * safeDz);
+                if (safeDist <= 24.0D) {
+                    return goal("中途撤退：回安全点", "travel",
+                            params("x", safePoint.getX(), "y", safePoint.getY(),
+                                    "z", safePoint.getZ()));
+                }
+            }
+        }
+        // c) 本夜小屋已建、人却在屋外近处（被生存层赶出/ascend 带偏）：回小屋站位。
+        // 【fix146b】当夜只派一次：travel 到达容差（约 2.5 格）大于本支的
+        // 「未到」门槛（2 格），错位带内会 1 Hz 连派（farm113 首夜实证）；
+        // 派过一次后认 travel 的到达口径、当夜落回原地等待。
+        if (shelterTrigger && shelterReturnNight != today) {
+            double shelterDx = shelterHoldPos.getX() + 0.5D - npc.getX();
+            double shelterDz = shelterHoldPos.getZ() + 0.5D - npc.getZ();
+            double shelterDist = Math.sqrt(shelterDx * shelterDx + shelterDz * shelterDz);
+            if (shelterDist > 2.0D && shelterDist <= 16.0D) {
+                shelterReturnNight = today;
+                return goal("就地过夜：回小屋", "travel",
+                        params("x", shelterHoldPos.getX(), "y", shelterHoldPos.getY(),
+                                "z", shelterHoldPos.getZ()));
+            }
+        }
+        // d) 还没有遮蔽且材料够：就地补建小屋（5.6 同口径，仅触发态提前）。
+        if (!underRoof() && planHas(StagePlan.SHELTER) && cobble >= 25
+                && !shelterCoolingDown()) {
+            return goal("夜间小屋", "build", params("structure", "shelter"));
+        }
+        // e) 原地等待至天亮（decide 返回 null 待命，生存层照常护身）。
+        return null;
+    }
+
+    /**
+     * 【fix154】步 -1/-0.5 共用的回地表腿状态机：需要继续派技能时返回该步；
+     * ascend 已回读回到地表、或横移两轮仍脱不出时返回 null，示意调用方本轮
+     * 按地表口径处置（到达/黎明释放/回程 travel——travel 自带竖向处理与
+     * 退避兜底，不是死锁）。旧版两步都是无条件重派 ascend、零结局消费：
+     * ascend 在死列恒以「连续 6 级上不去」收场（其走位是邻列 +1 格台阶、
+     * 四方向走位全灭时无解），步 -1 永远落不到地表分支，标记自清后步 0
+     * 接手、hunt 被 A 环中止又生新标记，组合绕同一堵墙（farm122
+     * (354,24,-121) 同点 30 秒一轮、步数恒 0 实证）。玩家做法是横着挖
+     * 几格换一列再爬：ascend 同点（锚点水平 <4 格）连败 ≥3 → strip 同层
+     * 掘进换列（explore/goto 纯走位不挖、地下口袋已被实证五向全灭，
+     * 不可用），回 ascend 腿在新列重新计数。
+     */
+    private Step surfaceAscendStep(String stage) {
+        BlockPos me = npc.blockPosition();
+        // 换地形自动清账：离锚点 ≥16 格视为新地形，连败/横移轮次作废。
+        if (surfAscendAnchorPos != null) {
+            long adx = me.getX() - surfAscendAnchorPos.getX();
+            long adz = me.getZ() - surfAscendAnchorPos.getZ();
+            if (adx * adx + adz * adz >= 256L) {
+                surfAscendAnchorPos = null;
+                surfAscendFailStreak = 0;
+                surfLateralRounds = 0;
+                surfAscendPhase = 0;
+                surfAscendIssued = false;
+                surfStripIssued = false;
+            }
+        }
+        if (surfAscendPhase == 1) {
+            return surfaceLateralStep(stage, me);
+        }
+        if (!surfAscendIssued) {
+            surfAscendIssued = true;
+            surfAscendSeq = skills.outcomeSeq();
+            if (surfAscendAnchorPos == null) {
+                surfAscendAnchorPos = me;
+            }
+            return skill(stage, "ascend");
+        }
+        if (skills.outcomeSeq() == surfAscendSeq) {
+            // 结局还没回来（技能在跑/刚被打断）：继续派 ascend 等回读。
+            return skill(stage, "ascend");
+        }
+        String outcome = skills.lastOutcome();
+        surfAscendSeq = skills.outcomeSeq();
+        if (outcome != null && outcome.startsWith("ascend 已回到地表")) {
+            surfAscendIssued = false;
+            surfAscendFailStreak = 0;
+            surfAscendAnchorPos = null;
+            surfLateralRounds = 0;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 回地表 ascend 结局回读（fix154） | outcome=" + outcome
+                    + "（已回地表，落回地表口径处置）");
+            return null;
+        }
+        if (outcome != null && outcome.startsWith("ascend ")) {
+            if (surfAscendAnchorPos == null) {
+                surfAscendAnchorPos = me;
+            }
+            long adx = me.getX() - surfAscendAnchorPos.getX();
+            long adz = me.getZ() - surfAscendAnchorPos.getZ();
+            if (adx * adx + adz * adz >= 16L) {
+                // 已挪开 ≥4 格：算换了列，锚点跟随、连败重新计数。
+                surfAscendAnchorPos = me;
+                surfAscendFailStreak = 0;
+            }
+            surfAscendFailStreak++;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 回地表 ascend 结局回读（fix154） | outcome=" + outcome
+                    + " 同点连败=" + surfAscendFailStreak
+                    + " 位置=" + me.toShortString());
+            if (surfAscendFailStreak >= 3) {
+                if (surfLateralRounds >= 2) {
+                    // 横移两轮仍上不去：放弃本腿，落调用方地表口径兜底。
+                    surfAscendIssued = false;
+                    surfAscendFailStreak = 0;
+                    surfLateralRounds = 0;
+                    surfAscendAnchorPos = null;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 回地表横移两轮仍未脱困，放弃回地表腿（fix154） | pos="
+                            + me.toShortString()
+                            + "（落回地表口径：回程 travel/退避/常规链兜底）");
+                    return null;
+                }
+                surfLateralRounds++;
+                surfAscendPhase = 1;
+                surfStripIssued = false;
+                return surfaceLateralStep(stage, me);
+            }
+            // 未满三度：刷新基线、立刻再派一轮 ascend。
+            surfAscendIssued = true;
+            surfAscendSeq = skills.outcomeSeq();
+            return skill(stage, "ascend");
+        }
+        // 非 ascend 结局（别的技能插队收场）：只更新基线，继续派 ascend。
+        return skill(stage, "ascend");
+    }
+
+    /** 【fix154】横移腿：strip 同层掘进约 8 格换列；strip 结局回读后回 ascend 腿。 */
+    private Step surfaceLateralStep(String stage, BlockPos me) {
+        Step lateral = new Step(stage + "：横移换列", Kind.SKILL,
+                new Intent("", "strip", params("block", "iron_ore", "length", 8)));
+        if (!surfStripIssued) {
+            surfStripIssued = true;
+            surfStripSeq = skills.outcomeSeq();
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " ascend 同点连败，横移换列（fix154） | 横移轮次=" + surfLateralRounds
+                    + " 位置=" + me.toShortString()
+                    + "（strip 同层掘进 8 格换列后回 ascend 腿）");
+            return lateral;
+        }
+        if (skills.outcomeSeq() == surfStripSeq) {
+            // strip 还没收场：继续派横移步等回读。
+            return lateral;
+        }
+        String stripOutcome = skills.lastOutcome();
+        surfStripSeq = skills.outcomeSeq();
+        if (stripOutcome != null && stripOutcome.startsWith("strip ")) {
+            // 横移收场（成败不论）：锚点跟到新列、连败清零，回 ascend 腿。
+            surfStripIssued = false;
+            surfAscendPhase = 0;
+            surfAscendAnchorPos = me;
+            surfAscendFailStreak = 0;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 横移收场（fix154） | outcome=" + stripOutcome
+                    + " 新列=" + me.toShortString() + "（回 ascend 腿重新计数）");
+            surfAscendIssued = true;
+            surfAscendSeq = skills.outcomeSeq();
+            return skill(stage, "ascend");
+        }
+        // 非 strip 结局（别的技能插队）：基线已更新，继续等横移收场。
+        return lateral;
+    }
+
+    /**
+     * 【fix149】步 0 饥饿 ascend 的结局回读状态机（范式照 fix147 的
+     * relocationStep）：需要继续派 ascend 时返回该技能步；ascend 刚回读
+     * 成功、或此地已两度失败放弃时返回 null，示意步 0 落回下方分支按
+     * 地表口径处置（fix117 回家出口/hunt/合成支）。旧版步 0 只认
+     * underground() 高度图口径无条件重派：崖面列高度图在崖顶、人在坡面
+     * 恒判地下，ascend 每约 35 秒以「四周悬空且没有垫脚方块」失败也无人
+     * 消费，hunt 永不派单、fix117 出口永不开启（farm114 同点 28 次实证）。
+     */
+    private Step hungerAscendStep() {
+        // 放弃点失效：人已挪开 ≥16 格，换了地方值得再试 ascend。
+        if (hungerAscendGiveUpPos != null) {
+            net.minecraft.core.BlockPos me = npc.blockPosition();
+            long gdx = me.getX() - hungerAscendGiveUpPos.getX();
+            long gdz = me.getZ() - hungerAscendGiveUpPos.getZ();
+            if (gdx * gdx + gdz * gdz >= 256L) {
+                hungerAscendGiveUpPos = null;
+                hungerAscendFailStreak = 0;
+                hungerAscendIssued = false;
+            }
+        }
+        if (hungerAscendGiveUpPos != null) {
+            return null;
+        }
+        if (!hungerAscendIssued) {
+            hungerAscendIssued = true;
+            hungerAscendSeq = skills.outcomeSeq();
+            return skill("饥饿求生：先回地表", "ascend");
+        }
+        if (skills.outcomeSeq() == hungerAscendSeq) {
+            // 结局还没回来（技能在跑/刚被打断）：继续派 ascend 等回读。
+            return skill("饥饿求生：先回地表", "ascend");
+        }
+        String ascendOutcome = skills.lastOutcome();
+        hungerAscendSeq = skills.outcomeSeq();
+        if (ascendOutcome != null && ascendOutcome.startsWith("ascend 已回到地表")) {
+            hungerAscendIssued = false;
+            hungerAscendFailStreak = 0;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 饥饿 ascend 结局回读（fix149） | outcome=" + ascendOutcome
+                    + "（已回地表，落回地表口径处置）");
+            return null;
+        }
+        if (ascendOutcome != null && ascendOutcome.startsWith("ascend ")) {
+            hungerAscendFailStreak++;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 饥饿 ascend 结局回读（fix149） | outcome=" + ascendOutcome
+                    + " 连败=" + hungerAscendFailStreak
+                    + " 位置=" + npc.blockPosition().toShortString());
+            if (hungerAscendFailStreak >= 2) {
+                hungerAscendIssued = false;
+                hungerAscendGiveUpPos = npc.blockPosition();
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 饥饿 ascend 两度失败，此地放弃回地表（fix149） | pos="
+                        + hungerAscendGiveUpPos.toShortString()
+                        + "（落回 hunt/回程出口按地表处置，位移≥16 格后重试）");
+                return null;
+            }
+            // 未满两度：刷新基线、立刻再派一轮 ascend。
+            hungerAscendIssued = true;
+            hungerAscendSeq = skills.outcomeSeq();
+            return skill("饥饿求生：先回地表", "ascend");
+        }
+        // 非 ascend 结局（别的技能插队收场）：只更新基线，继续派 ascend。
+        return skill("饥饿求生：先回地表", "ascend");
+    }
+
+    /**
      * 挖矿连败换区的一步（第三轮修复 C）：同一资源连弃 2 次后，
-     * 下一次挖矿目标先被换成换区步骤——地下先挖阶梯回地表，再远距离移动，
+     * 下一次挖矿目标先被换成换区步骤——先挖阶梯回地表，再远距离移动，
      * 换一片地形重新下矿。全程只用正常移动/挖阶梯技能，禁止任何传送。
+     *
+     * <p>【fix147】状态机改结局回读制：旧版在派单同一次调用里就把 phase
+     * 预进（0→1→2），且 underground() 的高度图口径在浅水口袋（顶面与脚差
+     * &lt;3）会误判「不在地下」永不派 ascend——farm112 实证同点 explore
+     * 0.5 秒五向全灭 11+ 次、失败后仍打「换区完成」原地重挖。改：phase 0
+     * 无条件先派 ascend，结局序号变化后回读技能结局、只有「ascend 已回到
+     * 地表」才进 phase 1；phase 1 派 explore 后不预进，完成判定在 tick 的
+     * 结局记账段按水平位移 ≥24 格验收（见彼处），这里只负责派单。
      *
      * @return 本步要执行的换区步骤；换区已走完时返回 null，表示放行原来的挖矿目标
      */
     private Step relocationStep() {
         if (relocationPhase == 0) {
-            relocationPhase = 1;
-            if (underground()) {
+            if (relocationAscendIssued) {
+                if (skills.outcomeSeq() == relocationAscendSeq) {
+                    // 结局还没回来（技能刚被打断/未收场）：继续派 ascend 等回读，
+                    // 不许凭高度图猜「已经在地表」直接 explore。
+                    return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
+                }
+                // 结局已回：回读原文，只有真回到地表才放行 explore。
+                String ascendOutcome = skills.lastOutcome();
+                relocationAscendSeq = skills.outcomeSeq();
+                if (ascendOutcome != null && ascendOutcome.startsWith("ascend 已回到地表")) {
+                    relocationPhase = 1;
+                    relocationAscendIssued = false;
+                    // 【fix150】记换区原点：后续 explore/travel 位移验收统一按此算。
+                    if (relocationOriginPos == null) {
+                        relocationOriginPos = npc.blockPosition();
+                    }
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 换区 ascend 结局回读（fix147） | outcome=" + ascendOutcome
+                            + " 位置=" + npc.blockPosition().toShortString()
+                            + "（已回地表，进 explore 腿）");
+                } else {
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 换区 ascend 结局回读（fix147） | outcome=" + ascendOutcome
+                            + " 位置=" + npc.blockPosition().toShortString()
+                            + "（未回地表，继续 ascend，不派 explore）");
+                    return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
+                }
+            } else {
+                relocationAscendIssued = true;
+                relocationAscendSeq = skills.outcomeSeq();
                 return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
             }
         }
         if (relocationPhase == 1) {
-            relocationPhase = 2;
+            // 【fix150】explore 无位移连败 ≥3：崖面地形 goto 探路结构性全灭
+            // （farm117 同点 15+ 次 0.5 秒失败实证），改走 travel 分段寻路
+            // 换位——目标=当前位置 + 48 格、按连败数轮换 8 方位，Y 传当前值
+            // 走 travel 既有解析（fix114/fix138）。travel 结局由记账段验收。
+            if (relocationExploreFailStreak >= 3) {
+                int[][] relocDirs = {{48, 0}, {48, 48}, {0, 48}, {-48, 48},
+                        {-48, 0}, {-48, -48}, {0, -48}, {48, -48}};
+                int[] relocDir = relocDirs[relocationExploreFailStreak % relocDirs.length];
+                BlockPos relocMe = npc.blockPosition();
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 换区改走 travel 换位（fix150） | 无位移连败=" + relocationExploreFailStreak
+                        + " 目标偏移=" + relocDir[0] + "," + relocDir[1]);
+                return goal("挖矿连败换区：travel 换位", "travel",
+                        params("x", relocMe.getX() + relocDir[0], "y", relocMe.getY(),
+                                "z", relocMe.getZ() + relocDir[1]));
+            }
+            if (relocationExploreStartPos == null) {
+                relocationExploreStartPos = npc.blockPosition();
+            }
             // explore 的距离是"至少走出这么远再停"，48 格足以离开原来那片贫矿洞。
+            // 派单不预进：完成与否由结局记账段按位移验收，未达标保持换区态重试。
             return goal("挖矿连败换区：远距离移动", "explore", params("distance", 48));
         }
-        relocationActive = false;
+        // phase 异常值兜底：回到回地表腿重走，不许直接放行挖矿（只堵不疏不许出厂）。
         relocationPhase = 0;
-        digAbandonStreak = 0;
-        LOG.info("[AIV][PLAN] " + npc.npcName() + " 换区完成，重新尝试挖矿 | resource="
-                + relocationResource + " 位置=" + npc.blockPosition().toShortString());
-        relocationResource = "";
-        return null;
+        relocationAscendIssued = false;
+        relocationAscendSeq = skills.outcomeSeq();
+        return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
     }
 
     /**
@@ -2211,6 +3017,18 @@ public final class ProgressionPlanner {
      */
     private static final int COUNT_SLOTS = 41;
 
+    /** 【fix136】主背包（0-35）空槽数：满包死锁置标的「包真满」判定口径，
+     * 与 GoalExecutor.countEmptyMainSlots 同义（只数主背包，不含装备/副手）。 */
+    private int countEmptyMainSlots() {
+        int empty = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            if (npc.getInventory().getItem(slot).isEmpty()) {
+                empty++;
+            }
+        }
+        return empty;
+    }
+
     private int countItem(String path) {
         int total = 0;
         for (int slot = 0; slot < COUNT_SLOTS; slot++) {
@@ -2388,12 +3206,13 @@ public final class ProgressionPlanner {
         // 暂缓补猎、放行下潜——地下不分昼夜，储备 13 够用，饥饿升井链是硬兜底；
         // 真饿（foodLevel≤6）夜里照旧先猎，不拿命赌。
         // 【fix122】真饿放行同加 hp 下限（惜命线 ≤7 同禁，与步 0/6.6 同口径）。
-        if (isNight() && (npc.getFoodData().getFoodLevel() > 6
-                || npc.getHealth() <= 7.0D)) {
+        // 【fix143】与步 6.6 同步去掉真饿例外（理由见彼处：与 fix121 豁免
+        // 口径不一致会整夜热循环，#26 实证）；撤退休整中同样暂缓。
+        if (isNight() || retreatHomeSince > 0L) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 下矿口粮门夜间暂缓 | foodNutrition=" + value
                     + " foodLevel=" + npc.getFoodData().getFoodLevel()
                     + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
-                    + "（夜里无猎物或低血保命，天亮再补）");
+                    + "（fix143：夜里无真饿例外/撤退休整中，天亮或到家后再补）");
             return null;
         }
         if (underground()) {

@@ -1355,6 +1355,10 @@ public final class SkillRunner {
         tasks.add(Bukkit.getScheduler().runTaskTimer(plugin, new Runnable() {
             private int noPathRounds;
             private int lastLogTick;
+            // 【fix138】中间点解析缓存：原始中间点格位移 <4 格时复用上次解析，
+            // 防原地失败时每 0.5 秒重跑 resolveTravelGoal 的深扫（260 格）+刷日志。
+            private BlockPos chunkCell;
+            private BlockPos chunkGoal;
 
             @Override
             public void run() {
@@ -1382,9 +1386,32 @@ public final class SkillRunner {
                     return;
                 }
                 BlockPos goal = pathGoal;
+                // 【fix138】长途分段寻路：水平 >24 格时本轮只搜朝终点方向 24 格的
+                // 中间点。旧版每次重算都直搜最终目标——贵地形（树冠/洞穴碰撞查询
+                // 约 700µs/节点）100ms 预算只够约 140–700 节点，65–600 格全程 A*
+                // 恒超时/开放集耗尽，travelStepToward 兜底 12 轮判败后上层同点
+                // 重派、无限空转（farm106 回程补给 7 分钟 62 次同型收尾，fix103/
+                // fix136 到达环与 PORTAL_PREP 回锚点全堵于此）。玩家走长途也是
+                // 朝大方向走一段看一段。中间点 Y 走既有 resolveTravelGoal 口径；
+                // 到达/竖直对齐判定仍按真实终点，本段只喂寻路。预算不放宽
+                // （主线程冻服红线）。
+                double horizontal = Math.sqrt(dx * dx + dz * dz);
+                if (horizontal > 24.0D) {
+                    double scale = 24.0D / horizontal;
+                    int wx = (int) Math.floor(npc.getX() + dx * scale);
+                    int wz = (int) Math.floor(npc.getZ() + dz * scale);
+                    BlockPos cell = new BlockPos(wx, (int) Math.floor(targetY), wz);
+                    if (chunkCell == null
+                            || Math.max(Math.abs(cell.getX() - chunkCell.getX()),
+                                    Math.abs(cell.getZ() - chunkCell.getZ())) >= 4) {
+                        chunkCell = cell;
+                        chunkGoal = resolveTravelGoal(cell);
+                    }
+                    goal = chunkGoal;
+                }
                 PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(),
                         goal, 24000, !npc.wearingLeatherBoots());
-                if (result.found()) {
+                if (result.found() && result.path().size() >= 2) {
                     noPathRounds = 0;
                     npc.followPath(result.path(), true, null, null);
                     if (npc.level().getServer().getTickCount() - lastLogTick > 200) {
