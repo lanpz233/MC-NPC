@@ -213,6 +213,8 @@ public final class ProgressionPlanner {
      * 猎物回来达标即清零。40 这个向导值本身一字不改。 */
     private int reserveFailStreak;
     private long reserveBackoffUntil;
+    /** 【fix160】13.1 让位专行节流时刻：让位生效且甲有缺件时最多 60 秒一行。 */
+    private long portalYieldLogAt;
     /** 【fix103】专程回程补给专属连败与退避 + 在途标记：与 fix98 同款自己
      * 记账（travel 单趟以分钟计，退避 120 秒×连败、上限 600 秒）；在途标记
      * 只为到达专行日志（回到目标 48 格内打一行、清标记）。 */
@@ -558,6 +560,21 @@ public final class ProgressionPlanner {
                         shelterHoldPos = npc.blockPosition();
                         LOG.info("[AIV][PLAN] " + npc.npcName() + " 本夜小屋建成记账（fix146） | 放置="
                                 + placed + " 位置=" + shelterHoldPos.toShortString());
+                    }
+                }
+            } else if ("建造传送门".equals(lastStage) || "进入下界传送门".equals(lastStage)) {
+                // 【fix160】门建成/已进门落盘：步 13.1 让位恢复的事实来源
+                // （PortalMemory 账本，跨重启不丢；坐标取实测门位、缺则站位）。
+                if (!goalFailed) {
+                    com.example.aivillager.goals.PortalMemory.bindWorld(npc.level());
+                    if (!com.example.aivillager.goals.PortalMemory.isBuilt(npc.npcName())) {
+                        BlockPos portalPos = goals.nearbyPortal();
+                        BlockPos recordPos = portalPos != null ? portalPos : npc.blockPosition();
+                        com.example.aivillager.goals.PortalMemory.markBuilt(npc.npcName(), recordPos);
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 传送门建成落账（fix160） | 阶段=" + lastStage
+                                + " 门位=" + recordPos.toShortString()
+                                + "（步 13.1 钻石甲维护恢复原判定）");
                     }
                 }
             } else if ("回箱存物".equals(lastStage)) {
@@ -947,6 +964,38 @@ public final class ProgressionPlanner {
             total += countItem(material);
         }
         return total;
+    }
+
+    /** 【fix160】门已建成的事实判定：PortalMemory 账本有记录，或当下身边
+     * 实测到亮着的门（账本丢失/旧存档已有门时自愈落账）。 */
+    private boolean portalBuiltKnown() {
+        com.example.aivillager.goals.PortalMemory.bindWorld(npc.level());
+        if (com.example.aivillager.goals.PortalMemory.isBuilt(npc.npcName())) {
+            return true;
+        }
+        BlockPos near = goals.nearbyPortal();
+        if (near != null) {
+            com.example.aivillager.goals.PortalMemory.markBuilt(npc.npcName(), near);
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 传送门建成自愈落账（fix160） | 门位=" + near.toShortString());
+            return true;
+        }
+        return false;
+    }
+
+    /** 【fix160】13.1 让位是否生效（Fong 拍板「先建门」）：计划含
+     * PORTAL_PREP ∧ 末影之眼为 0 ∧ 门未建成，三者同时成立才让位；
+     * 任一不成立（门已建成/已下过界/计划不含建门）即恢复 13.1 原判定。 */
+    private boolean portalYieldActive(int eyes) {
+        return planHas(StagePlan.PORTAL_PREP) && eyes == 0 && !portalBuiltKnown();
+    }
+
+    /** 【fix160】钻石甲是否有缺件（让位专行只在真有活可干时打）。 */
+    private boolean diamondArmorMissing() {
+        return !hasAny("diamond_helmet", "netherite_helmet")
+                || !hasAny("diamond_chestplate", "netherite_chestplate")
+                || !hasAny("diamond_leggings", "netherite_leggings")
+                || !hasAny("diamond_boots", "netherite_boots");
     }
 
     /** 当前 day 索引（dayTime/24000）：跨夜判定口径，fix146 保持记账用。 */
@@ -2217,7 +2266,22 @@ public final class ProgressionPlanner {
         // 穿戴不用管：生存层的 AutoArmor 会把做好的甲自动穿上；hasAny 已含装备槽，
         // 穿在身上的那件算"有"，不会重复合成。护甲配方不需要木棍，不查 stickMaterial。
         // dig 的 count 是"这一趟新挖多少"，所以每件只挖还差的差额，别多挖浪费时间。
-        if (planHas(StagePlan.DIAMOND_ARMOR) && hasAny("diamond_pickaxe", "netherite_pickaxe")) {
+        // 【fix160·Fong 2026-10-31 06:46 拍板「先建门」】PORTAL 未建成前
+        // 本步整步让位：穿现有铁套+钻镐先行 13.5 建门链，钻甲补齐挪到建门
+        // 之后。让位/恢复条件见 portalYieldActive/portalBuiltKnown；让位
+        // 生效且甲确有缺件时打 60 秒节流专行，decide 自然落到步 13/13.3/13.5。
+        boolean diaArmorReady = planHas(StagePlan.DIAMOND_ARMOR)
+                && hasAny("diamond_pickaxe", "netherite_pickaxe");
+        boolean portalYield = diaArmorReady && portalYieldActive(eyes);
+        if (portalYield && diamondArmorMissing()) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - portalYieldLogAt >= 60_000L) {
+                portalYieldLogAt = nowMs;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 钻石甲维护让位（fix160） | PORTAL 未建成，先建门（Fong 拍板），铁套+钻镐先行");
+            }
+        }
+        if (diaArmorReady && !portalYield) {
             String[][] diaArmor = {
                     {"diamond_helmet", "netherite_helmet", "制作钻石头盔"},
                     {"diamond_chestplate", "netherite_chestplate", "制作钻石胸甲"},
