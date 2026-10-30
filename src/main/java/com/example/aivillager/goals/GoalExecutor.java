@@ -796,6 +796,23 @@ public final class GoalExecutor {
                     + " target=" + chaseTarget + " 已追 " + chasedSec + " 秒");
             return;
         }
+        // 【fix162】到达抢先判定（仅 travel）：tickTravel 的到达判定只在
+        // 技能 idle 时才跑，fix107 死线却挂在忙位早退之前——farm127 实证：
+        // 人已落在终点到达包络内（水平 2 格/高差 3~4），descend 在洼地唇口
+        // 悬挂复位长占忙位，tickTravel 永远跑不到，死线 300 秒抢先收场、
+        // 记一笔冤枉失败。忙位之前先按 tickTravel 同一口径问一句：已在
+        // 包络内就停技能按到达收场；死线只管真到不了的僵局。revisit 的
+        // 完成口径是挖到矿而非位置到达，不在此列。
+        if ("travel".equals(type)) {
+            double arriveDx = travelX - npc.getX();
+            double arriveDz = travelZ - npc.getZ();
+            if (arriveDx * arriveDx + arriveDz * arriveDz <= 16.0D
+                    && Math.abs(travelY - npc.getY()) <= 3.0D) {
+                skills.stop();
+                finish("到达目的地");
+                return;
+            }
+        }
         // 【fix107】竖向对齐死线（travel/revisit）：水平已到位、高差悬殊时
         // descend/ascend 若在边缘悬挂等状态里空转，技能会长占忙位、目标层
         // 只能干等 LONG 看门狗 480 秒位置处决（farm67 实证）。与 fix106
