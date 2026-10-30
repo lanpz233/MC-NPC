@@ -1375,8 +1375,12 @@ public final class SkillRunner {
                 // 竖向交给目标层调用 descend/ascend。不在这里收手的话会一直挖到超时。
                 double dx = targetX - npc.getX();
                 double dz = targetZ - npc.getZ();
-                if (dx * dx + dz * dz <= tolerance * tolerance
-                        && Math.abs(targetY - npc.getY()) > 2.5D) {
+                // 【fix156】宽带早退：水平 ≤8 格 ∧ 高差 ≥6 时同样交目标层竖直
+                // 对齐，不等 A* 磨到无路（与 GoalExecutor.tickTravel 收尾带对齐）。
+                if ((dx * dx + dz * dz <= tolerance * tolerance
+                        && Math.abs(targetY - npc.getY()) > 2.5D)
+                        || (dx * dx + dz * dz <= 64.0D
+                        && Math.abs(targetY - npc.getY()) >= 6.0D)) {
                     npc.stopWalking();
                     finish(id, "travel", "水平到位，需要竖直对齐");
                     return;

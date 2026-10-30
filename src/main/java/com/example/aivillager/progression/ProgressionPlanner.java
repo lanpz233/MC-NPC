@@ -627,7 +627,16 @@ public final class ProgressionPlanner {
             // 成功即清零。「饥饿求生：回农场」的 travel 连败走自己的退避，
             // 退避期内步 0 照旧 hunt，不把 NPC 钉在原地干等。
             if ("饥饿求生".equals(lastStage)) {
-                if (goalFailed) {
+                // 【fix158】A 环「中途撤退」收场也计连败：isFailureText 不认该
+                // 结局（无失败关键词），旧版走下方 else 清零——猎贫区里真失败
+                // （+1）与 A 环中止（清零）交替，连败永达不到 3、fix117 出口
+                // 永不开启（#31 定谳）。被饥饿中止的 hunt 与打不着的 hunt 是
+                // 同一证据：本地 hunt 喂不饱它。
+                if (goalOutcomeText != null && goalOutcomeText.contains("中途撤退")) {
+                    hungerHuntFailStreak++;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿狩猎连败=" + hungerHuntFailStreak
+                            + "（A 环中途撤退收场计入，fix158）");
+                } else if (goalFailed) {
                     hungerHuntFailStreak++;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿狩猎连败=" + hungerHuntFailStreak
                             + "（≥3 且未到家（水平>48 或高差>12）时改走回农场）");
@@ -1092,6 +1101,15 @@ public final class ProgressionPlanner {
                     double safeDz = safePoint.getZ() + 0.5D - npc.getZ();
                     double safeDist = Math.sqrt(safeDx * safeDx + safeDz * safeDz);
                     double safeDy = npc.getY() - safePoint.getY();
+                    // 【fix158】饥饿回程接管判定：饥饿狩猎连败已满（本地 hunt
+                    // 被实证喂不饱它）且当下无追兵/未接战时，下方黎明释放
+                    // 让位给豁免回程腿——释放的前提「就地 hunt 补给」已被
+                    // 连败证伪。有追兵时照旧释放先活命（#28 死相=夜余追兵，
+                    // 此条件正为排除它），连败留待下轮平静评估。
+                    SurvivalController retreatSv = plugin.survival(npc.npcName());
+                    boolean starvationReturnReady = hungerHuntFailStreak >= 3
+                            && (retreatSv == null
+                                || (!retreatSv.isFleeing() && !retreatSv.isEngaged()));
                     if (safeDist <= 16.0D && Math.abs(safeDy) <= 12.0D) {
                         retreatHomeSince = 0L;
                         LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退到达 | 安全点="
@@ -1099,7 +1117,8 @@ public final class ProgressionPlanner {
                                 + " " + safePoint.toShortString()
                                 + " 距离=" + Math.round(safeDist) + "（落回常规链休整）");
                     } else if (!isNight() && retreatNow >= retreatTravelBackoffUntil
-                            && (npc.getHealth() <= 7.0D || foodLevel <= 3)) {
+                            && (npc.getHealth() <= 7.0D || foodLevel <= 3)
+                            && !starvationReturnReady) {
                         // 【fix151】黎明 vitals 释放（#28 定谳）：夜里靠保持
                         // 门活过，天亮步 -1 却以 hp 4.6/food 0 原样续派
                         // 388 格长途、穿水带被夜余僵尸追死。危线时不带伤
@@ -1119,6 +1138,13 @@ public final class ProgressionPlanner {
                                 + " " + safePoint.toShortString()
                                 + " 距离=" + Math.round(safeDist)
                                 + " 高差=" + Math.round(safeDy));
+                        // 【fix158】饥饿连败已满时本腿即饥饿回程：黎明释放
+                        // 已让位（见上方 starvationReturnReady），专行留痕。
+                        if (starvationReturnReady) {
+                            LOG.info("[AIV][PLAN] " + npc.npcName()
+                                    + " 饥饿回程接管（fix158） | 饥饿狩猎连败=" + hungerHuntFailStreak
+                                    + "（释放让位豁免救援腿，送回安全点进食休整）");
+                        }
                         return goal("中途撤退：回安全点", "travel",
                                 params("x", safePoint.getX(), "y", safePoint.getY(),
                                         "z", safePoint.getZ()));
@@ -1987,6 +2013,20 @@ public final class ProgressionPlanner {
                     params("resource", "coal", "count", 16));
         }
 
+        // 【fix157】制作钻石镐前置于此（原在步 13 内、2109 行）：farm124 实证——
+        // 铁护腿做完、钻石 4≥3、材料全齐，decide 却先落步 10 挖铁（补仓软目标），
+        // 一趟 315 秒坏地形收场后又被口粮/夜链冲散，钻石镐连续多棒未落。制作
+        // 钻镐不耗铁、不足 1 秒，是 PORTAL 链的钥匙步；步 10/11/12 的铁储备与
+        // 保镐都是软向导（常备数不许硬卡进度），不许排在主线合成之前。玩家
+        // 口径：手里有 3 颗钻石先把镐做出来、再补仓。挖钻分支（diamonds<3，
+        // 含铁镐耐久保障）仍留在步 13 不动。
+        if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe")) {
+            if (!stickMaterial) {
+                return gatherLogs("钻石镐缺木棍");
+            }
+            return goal("制作钻石镐", "craft", params("item", "diamond_pickaxe", "count", 1));
+        }
+
         // 10) 铁矿石（原第 8 步，【第三十四轮】顺延）：石镐就能挖，Y=16 附近最密集。
         // 【第二十二轮】同理按存量差额：生铁+铁锭合计补到 8（够镐+剑+余量）。
         // 【fix88】连败退避中跳过本步：补 8 锭是早期口径，钻石时代（剑/甲已
@@ -2106,12 +2146,7 @@ public final class ProgressionPlanner {
                     + " stonePickaxes=" + stonePickaxes);
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
-        if (planHas(StagePlan.DIAMOND) && diamonds >= 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe")) {
-            if (!stickMaterial) {
-                return gatherLogs("钻石镐缺木棍");
-            }
-            return goal("制作钻石镐", "craft", params("item", "diamond_pickaxe", "count", 1));
-        }
+        // （制作钻石镐已由 fix157 前置到步 10 之前，见彼处；此处原分支删除防口径漂移。）
         if (planHas(StagePlan.DIAMOND_SWORD) && diamonds >= 2 && !hasUsable("diamond_sword", "netherite_sword")) {
             if (!stickMaterial) {
                 return gatherLogs("钻石剑缺木棍");

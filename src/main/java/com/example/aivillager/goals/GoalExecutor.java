@@ -307,6 +307,14 @@ public final class GoalExecutor {
      */
     private long alignBandSinceTick;
     private double alignBestAbsDelta = Double.MAX_VALUE;
+    /**
+     * 【fix156·起点侧】travel 高空起点死线状态：连续派单间水平推进 <2 格的
+     * 次数 + 上次派单时的水平距与目标点（目标点变化即清账，见 tickTravel）。
+     */
+    private int travelStallCount;
+    private double travelStallLastHorizontal = -1.0D;
+    private double travelStallTargetX = Double.NaN;
+    private double travelStallTargetZ = Double.NaN;
     /** 传送门选址结果：origin 是框架左下角，alongX 表示门面横向沿 X 轴。 */
     private BlockPos portalOrigin;
     private boolean portalAlongX = true;
@@ -550,6 +558,11 @@ public final class GoalExecutor {
                 travelX = intent.doubleParam("x", npc.getX());
                 travelY = intent.doubleParam("y", npc.getY());
                 travelZ = intent.doubleParam("z", npc.getZ());
+                // 【fix156·起点侧】新 travel 目标清死线记账，防跨目标误触发。
+                travelStallCount = 0;
+                travelStallLastHorizontal = -1.0D;
+                travelStallTargetX = Double.NaN;
+                travelStallTargetZ = Double.NaN;
             }
             case "endportal" -> {
                 newTarget = "endportal";
@@ -5397,7 +5410,10 @@ public final class GoalExecutor {
                 finish("回访放弃：多次推进仍未到达记账点");
                 return;
             }
-            if (horizontalSq <= 16.0D) {
+            // 【fix156】竖直对齐带同步放宽（与 tickTravel 同口径）：水平 ≤8 格
+            // ∧ 高差 ≥6 时也在自家列先对齐，免回访终点在崖上/洞下时 travel 空磨。
+            if (horizontalSq <= 16.0D
+                    || (horizontalSq <= 64.0D && Math.abs(revisitY - npc.getY()) >= 6.0D)) {
                 String action = npc.getY() > revisitY ? "descend" : "ascend";
                 JsonObject p = params("y", revisitY, "max", 160);
                 if (!skills.run(new Intent("", action, p), "目标")) {
@@ -5626,12 +5642,61 @@ public final class GoalExecutor {
             finish("长途行进放弃：多次推进仍未到达");
             return;
         }
-        if (horizontalSq <= 16.0D) {
+        // 【fix156】近终点竖向收尾宽带：水平 ≤8 格 ∧ 高差 ≥6 时也派竖直对齐，
+        // 不再只限 4 格带。farm124 实证：目标列 Y=57、NPC 在上方山头水平 5 格/
+        // 高差 29，落在 4 格收尾带外、fix107 死线带（6 格）内的缝里，travel
+        // 技能 A* 耗尽即时重启 45 次、白烧 775 秒靠死线收场。玩家到山头会
+        // 自己挖下去/垫上去，不原地转圈。对齐后下一轮回本函数重新判定水平，
+        // 与原 4 格带同一回路；fix107 死线继续在外层兜底。
+        boolean wideVerticalBand = horizontalSq <= 64.0D
+                && Math.abs(travelY - npc.getY()) >= 6.0D;
+        if (horizontalSq <= 16.0D || wideVerticalBand) {
             // 水平到位但高度不对：先竖直挖楼梯下去/爬上来，再由下一轮继续水平推进。
+            if (wideVerticalBand && horizontalSq > 16.0D) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 近终点竖向收尾（fix156） | 水平="
+                        + Math.round(Math.sqrt(horizontalSq)) + " 高度差="
+                        + Math.round(travelY - npc.getY()));
+            }
             String action = npc.getY() > travelY ? "descend" : "ascend";
             JsonObject params = params("y", travelY, "max", 160);
             if (!skills.run(new Intent("", action, params), "目标")) {
                 finish("竖直对齐失败 action=" + action);
+            }
+            return;
+        }
+        // 【fix156·起点侧】高空起点死线：travel 技能在柱顶/崖头起点会 A* 开放集
+        // 耗尽即时重启、位置纹丝不动（farm126 实证：桥棘轮带上 Y=221 后冻在
+        // (311,221,-195) 每 6 秒受阻一次）。连续 3 次派单水平推进 <2 格、且人
+        // 高出目标层 >12 格时，不再重派 travel，先派 descend 在自家列下到目标
+        // 层再续行——玩家被困高柱也是先挖下去。descend 派单后计数清零，收场
+        // 回本函数重新判定；attempts 总帽与 fix107 死线仍在外层兜底。
+        double horizontalNow = Math.sqrt(horizontalSq);
+        if (!Double.isNaN(travelStallTargetX)
+                && (Math.abs(travelX - travelStallTargetX) > 4.0D
+                    || Math.abs(travelZ - travelStallTargetZ) > 4.0D)) {
+            travelStallCount = 0;
+            travelStallLastHorizontal = -1.0D;
+        }
+        travelStallTargetX = travelX;
+        travelStallTargetZ = travelZ;
+        if (travelStallLastHorizontal >= 0.0D) {
+            if (horizontalNow > travelStallLastHorizontal - 2.0D
+                    && npc.getY() - travelY > 12.0D) {
+                travelStallCount++;
+            } else if (horizontalNow <= travelStallLastHorizontal - 2.0D) {
+                travelStallCount = 0;
+            }
+        }
+        travelStallLastHorizontal = horizontalNow;
+        if (travelStallCount >= 3) {
+            travelStallCount = 0;
+            travelStallLastHorizontal = -1.0D;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 高空起点先下行（fix156） | 水平="
+                    + Math.round(horizontalNow) + " 高出目标="
+                    + Math.round(npc.getY() - travelY) + "，改派 descend 至目标层");
+            JsonObject dp = params("y", travelY, "max", 220);
+            if (!skills.run(new Intent("", "descend", dp), "目标")) {
+                finish("高空起点下行技能启动失败");
             }
             return;
         }
