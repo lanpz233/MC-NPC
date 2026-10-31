@@ -1019,6 +1019,16 @@ public final class SurvivalController {
                 return null;
             }
             BlockPos foot = base.bedPos();
+            // 【fix174】验床前先确保区块已加载：未加载区块 getBlockState
+            // 恒读空气，死在远方（床区块不在加载范围）时会误判床已不在、
+            // 误杀账本并回落世界出生点（#37 实证，距床约 430 格）。复活是
+            // 低频事件，同步加载一个区块的代价可接受（原版复活本就会
+            // 加载复活点区块）；真被拆时加载后照样读得到、fix99 失效链不变。
+            if (!mainLevel.hasChunkAt(foot)) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床区块未加载，先加载再验床（fix174） | bed="
+                        + foot.getX() + "," + foot.getY() + "," + foot.getZ());
+                mainLevel.getChunk(foot);
+            }
             net.minecraft.world.level.block.state.BlockState bedState = mainLevel.getBlockState(foot);
             if (!(bedState.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床账本在但床已不在（被拆/被换），回落世界出生点 | bed="
@@ -1342,7 +1352,9 @@ public final class SurvivalController {
             npc.stopUsingItem();
         }
         // 进入攻击距离后先把最好的武器换到主手：空手 0.94 点伤害打不死怪，自己会先死。
-        ensureBestWeaponInHand();
+        // 【fix163】走战斗入口：主手是食物/非武器且包里有武器时，先中断进食再换——
+        // 抢吃循环里进食永远吃不完，ensure 的进食守卫会被永久短路（#33 拿腐肉打僵尸 26 秒）。
+        ensureBestWeaponInHandForCombat();
         float damage = npc.attackTarget(threat);
         nextAttackTick = npc.tickCount + ATTACK_COOLDOWN_TICKS;
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 自卫攻击 | threat=" + threat.getType()
@@ -1977,6 +1989,26 @@ public final class SurvivalController {
      * <p>评分直接读 {@code ATTACK_DAMAGE} 修饰符：1.21 的剑/斧伤害全是数据驱动的，
      * 没有 SwordItem.getDamage() 之类的接口。空手/食物/方块评分为 0，不会被选中。
      */
+    /**
+     * 【fix163】战斗出手前的换武器入口：主手评分=0（食物/空手）且背包里有真武器时，
+     * 正在进食也要先停下换武器——惜命优先级：被贴身打时换剑先于吃完一口。
+     * 其余情形（主手已有武器、包里没武器、没在进食）与旧口径一致，直接走原 ensure。
+     */
+    private void ensureBestWeaponInHandForCombat() {
+        if (npc.isUsingItem() && weaponScore(npc.getMainHandItem()) <= 0) {
+            Inventory inventory = npc.getInventory();
+            for (int slot = 0; slot < 36; slot++) {
+                if (weaponScoreCapped(inventory.getItem(slot)) > 0) {
+                    npc.stopUsingItem();
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                            + " 战斗换武器：中断进食先换武器（fix163） | mainHand=" + npc.getMainHandItem().getItem());
+                    break;
+                }
+            }
+        }
+        ensureBestWeaponInHand();
+    }
+
     private void ensureBestWeaponInHand() {
         // 正在吃东西时换手会打断进食，等吃完再说。
         if (npc.isUsingItem()) {

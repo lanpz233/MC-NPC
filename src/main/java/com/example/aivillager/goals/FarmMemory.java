@@ -49,6 +49,13 @@ public final class FarmMemory {
         }
     }
 
+    /** 【fix171】注销留痕：上一块被注销田的锚点（侧车账本，重开时回旧田址选址用）。 */
+    public record LastAnchor(String world, int x, int y, int z, long clearedAt) {
+        public BlockPos anchor() {
+            return new BlockPos(x, y, z);
+        }
+    }
+
     /** 按活方块盘点的田况：成熟/生长中/空耕地/已损坏（土没了或变回普通土）格数 + 各作物在田株数。 */
     public record Scan(int mature, int growing, int emptyFarmland, int lost,
                        int plantedWheat, int plantedCarrot, int plantedPotato) {
@@ -64,6 +71,8 @@ public final class FarmMemory {
     private static File dataDir;
     private static final Map<String, Farm> BY_NPC = new HashMap<>();
     private static final java.util.Set<String> LOADED = new java.util.HashSet<>();
+    private static final Map<String, LastAnchor> LAST_BY_NPC = new HashMap<>();
+    private static final java.util.Set<String> LAST_LOADED = new java.util.HashSet<>();
     private static volatile String currentWorld;
 
     private FarmMemory() {
@@ -125,6 +134,29 @@ public final class FarmMemory {
 
     /** 注销一块田（fix161 全毁重开）：清缓存 + 删账本文件，下轮起按无田走开田分支。 */
     public static synchronized void clear(String npcName) {
+        // 【fix171】删账本前先把锚点留痕到侧车账本：田毁了回老地方重开是
+        // 玩家常识，锚点随注销一起丢掉的话，NPC 只能站在现位置半径 26 内
+        // 反复试种（基址丘陵带两轮实证开不成田）；规划层开田前凭侧车先
+        // travel 回旧田址一带再选址。
+        Farm dying = load(npcName);
+        if (dying != null) {
+            LastAnchor last = new LastAnchor(dying.world(), dying.anchorX(),
+                    dying.anchorY(), dying.anchorZ(), System.currentTimeMillis());
+            LAST_BY_NPC.put(npcName, last);
+            File lastFile = lastFileFor(npcName);
+            if (lastFile != null) {
+                try {
+                    Files.createDirectories(lastFile.getParentFile().toPath());
+                    try (Writer writer = Files.newBufferedWriter(lastFile.toPath(),
+                            StandardCharsets.UTF_8)) {
+                        GSON.toJson(last, writer);
+                    }
+                } catch (Exception e) {
+                    LOG.warning("[AIV][GOAL] 旧田锚点留痕失败 " + npcName
+                            + " | " + e.getMessage());
+                }
+            }
+        }
         BY_NPC.remove(npcName);
         File file = fileFor(npcName);
         if (file != null && file.isFile()) {
@@ -253,5 +285,40 @@ public final class FarmMemory {
             BY_NPC.put(npcName, farm);
         }
         return farm;
+    }
+
+    /** 【fix171】上一块被注销田的锚点（当前世界）；从未注销/异世界返回 null。 */
+    public static synchronized BlockPos lastAnchor(String npcName) {
+        LastAnchor last = LAST_BY_NPC.get(npcName);
+        if (last == null && LAST_LOADED.add(npcName)) {
+            File file = lastFileFor(npcName);
+            if (file != null && file.isFile()) {
+                try (Reader reader = Files.newBufferedReader(file.toPath(),
+                        StandardCharsets.UTF_8)) {
+                    last = GSON.fromJson(reader, LastAnchor.class);
+                } catch (Exception e) {
+                    LOG.warning("[AIV][GOAL] 旧田锚点读取失败（按无留痕继续） " + npcName
+                            + " | " + e.getMessage());
+                }
+            }
+            if (last != null) {
+                LAST_BY_NPC.put(npcName, last);
+            }
+        }
+        if (last == null) {
+            return null;
+        }
+        if (currentWorld != null && !currentWorld.equals(last.world())) {
+            return null;
+        }
+        return last.anchor();
+    }
+
+    private static File lastFileFor(String npcName) {
+        if (dataDir == null) {
+            return null;
+        }
+        String safe = npcName.replaceAll("[^A-Za-z0-9_\\-]", "_");
+        return new File(new File(dataDir, "farm-last-anchor"), safe + ".json");
     }
 }

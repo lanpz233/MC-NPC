@@ -4,6 +4,7 @@ import com.example.aivillager.AiVillagerPlugin;
 import com.example.aivillager.goals.GoalExecutor;
 import com.example.aivillager.intent.Intent;
 import com.example.aivillager.npc.FakePlayerBody;
+import com.example.aivillager.pathfinding.PathFinder;
 import com.example.aivillager.skills.SkillRunner;
 import com.example.aivillager.snapshot.InventorySnapshot;
 import com.example.aivillager.survival.SurvivalController;
@@ -497,7 +498,9 @@ public final class ProgressionPlanner {
                     foodFailStreak = 0;
                     foodBackoffUntil = 0L;
                 }
-            } else if ("开垦农田".equals(lastStage)) {
+            } else if ("开垦农田".equals(lastStage) || "回旧田址".equals(lastStage)) {
+                // 【fix171】回旧田址腿与开田共用退避记账：同一立项的两段，
+                // 失败同涨退避，不另设字段。
                 if (goalFailed) {
                     farmFailStreak++;
                     farmBackoffUntil = now + Math.min(300_000L, 60_000L * farmFailStreak);
@@ -1731,6 +1734,27 @@ public final class ProgressionPlanner {
                         return goal("制作木锄", "craft", params("item", "wooden_hoe", "count", 1));
                     }
                 } else {
+                    // 【fix171】旧田址重开腿：有注销留痕且人离旧田 >32 格时，
+                    // 先 travel 回旧田址一带再走 establish 选址——establish
+                    // 只扫站位半径 26，基址丘陵带无合格靠水平整簇（farm137
+                    // 两轮实证），站在家里永远开不成；旧田址是已验证的田址。
+                    // 到达后下轮 decide 距 ≤32 自然落回下方开田分支。
+                    BlockPos lastFarmAnchor =
+                            com.example.aivillager.goals.FarmMemory.lastAnchor(npc.npcName());
+                    if (lastFarmAnchor != null) {
+                        double reopenDx = npc.getX() - (lastFarmAnchor.getX() + 0.5D);
+                        double reopenDz = npc.getZ() - (lastFarmAnchor.getZ() + 0.5D);
+                        double reopenDistSq = reopenDx * reopenDx + reopenDz * reopenDz;
+                        if (reopenDistSq > 32.0D * 32.0D) {
+                            LOG.info("[AIV][PLAN] " + npc.npcName() + " 回旧田址开田（fix171） | 旧锚点="
+                                    + lastFarmAnchor.toShortString() + " 距="
+                                    + (int) Math.sqrt(reopenDistSq)
+                                    + " 格（现位置半径内无合格田址，先回旧田一带再选址）");
+                            return goal("回旧田址", "travel",
+                                    params("x", lastFarmAnchor.getX(), "y", lastFarmAnchor.getY(),
+                                            "z", lastFarmAnchor.getZ()));
+                        }
+                    }
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 开田触发 | foodNutrition="
                             + foodNutrition() + "/" + MINING_FOOD_NUTRITION
                             + "（hunt 不稳，田是根治项）");
@@ -2545,6 +2569,33 @@ public final class ProgressionPlanner {
     }
 
     /**
+     * 【fix164】离最近安全点（落脚点锚点/农场锚点取近者）水平距离是否 >96 格。
+     * 无任一锚点（早期世界）返回 false——没有「家」可量时不触发保持。
+     */
+    private boolean farFromSafePoint() {
+        com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.BaseMemory.Base farBase =
+                com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+        com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.FarmMemory.Farm farFarm =
+                com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+        double bestSq = Double.MAX_VALUE;
+        if (farBase != null) {
+            bestSq = Math.min(bestSq, horizontalDistSq(farBase.anchor()));
+        }
+        if (farFarm != null) {
+            bestSq = Math.min(bestSq, horizontalDistSq(farFarm.anchor()));
+        }
+        return bestSq != Double.MAX_VALUE && bestSq > 96.0D * 96.0D;
+    }
+
+    private double horizontalDistSq(BlockPos anchor) {
+        double dx = anchor.getX() + 0.5D - npc.getX();
+        double dz = anchor.getZ() + 0.5D - npc.getZ();
+        return dx * dx + dz * dz;
+    }
+
+    /**
      * 【fix146】就地过夜保持门（decide 步 -0.25）：夜里地表处于「回不了家、
      * 只能就地过夜」的状态（撤退标记在/本夜刚建过小屋/血饭危线）时，把人
      * 留在安全处熬到天亮，而不是让 decide 落到挖矿、采集等步把人带出小屋
@@ -2567,7 +2618,12 @@ public final class ProgressionPlanner {
         boolean retreatTrigger = retreatHomeSince > 0L;
         boolean shelterTrigger = shelterHoldNight == today && shelterHoldPos != null;
         boolean vitalsTrigger = npc.getHealth() <= 7.0D || foodLevel <= 3;
-        if (!retreatTrigger && !shelterTrigger && !vitalsTrigger) {
+        // 【fix164】第四触发：夜里离最近安全点 >96 格（#34 实证：夜间远猎区
+        // hunt 正常收场不置标记、vitals 未达线，三触发全落空被续派 hunt 磨死）。
+        // 只在前三触发全落空时评估；回程腿（步 -1/-0.5）在本门之前返回，不受影响。
+        boolean farTrigger = !retreatTrigger && !shelterTrigger && !vitalsTrigger
+                && farFromSafePoint();
+        if (!retreatTrigger && !shelterTrigger && !vitalsTrigger && !farTrigger) {
             return null;
         }
         // 【fix146c】近棚口径：小屋常建在洼地里，该列高度图顶面比站位高 >3 格
@@ -2593,7 +2649,7 @@ public final class ProgressionPlanner {
             overnightHoldLoggedNight = today;
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 就地过夜保持（fix146） | 触发="
                     + (retreatTrigger ? "撤退休整 " : "") + (shelterTrigger ? "本夜已建小屋 " : "")
-                    + (vitalsTrigger ? "血/饭危线" : "")
+                    + (vitalsTrigger ? "血/饭危线" : "") + (farTrigger ? "远离安全点（fix164）" : "")
                     + " hp=" + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
                     + " foodLevel=" + foodLevel
                     + " pos=" + npc.blockPosition().toShortString()
@@ -2641,18 +2697,68 @@ public final class ProgressionPlanner {
             double shelterDist = Math.sqrt(shelterDx * shelterDx + shelterDz * shelterDz);
             if (shelterDist > 2.0D && shelterDist <= 16.0D) {
                 shelterReturnNight = today;
-                return goal("就地过夜：回小屋", "travel",
-                        params("x", shelterHoldPos.getX(), "y", shelterHoldPos.getY(),
-                                "z", shelterHoldPos.getZ()));
+                // 【fix170】到达点先解析基座层地面格、并给目标层带到达 Y
+                // 上限：旧版直派 shelterHoldPos，tickTravel 到达包络（水平
+                // ≤4∧|dy|≤3）把屋顶（基座+3）判成到达，人整夜站在棚顶全
+                // 暴露（#36 幻翼链定谳）。解析不到地面格时宁可落回原地
+                // 等待（下方 (d) 支有近棚守卫、终落 (e)），不登顶。
+                BlockPos groundCell = resolveShelterGroundCell();
+                if (groundCell == null) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 回小屋无基座层地面落点，原地等待（fix170） | 小屋站位="
+                            + shelterHoldPos.toShortString());
+                } else {
+                    return goal("就地过夜：回小屋", "travel",
+                            params("x", groundCell.getX(), "y", groundCell.getY(),
+                                    "z", groundCell.getZ(),
+                                    "arriveYCap", shelterHoldPos.getY() + 1));
+                }
             }
         }
         // d) 还没有遮蔽且材料够：就地补建小屋（5.6 同口径，仅触发态提前）。
         // 【fix159】材料口径 = 可放置建材总量（混料可建），非圆石单项。
+        // 【fix166】本夜已建小屋且人在棚 16 格内时不许再建：farm133 实证
+        // (d) 支 16 秒连建 4 间（人站棚外 underRoof()=false、(c) 支 dist≤2
+        // 跳过），材料空烧、人还一路漂出棚外被磨死。近棚时落 (e) 原地等待
+        // （(c) 支管 2<dist≤16 的回棚 travel），远棚（>16）记账失效仍可新建。
+        boolean nearShelterTonight = false;
+        if (shelterTrigger) {
+            double builtDx = shelterHoldPos.getX() + 0.5D - npc.getX();
+            double builtDz = shelterHoldPos.getZ() + 0.5D - npc.getZ();
+            nearShelterTonight = builtDx * builtDx + builtDz * builtDz <= 16.0D * 16.0D;
+        }
         if (!underRoof() && planHas(StagePlan.SHELTER) && buildBlocks >= 25
-                && !shelterCoolingDown()) {
+                && !shelterCoolingDown() && !nearShelterTonight) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
         // e) 原地等待至天亮（decide 返回 null 待命，生存层照常护身）。
+        return null;
+    }
+
+    /**
+     * 【fix170】回小屋到达点解析：以小屋站位为心、切比雪夫半径 2 内按环由近
+     * 及远、层序基座层→+1→−1 找第一个可站立格。原站位列基座层（棚内地面）
+     * 最先命中；整片被水/墙体占满时返回 null，调用方落回原地等待——玩家回
+     * 棚是进棚或站棚边地面，落不上地面格宁可不动，不爬屋顶（#36 定谳）。
+     */
+    private BlockPos resolveShelterGroundCell() {
+        BlockPos hold = shelterHoldPos;
+        for (int ring = 0; ring <= 2; ring++) {
+            for (int dx = -ring; dx <= ring; dx++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
+                        continue;
+                    }
+                    for (int dy : new int[]{0, 1, -1}) {
+                        BlockPos cell = new BlockPos(hold.getX() + dx,
+                                hold.getY() + dy, hold.getZ() + dz);
+                        if (PathFinder.isStandable(npc.level(), cell)) {
+                            return cell;
+                        }
+                    }
+                }
+            }
+        }
         return null;
     }
 

@@ -1409,7 +1409,9 @@ public final class SkillRunner {
                             || Math.max(Math.abs(cell.getX() - chunkCell.getX()),
                                     Math.abs(cell.getZ() - chunkCell.getZ())) >= 4) {
                         chunkCell = cell;
-                        chunkGoal = resolveTravelGoal(cell);
+                        // 【fix165】中间点走地表口径解析（resolveSurfaceGoal）：
+                        // 原向下扫会被洞穿列劫持进洞网（fix136 存箱腿实证）。
+                        chunkGoal = resolveSurfaceGoal(cell);
                     }
                     goal = chunkGoal;
                 }
@@ -1469,6 +1471,35 @@ public final class SkillRunner {
             }
         }
         return goal;
+    }
+
+    /**
+     * 【fix165】长途中间点的地表口径解析：先认该列高度图（MOTION_BLOCKING）表面格，
+     * ±3 内有可站立格就用它；没有（水面/树冠/未加载等）才落回
+     * {@link #resolveTravelGoal} 向下扫兜底，行为不劣于旧版。
+     *
+     * <p>病灶：中间点原走向下扫，列被 NPC 自家竖井/洞网洞穿时第一个命中的是
+     * 洞层台地——fix136 存箱腿中间点被解析到 (317,40,-215)，其后每段都在洞网里
+     * 接续、Y=13 磨 20+ 分钟不回地表。玩家长途赶路是先回地表再水平推进：
+     * 中间点恒在地表，A* 自然先爬出洞再朝终点走，「回地表」从选点口径涌现，
+     * 不另设模式开关。终点 pathGoal 的 fix114 口径不在此列（目的地洼地/
+     * 竖向收尾自有 fix156 宽带接管）。
+     */
+    private BlockPos resolveSurfaceGoal(BlockPos cell) {
+        int surfaceY = npc.level().getHeight(
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING,
+                cell.getX(), cell.getZ());
+        for (int dy = 0; dy <= 3; dy++) {
+            BlockPos cand = new BlockPos(cell.getX(), surfaceY + dy, cell.getZ());
+            if (PathFinder.isStandable(npc.level(), cand)) {
+                return cand;
+            }
+            cand = new BlockPos(cell.getX(), surfaceY - dy, cell.getZ());
+            if (PathFinder.isStandable(npc.level(), cand)) {
+                return cand;
+            }
+        }
+        return resolveTravelGoal(cell);
     }
 
     /**
