@@ -323,6 +323,9 @@ public final class GoalExecutor {
      * 次数 + 上次派单时的水平距与目标点（目标点变化即清账，见 tickTravel）。
      */
     private int travelStallCount;
+    /** 【fix186】平地停滞计数：与 fix156 同一无推进口径但不带高差条件
+     * （宽河岸平地热循环无人收场的兜底），见 tickTravel。 */
+    private int travelStallAnyCount;
     private double travelStallLastHorizontal = -1.0D;
     private double travelStallTargetX = Double.NaN;
     private double travelStallTargetZ = Double.NaN;
@@ -678,6 +681,7 @@ public final class GoalExecutor {
         bedItemPath = null;
         bedActionStuck = 0;
         bedLastActionKey = "";
+        bedPadAttempted = false;
         sleepPhase = 0;
         obsidianDescendFails = 0;
         lavaSearchDir = Double.NaN;
@@ -2785,12 +2789,12 @@ public final class GoalExecutor {
                     farmSiteCells = findFarmSite();
                     if (farmSiteCells == null) {
                         farmSiteAttempts++;
-                        if (farmSiteAttempts >= 4) {
+                        if (farmSiteAttempts >= 6) {
                             finish("开田放弃：附近找不到靠水的平地");
                             return;
                         }
                         if ("idle".equals(skills.currentSkill())) {
-                            escalateSearch();
+                            relocateForFarmSite();
                         }
                         return;
                     }
@@ -3306,6 +3310,38 @@ public final class GoalExecutor {
      * Wiki），成团 ≥5 格才算一块田，目标 8 格。只看已加载区块的地表，
      * 不为找田加载新区块（与找树同口径，非透视）。
      */
+    /**
+     * 【fix187】选址换位：phase 2 连续找不到田址时沿罗盘轮转方向走 26 格换一片
+     * 河岸再扫（真人找田就是沿河走一段换地方）。旧路径借通用 escalateSearch
+     * 8 格小跳，farm154 实证四连败净迁移≈0、122 秒原地放弃。方向按
+     * farmSiteAttempts 轮转（不重复同向）、目标列未生成（高度图无效）跳过换向；
+     * goto 起不来回退 escalateSearch 兜底，不硬失败。
+     */
+    private void relocateForFarmSite() {
+        int invalidY = npc.level().getMinY() + 4;
+        for (int tries = 0; tries < 8; tries++) {
+            double angle = (farmSiteAttempts + tries) * Math.PI / 4.0D;
+            double tx = npc.getX() + Math.cos(angle) * 26;
+            double tz = npc.getZ() + Math.sin(angle) * 26;
+            int surfaceY = npc.level().getHeight(
+                    net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                    (int) Math.floor(tx), (int) Math.floor(tz));
+            if (surfaceY <= invalidY) {
+                continue;
+            }
+            JsonObject params = new JsonObject();
+            params.addProperty("x", tx);
+            params.addProperty("z", tz);
+            if (skills.run(new Intent("", "goto", params), "目标")) {
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [FARM] 选址换位（fix187） | 第"
+                        + farmSiteAttempts + "次 方向=" + Math.round(Math.toDegrees(angle)) + "° 距离=26");
+                return;
+            }
+            break;
+        }
+        escalateSearch();
+    }
+
     private java.util.List<BlockPos> findFarmSite() {
         if (!(npc.level() instanceof ServerLevel level)) {
             return null;
@@ -3324,7 +3360,8 @@ public final class GoalExecutor {
                         x, z) - 1;
                 BlockPos ground = new BlockPos(x, topY, z);
                 BlockState state = level.getBlockState(ground);
-                if (!state.is(Blocks.GRASS_BLOCK) && !state.is(Blocks.DIRT)) {
+                if (!state.is(Blocks.GRASS_BLOCK) && !state.is(Blocks.DIRT)
+                        && !state.is(Blocks.FARMLAND)) {
                     continue;
                 }
                 BlockState above = level.getBlockState(ground.above());
@@ -3691,6 +3728,8 @@ public final class GoalExecutor {
     private net.minecraft.core.Direction bedFacing;
     private String bedItemPath;
     private int bedActionStuck;
+    /** 【fix185】本目标是否已垫过站位格（防反复垫格烧料，每目标限一次）。 */
+    private boolean bedPadAttempted;
     private String bedLastActionKey = "";
     private int sleepPhase;
     private long sleepStartMillis;
@@ -3824,37 +3863,167 @@ public final class GoalExecutor {
      * 下一层、站位 = anchor.y-1，原口径只试同层西列两对、层差一层即全灭），
      * 东西/南北任意相邻两格皆空且脚下实心即命中（foot 取西/北格、facing
      * 指向 head 格，与原版床 FACING 约定及 phase 2 放床一致）。命中写状态
-     * 返回 true；扫描面与层位双扩面后不再依赖单一几何假设。 */
+     * 返回 true；扫描面与层位双扩面后不再依赖单一几何假设。
+     * 【fix180】搜索面 ±1→±3（按切比雪夫距离近者优先）：farm145 实证
+     * 落脚点地面被挖穿/炸穿——±1 双层 18 格仅两格有支撑且互不相邻，
+     * 合法对不存在、place_bed 诚实失败（fix179 抢占已把派单送到，败在
+     * 选位）。玩家床放不下会往旁边挪几格找平地：床只需在锚点近傍
+     * （账本记实际脚格、睡眠/重生都按脚格走），半径放到 3 格；±3 仍
+     * 全灭维持诚实失败（垫格修复留后手）。
+     * 【fix185】命中选择改「NPC 最近优先」：farm150 实证旧版按扫描序
+     * 首命中选在锚点另一侧，phase 1 够不着站位——候选全集里按到 NPC
+     * 的距离选最优（同距取 ring 小、dy 0 优先），选位天然落在人够得
+     * 着的一侧。 */
     private boolean scanBedSpot(BlockPos anchor) {
+        BlockPos bestFoot = null;
+        net.minecraft.core.Direction bestFacing = null;
+        int bestRing = 0;
+        int bestDy = 0;
+        double bestDist = Double.MAX_VALUE;
         for (int dy = 0; dy >= -1; dy--) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    BlockPos cell = anchor.offset(dx, dy, dz);
-                    if (dx < 1 && bedCellFree(cell) && bedCellFree(cell.east())
-                            && bedSleepableAt(cell, net.minecraft.core.Direction.EAST)) {
-                        bedFootPos = cell;
-                        bedFacing = net.minecraft.core.Direction.EAST;
-                        return true;
-                    }
-                    if (dz < 1 && bedCellFree(cell) && bedCellFree(cell.south())
-                            && bedSleepableAt(cell, net.minecraft.core.Direction.SOUTH)) {
-                        bedFootPos = cell;
-                        bedFacing = net.minecraft.core.Direction.SOUTH;
-                        return true;
+            for (int ring = 0; ring <= 3; ring++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    for (int dx = -ring; dx <= ring; dx++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) {
+                            continue;
+                        }
+                        BlockPos cell = anchor.offset(dx, dy, dz);
+                        if (dx < 3 && bedCellFree(cell) && bedCellFree(cell.east())
+                                && bedSleepableAt(cell, net.minecraft.core.Direction.EAST)) {
+                            double ddx = npc.getX() - (cell.getX() + 0.5D);
+                            double ddz = npc.getZ() - (cell.getZ() + 0.5D);
+                            double d = ddx * ddx + ddz * ddz;
+                            if (d < bestDist - 1.0E-9D
+                                    || (Math.abs(d - bestDist) <= 1.0E-9D
+                                        && (ring < bestRing
+                                            || (ring == bestRing && dy > bestDy)))) {
+                                bestDist = d;
+                                bestFoot = cell;
+                                bestFacing = net.minecraft.core.Direction.EAST;
+                                bestRing = ring;
+                                bestDy = dy;
+                            }
+                        }
+                        if (dz < 3 && bedCellFree(cell) && bedCellFree(cell.south())
+                                && bedSleepableAt(cell, net.minecraft.core.Direction.SOUTH)) {
+                            double ddx = npc.getX() - (cell.getX() + 0.5D);
+                            double ddz = npc.getZ() - (cell.getZ() + 0.5D);
+                            double d = ddx * ddx + ddz * ddz;
+                            if (d < bestDist - 1.0E-9D
+                                    || (Math.abs(d - bestDist) <= 1.0E-9D
+                                        && (ring < bestRing
+                                            || (ring == bestRing && dy > bestDy)))) {
+                                bestDist = d;
+                                bestFoot = cell;
+                                bestFacing = net.minecraft.core.Direction.SOUTH;
+                                bestRing = ring;
+                                bestDy = dy;
+                            }
+                        }
                     }
                 }
             }
         }
-        return false;
+        if (bestFoot == null) {
+            return false;
+        }
+        bedFootPos = bestFoot;
+        bedFacing = bestFacing;
+        if (bestRing > 1) {
+            LOG.info("[AIV][GOAL] " + npc.npcName()
+                    + " [BED] 床位扩面命中（fix180） | foot="
+                    + bestFoot.toShortString() + " ring=" + bestRing);
+        }
+        return true;
+    }
+
+    /** 【fix185】站位格可站：脚格空/植被无流体且脚下实心（bedCellFree
+     * 口径）+ 头格空/植被无流体。 */
+    private boolean bedStandable(BlockPos c) {
+        if (!bedCellFree(c)) {
+            return false;
+        }
+        BlockState head = npc.level().getBlockState(c.above());
+        return (head.isAir() || isVegetation(head)) && head.getFluidState().isEmpty();
+    }
+
+    /** 【fix185】可垫格：脚/头两格空且无流体、脚下是空气——垫一格即成站位。 */
+    private boolean bedCellPaddable(BlockPos c) {
+        BlockState feet = npc.level().getBlockState(c);
+        if ((!feet.isAir() && !isVegetation(feet)) || !feet.getFluidState().isEmpty()) {
+            return false;
+        }
+        BlockState head = npc.level().getBlockState(c.above());
+        if ((!head.isAir() && !isVegetation(head)) || !head.getFluidState().isEmpty()) {
+            return false;
+        }
+        return npc.level().getBlockState(c.below()).isAir();
+    }
+
+    /** 【fix185】床脚够格站位：farm150 实证 phase 1 旧口径钉死锚点列——
+     * 锚点被挖穿时该列不可站立、goto/travel 双灭，47.5 秒空转放弃。
+     * 玩家做法是站在床边任何够得着的平地上放床。候选面=farmInReach
+     * 反解几何（相对床脚 dx²+dz²≤10、dy∈[-1,3]，站上去必够得着床脚）
+     * 内可站立的最近格（排除床脚/床头两格本身）；无可站格且已卡
+     * 一阵（stuck&gt;30）且本目标未垫过时，找同几何内的可垫格垫一格
+     * 造站位（每目标限一次，防烧料循环）。仍无则返回 null，调用方
+     * 落回锚点列原逻辑、90 计数诚实放弃不变。 */
+    private BlockPos bedStandCandidate(BlockPos foot) {
+        BlockPos headCell = foot.relative(bedFacing);
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos padCand = null;
+        for (int dy = -1; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+                for (int dz = -3; dz <= 3; dz++) {
+                    if (dx * dx + dz * dz > 10) {
+                        continue;
+                    }
+                    BlockPos c = foot.offset(dx, dy, dz);
+                    if (c.equals(foot) || c.equals(headCell)) {
+                        continue;
+                    }
+                    if (bedStandable(c)) {
+                        double ddx = npc.getX() - (c.getX() + 0.5D);
+                        double ddz = npc.getZ() - (c.getZ() + 0.5D);
+                        double d = ddx * ddx + ddz * ddz;
+                        if (d < bestDist) {
+                            bestDist = d;
+                            best = c;
+                        }
+                    } else if (padCand == null && bedActionStuck > 30 && !bedPadAttempted
+                            && bedCellPaddable(c)) {
+                        padCand = c;
+                    }
+                }
+            }
+        }
+        if (best != null) {
+            return best;
+        }
+        if (padCand != null) {
+            String material = pickBuildMaterial();
+            Block block = material == null ? null : blockOfItem(material);
+            if (block != null && consume(material, 1)) {
+                npc.level().setBlockAndUpdate(padCand.below(), block.defaultBlockState());
+                bedPadAttempted = true;
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " [BED] 站位垫格（fix185） | cell="
+                        + padCand.below().toShortString() + " material=" + material
+                        + "（够格几何内无可站格，垫一格造站位）");
+                return padCand;
+            }
+        }
+        return null;
     }
 
     /** 【fix82/fix84】选位失败诊断：双层全内室逐格打 本格/脚下 物品 id，
-     * 层位/占用/未加载三类原因靠此一次分辨（日志四问：出事留快照）。 */
+     * 层位/占用/未加载三类原因靠此一次分辨（日志四问：出事留快照）。
+     * 【fix180】诊断面随扫描面扩到 ±3（失败路径才打，行长可控）。 */
     private void logBedScanDiagnostics(BlockPos anchor) {
         StringBuilder sb = new StringBuilder();
         for (int dy = 0; dy >= -1; dy--) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int dx = -3; dx <= 3; dx++) {
                     BlockPos cell = anchor.offset(dx, dy, dz);
                     BlockState state = npc.level().getBlockState(cell);
                     BlockState below = npc.level().getBlockState(cell.below());
@@ -3990,7 +4159,18 @@ public final class GoalExecutor {
                     return;
                 }
                 if (!bedAtStand) {
-                    moveToStand(stand, bedActionStuck, "[BED]");
+                    // 【fix185】床位已知时站位改「床脚够格站位」：够得着
+                    // 床脚的最近可站格（见 bedStandCandidate），不再钉
+                    // 锚点列——锚点被挖穿时该列不可达、旧口径 47.5 秒
+                    // 空转放弃（farm150 实证）。床位未知维持锚点列原逻辑。
+                    BlockPos standTarget = stand;
+                    if (bedFootPos != null) {
+                        BlockPos cand = bedStandCandidate(bedFootPos);
+                        if (cand != null) {
+                            standTarget = cand;
+                        }
+                    }
+                    moveToStand(standTarget, bedActionStuck, "[BED]");
                 }
             }
             case 2 -> {
@@ -5596,8 +5776,9 @@ public final class GoalExecutor {
             }
             // 【fix156】竖直对齐带同步放宽（与 tickTravel 同口径）：水平 ≤8 格
             // ∧ 高差 ≥6 时也在自家列先对齐，免回访终点在崖上/洞下时 travel 空磨。
+            // 【fix176】带宽同步 8→12 格（同 tickTravel 口径，farm141 唇口实证）。
             if (horizontalSq <= 16.0D
-                    || (horizontalSq <= 64.0D && Math.abs(revisitY - npc.getY()) >= 6.0D)) {
+                    || (horizontalSq <= 144.0D && Math.abs(revisitY - npc.getY()) >= 6.0D)) {
                 String action = npc.getY() > revisitY ? "descend" : "ascend";
                 JsonObject p = params("y", revisitY, "max", 160);
                 if (!skills.run(new Intent("", action, p), "目标")) {
@@ -5837,12 +6018,13 @@ public final class GoalExecutor {
             return;
         }
         // 【fix156】近终点竖向收尾宽带：水平 ≤8 格 ∧ 高差 ≥6 时也派竖直对齐，
+        // 【fix176】带宽放宽为 12 格（见 wideVerticalBand 处注释）。
         // 不再只限 4 格带。farm124 实证：目标列 Y=57、NPC 在上方山头水平 5 格/
         // 高差 29，落在 4 格收尾带外、fix107 死线带（6 格）内的缝里，travel
         // 技能 A* 耗尽即时重启 45 次、白烧 775 秒靠死线收场。玩家到山头会
         // 自己挖下去/垫上去，不原地转圈。对齐后下一轮回本函数重新判定水平，
         // 与原 4 格带同一回路；fix107 死线继续在外层兜底。
-        boolean wideVerticalBand = horizontalSq <= 64.0D
+        boolean wideVerticalBand = horizontalSq <= 144.0D
                 && Math.abs(travelY - npc.getY()) >= 6.0D;
         if (horizontalSq <= 16.0D || wideVerticalBand) {
             // 水平到位但高度不对：先竖直挖楼梯下去/爬上来，再由下一轮继续水平推进。
@@ -5869,19 +6051,37 @@ public final class GoalExecutor {
                 && (Math.abs(travelX - travelStallTargetX) > 4.0D
                     || Math.abs(travelZ - travelStallTargetZ) > 4.0D)) {
             travelStallCount = 0;
+            travelStallAnyCount = 0;
             travelStallLastHorizontal = -1.0D;
         }
         travelStallTargetX = travelX;
         travelStallTargetZ = travelZ;
         if (travelStallLastHorizontal >= 0.0D) {
-            if (horizontalNow > travelStallLastHorizontal - 2.0D
-                    && npc.getY() - travelY > 12.0D) {
-                travelStallCount++;
-            } else if (horizontalNow <= travelStallLastHorizontal - 2.0D) {
+            if (horizontalNow <= travelStallLastHorizontal - 2.0D) {
                 travelStallCount = 0;
+                travelStallAnyCount = 0;
+            } else {
+                // 【fix186】无推进（<2 格）时平地计数同步累加（fix156 的
+                // travelStallCount 仍只在高出 >12 格时累加、口径不变）。
+                travelStallAnyCount++;
+                if (npc.getY() - travelY > 12.0D) {
+                    travelStallCount++;
+                }
             }
         }
         travelStallLastHorizontal = horizontalNow;
+        if (travelStallAnyCount >= 6) {
+            // 【fix186】平地停滞收场：宽河岸实证旧版每 6 秒同参重派、
+            // 烧 attempts 240 帽≈24 分钟（farm152 (486,65,-208) 74+ 轮）。
+            // 连续 6 次派单推进 <2 格即诚实收场，交规划层退避/换路。
+            travelStallAnyCount = 0;
+            travelStallLastHorizontal = -1.0D;
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 长途停滞收场（fix186） | 水平="
+                    + Math.round(horizontalNow) + " 目标=" + Math.round(travelX) + ","
+                    + Math.round(travelZ) + "（连续 6 次派单推进 <2 格，交规划层退避/换路）");
+            finish("长途行进受阻：多次推进无进展");
+            return;
+        }
         if (travelStallCount >= 3) {
             travelStallCount = 0;
             travelStallLastHorizontal = -1.0D;
@@ -6995,6 +7195,33 @@ public final class GoalExecutor {
         // 没有一条全局底线。这里钉死：当前能用的最好的一把镐永远不扔；
         // 一把能用的都没有时，最高等级的那把（哪怕只剩 1 耐久）也留着当最后稻草。
         int protectedPickaxe = protectedPickaxeSlot();
+        // 【fix184】弓配额：junkKeepLimit 对 bow 落 default=-1 永不裁剪，骷髅
+        // 掉落弓只进不出（实况 ×6 占 6 格、其中两把近废），是满包腾格「一二
+        // 线皆无受害者」的深层驱动之一。仍走配额裁剪路径：先按剩余耐久
+        // 排出最差的超额弓（保留最优 2 把），主循环命中即裁；只裁同型
+        // 冗余、≤2 把不动，不碰 fix102 白名单兜底面。
+        java.util.Set<Integer> excessBows = new java.util.HashSet<>();
+        {
+            java.util.List<Integer> bowSlots = new java.util.ArrayList<>();
+            for (int s = 0; s < MAIN_SLOTS; s++) {
+                ItemStack st = npc.getInventory().getItem(s);
+                if (!st.isEmpty() && pathOf(st).equals("bow")) {
+                    bowSlots.add(s);
+                }
+            }
+            if (bowSlots.size() > 2) {
+                bowSlots.sort((a, b) -> {
+                    ItemStack sa = npc.getInventory().getItem(a);
+                    ItemStack sb = npc.getInventory().getItem(b);
+                    int ra = sa.isDamageableItem() ? sa.getMaxDamage() - sa.getDamageValue() : 0;
+                    int rb = sb.isDamageableItem() ? sb.getMaxDamage() - sb.getDamageValue() : 0;
+                    return Integer.compare(ra, rb);
+                });
+                for (int i = 0; i < bowSlots.size() - 2; i++) {
+                    excessBows.add(bowSlots.get(i));
+                }
+            }
+        }
         // 先统计每个"工具家族"里还有多少把真能用的镐/剑/护甲，
         // 防止 trimOverflow 把所有剩 1 耐久的都丢光，最后变成真没工具。
         // 但注意：只能把"同等级或更好的"算进可用池——石镐能挖石头但挖不动深板岩，
@@ -7017,6 +7244,11 @@ public final class GoalExecutor {
                 continue;
             }
             if (slot == protectedPickaxe) {
+                continue;
+            }
+            if (excessBows.contains(slot)) {
+                dropItems(slot, 1, "超量裁剪 bow 保留最优=2");
+                freed++;
                 continue;
             }
             String path = pathOf(stack);
@@ -7400,6 +7632,16 @@ public final class GoalExecutor {
             }
             ItemStack stack = npc.getInventory().getItem(worstSlot);
             int amount = stack.getCount();
+            // 【fix181】种子丢弃量封顶：二线整堆丢弃会穿留种下限（单堆
+            // 常态是全存量，总量 17 也能一丢归零、下限形同虚设）——受害者
+            // 为小麦种子时只丢超出 16 的部分。守卫口径已保证总量 >16 才
+            // 会选到种子，此处 ≤0 仅作双保险、如实返回已腾格数走退避。
+            if ("wheat_seeds".equals(pathOf(stack))) {
+                amount = Math.min(amount, countItem("wheat_seeds") - 16);
+                if (amount <= 0) {
+                    return freed;
+                }
+            }
             // 走统一的丢弃入口：那里会把拾取延迟设成永久，避免伪玩家两秒后又捡回来。
             dropItems(worstSlot, amount, "背包塞满，兜底 " + pathOf(stack)
                     + (lastResortUsed ? "（二线）" : ""));
@@ -7438,10 +7680,20 @@ public final class GoalExecutor {
             return false;
         }
         return switch (path) {
-            // 真大宗消耗料：烧的（煤/木炭）、攒的（燧石/青金石）、种剩的
-            // （小麦种子）、打剩的（箭）——玩家满包时先扔的也是这几样。
+            // 真大宗消耗料：烧的（煤/木炭）、攒的（燧石/青金石）、打剩的
+            // （箭）——玩家满包时先扔的也是这几样。
             case "coal", "charcoal", "flint", "lapis_lazuli",
-                    "wheat_seeds", "arrow" -> true;
+                    "arrow" -> true;
+            // 【fix181】小麦种子加留种下限（与下方红石同型）：种子是田的
+            // 命根子（D11 留种），但旧口径在二线白名单里无条件可丢、又按
+            // 最小堆挑受害者——种子堆通常最小，于是成了全技能通用的常态
+            // 受害者：跨 farm101–145 数十笔二线丢种（合成腾格 ×11、hunt
+            // 拾取腾格 ×5 等，时点均不在 farm 技能内，fix173 的攒种期豁免
+            // 口径只认当前技能、罩不住日常沥干），establish 派单时存量
+            // 已归零、只能现攒（farm146 407 秒败）。总量 >16 才可丢（16=
+            // 开田跳攒种门槛 8 的两倍，够种田+一次补种），且 dropLeastValuable
+            // 对种子另有丢弃量封顶防整堆穿底。还要种田的人不扔最后一份种。
+            case "wheat_seeds" -> countItem("wheat_seeds") > 16;
             // 【fix92·Fong 2026-10-28】红石最多留一组：总量 ≤64 时二线
             // 也不许动；超出时才可丢——二线按最小堆挑受害者，丢掉最小的
             // 红石堆后总量仍 ≥64 或收敛到一组内，不会把留存组扔穿。

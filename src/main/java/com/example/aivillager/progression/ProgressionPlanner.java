@@ -258,6 +258,16 @@ public final class ProgressionPlanner {
     private boolean surfStripIssued;
     private long surfStripSeq;
     private int surfLateralRounds;
+    /** 【fix182】surfaceAscendStep 材料轮次记账：ascend 以「没有垫脚方块」
+     * 收场且垫脚料存量 &lt;2 时，先 strip 横移取材再重试（不计连败），
+     * 本锚点 ≤2 轮；surfMaterialRound=true 表示当前 phase 1 是取材轮
+     * （不占 fix154 横移轮次）。锚点位移清账时一并重置。 */
+    private int surfMaterialRounds;
+    private boolean surfMaterialRound;
+    /** 【fix182】hungerAscendStep 材料轮次记账（同上口径，本腿 ≤1 轮）。 */
+    private boolean hungerMaterialIssued;
+    private long hungerMaterialSeq;
+    private int hungerMaterialRounds;
     /** 【fix134】中途撤退专属记账：目标层自查（GoalExecutor.checkVitalRetreat）
      * 以「中途撤退」结局收场后置位 retreatHomeSince，decide() 步 -1 据此把人
      * 送回安全点（落脚点锚点优先、无则农场锚点）；回程 travel 专属连败与
@@ -1037,6 +1047,36 @@ public final class ProgressionPlanner {
                 || text.contains("找不到") || text.contains("挖不动"));
     }
 
+    /**
+     * 【fix188】农场走廊：农场向长腿先绕西侧下坡入口，再直进锚点。
+     *
+     * <p>定因（farm155/156 三败 + 第五十一棒 staging 复现/选案）：旧田址是
+     * 被挖低的水浸洼地（锚点列解析到坑底 Y=57），自北/东 rim 向坑底的
+     * A* 在崖面/水缘探索空间爆炸、恒爆 100ms 预算（廉价无树地形同签名
+     * 复现），fix186-B 只能诚实收场；唯一下行通路在西侧缓坡。走廊要点
+     * （staging 实测）：approach 必须落在锚点同纬度的西侧下坡入口——
+     * 派到坑西缘正上方仍败（A* 先撞直崖、stepToward 兜底朝目标直行到
+     * 崖边，不自己找入口）。自西口派坑底则 A* 一次命中（18 格/19 节
+     * 点）、全程约 25 秒 vs 直派永不到达。
+     *
+     * <p>无状态几何规则（每次 decide 按相对位置判定、自纠正）：距锚点
+     * 水平 ≤20 或已在走廊锥内（锚点西侧 ≥8 格且 |dz|≤8）→ 返回 null
+     * 直派锚点；否则返回 approach=(锚点.x-16, 锚点.z-2)。两跳皆走既有
+     * travel 全套机器（Y 解析/分段/fix186-B 收场/各腿退避），approach
+     * 腿败不劣于现状（原直派同为败）。
+     */
+    private BlockPos farmCorridorApproach(BlockPos anchor) {
+        double relDx = npc.getX() - (anchor.getX() + 0.5D);
+        double relDz = npc.getZ() - (anchor.getZ() + 0.5D);
+        if (relDx * relDx + relDz * relDz <= 20.0D * 20.0D) {
+            return null;
+        }
+        if (relDx <= -8.0D && Math.abs(relDz) <= 8.0D) {
+            return null;
+        }
+        return new BlockPos(anchor.getX() - 16, anchor.getY(), anchor.getZ() - 2);
+    }
+
     private Step goal(String stage, String action, JsonObject params) {
         return new Step(stage, Kind.GOAL, new Intent("", action, params));
     }
@@ -1302,6 +1342,53 @@ public final class ProgressionPlanner {
                     + "（落后续步就地休整，天亮/到家后恢复）");
         }
 
+        // -0.1) 【fix179】床账修复抢占：床账本失效（bedPos==null）时步 6.76
+        // 排在步 0/6.6/6.65 之后，在家被饥饿链/回程链恒占 decide、永无
+        // 轮次——#37/#38/#39 三死同根（床不复→复活点错位+失眠永不重置
+        // →幻翼连环）。玩家回家第一件事是确认床/重生点。人已在落脚点
+        // 近傍（≤48 格、6.77 口径）、白天地表时，把床务派单抢占到步 0
+        // 之前：place_bed 一次派单即闭合（fix174 现成床扫描登记/安置
+        // 包里床/做床三分支与 6.76 同口径；三分支皆无时仍派 place_bed
+        // 触发扫描，扫不到由执行层诚实失败、走床退避让位）。兜底防反
+        // 过来饿死：food 危线（foodLevel≤3∧food==0，fix134 口径）且床
+        // 务已有失败记录（bedFailStreak≥1）时不抢占——危线下只许一把
+        // 过，失败过就先让步 0 找吃的；成功即账本恢复、抢占条件永久
+        // 消失。远离家（>48 格）不抢占、维持 6.76 原顺位（长途先保命）。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
+                && System.currentTimeMillis() >= bedBackoffUntil) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base bedRepairBase =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (bedRepairBase != null && bedRepairBase.bedPos() == null) {
+                double bedDx = bedRepairBase.anchor().getX() + 0.5D - npc.getX();
+                double bedDz = bedRepairBase.anchor().getZ() + 0.5D - npc.getZ();
+                double bedDist = Math.sqrt(bedDx * bedDx + bedDz * bedDz);
+                boolean foodCritical = foodLevel <= 3 && food == 0;
+                if (bedDist <= 48.0D && !(foodCritical && bedFailStreak >= 1)) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 床账修复抢占（fix179） | 距锚点="
+                            + Math.round(bedDist) + " foodLevel=" + foodLevel
+                            + "（床账本失效且人在落脚点近傍，先修床再走常规链）");
+                    if (countSuffix("_bed") > 0) {
+                        return goal("安置床", "place_bed", params());
+                    }
+                    String repairWoolColor = woolColorWithThree();
+                    if (repairWoolColor != null) {
+                        return goal("制作床", "craft",
+                                params("item", repairWoolColor + "_bed", "count", 1));
+                    }
+                    int repairWhiteWool = countItem("white_wool");
+                    int repairString = countItem("string");
+                    int repairStringWool = repairString / 4;
+                    if (repairWhiteWool + repairStringWool >= 3) {
+                        int repairCraftWool = Math.min(3 - repairWhiteWool, repairStringWool);
+                        return goal("线合成白羊毛", "craft",
+                                params("item", "white_wool", "count", repairCraftWool));
+                    }
+                    return goal("安置床", "place_bed", params());
+                }
+            }
+        }
+
         // 0) 快饿死了：先找吃的，其他都往后排。
         if (planHas(StagePlan.HUNGER) && foodLevel <= 8 && food == 0
                 && retreatHomeSince <= 0L) {
@@ -1349,6 +1436,20 @@ public final class ProgressionPlanner {
                                 + " 距离=" + Math.round(Math.sqrt(hDx * hDx + hDz * hDz))
                                 + " 高差=" + Math.round(hDy)
                                 + " 饥饿狩猎连败=" + hungerHuntFailStreak);
+                        // 【fix188】农场走廊：目标是农场时同 fix171 腿口径，
+                        // 先绕西侧下坡入口（落脚点目标不走走廊）。
+                        if (hungerFarm != null) {
+                            BlockPos hungerApproach = farmCorridorApproach(hungerHome);
+                            if (hungerApproach != null) {
+                                LOG.info("[AIV][PLAN] " + npc.npcName()
+                                        + " 农场走廊 approach（fix188） | approach="
+                                        + hungerApproach.toShortString()
+                                        + "（回农场腿先绕西侧下坡入口）");
+                                return goal("饥饿求生：回农场", "travel",
+                                        params("x", hungerApproach.getX(), "y", hungerApproach.getY(),
+                                                "z", hungerApproach.getZ()));
+                            }
+                        }
                         return goal("饥饿求生：回农场", "travel",
                                 params("x", hungerHome.getX(), "y", hungerHome.getY(),
                                         "z", hungerHome.getZ()));
@@ -1750,6 +1851,18 @@ public final class ProgressionPlanner {
                                     + lastFarmAnchor.toShortString() + " 距="
                                     + (int) Math.sqrt(reopenDistSq)
                                     + " 格（现位置半径内无合格田址，先回旧田一带再选址）");
+                            // 【fix188】农场走廊：北/东向直派恒撞洼地崖面
+                            // （A* 爆预算三败），先绕西侧下坡入口。
+                            BlockPos reopenApproach = farmCorridorApproach(lastFarmAnchor);
+                            if (reopenApproach != null) {
+                                LOG.info("[AIV][PLAN] " + npc.npcName()
+                                        + " 农场走廊 approach（fix188） | approach="
+                                        + reopenApproach.toShortString()
+                                        + "（先绕西侧下坡入口，再直进旧田址）");
+                                return goal("回旧田址", "travel",
+                                        params("x", reopenApproach.getX(), "y", reopenApproach.getY(),
+                                                "z", reopenApproach.getZ()));
+                            }
                             return goal("回旧田址", "travel",
                                     params("x", lastFarmAnchor.getX(), "y", lastFarmAnchor.getY(),
                                             "z", lastFarmAnchor.getZ()));
@@ -2404,6 +2517,18 @@ public final class ProgressionPlanner {
                             Math.min(16, INGOT_RESERVE_TARGET - rawIron - ingots)));
         }
 
+        // 13.35) 【fix182】垫脚料常备：圆石/泥土等可放置方块是 ascend 垫脚、
+        // 搭桥、脱困的物质前提——fix89 只保护不丢、没人保证带够，存量见底
+        // 时悬空点 ascend 以「没有垫脚方块」收场（#40 型死局）。软向导
+        // 口径：存量 <16 只在主线空档补一趟石（dig 自有连败换区兜底），
+        // 不设硬门、不挡主线。
+        if (buildBlocks < 16) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 垫脚料常备触发 | 可放置方块="
+                    + buildBlocks + "（<16，补一趟石）");
+            return goal("垫脚料常备补给", "dig",
+                    params("resource", "stone", "count", 16));
+        }
+
         // 13.5) 下界传送门准备（通关路线的前置门槛）。
         // 顺序严格照玩家做法：铁桶 -> 装水 -> 挖燧石 -> 打火石 -> 钻石镐浇铸 20 黑曜石 -> 建门进入。
         // 这里用"眼睛不足 12 个"作为整个通关链的入口条件：
@@ -2788,6 +2913,8 @@ public final class ProgressionPlanner {
                 surfAscendPhase = 0;
                 surfAscendIssued = false;
                 surfStripIssued = false;
+                surfMaterialRounds = 0;
+                surfMaterialRound = false;
             }
         }
         if (surfAscendPhase == 1) {
@@ -2818,6 +2945,20 @@ public final class ProgressionPlanner {
             return null;
         }
         if (outcome != null && outcome.startsWith("ascend ")) {
+            // 【fix182】无垫脚料收场且存量见底：先横移取材、不计连败
+            // （材料轮次用满仍无料才落回下方连败/横移/放弃计数，不无限循环）。
+            if (outcome.contains("没有垫脚方块") && shelterBuildBlockCount() < 2
+                    && surfMaterialRounds < 2) {
+                surfMaterialRounds++;
+                surfMaterialRound = true;
+                surfAscendPhase = 1;
+                surfStripIssued = false;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " ascend 无垫脚料，先横移取材（fix182） | 取材轮次=" + surfMaterialRounds
+                        + " 垫脚料存量=" + shelterBuildBlockCount()
+                        + " 位置=" + me.toShortString());
+                return surfaceLateralStep(stage, me);
+            }
             if (surfAscendAnchorPos == null) {
                 surfAscendAnchorPos = me;
             }
@@ -2885,9 +3026,19 @@ public final class ProgressionPlanner {
             surfAscendPhase = 0;
             surfAscendAnchorPos = me;
             surfAscendFailStreak = 0;
-            LOG.info("[AIV][PLAN] " + npc.npcName()
-                    + " 横移收场（fix154） | outcome=" + stripOutcome
-                    + " 新列=" + me.toShortString() + "（回 ascend 腿重新计数）");
+            if (surfMaterialRound) {
+                // 【fix182】取材轮收场：打存量回读行（料没刨到也如实记账，
+                // 下轮 ascend 若再以无料收场、轮次用满后落回连败计数）。
+                surfMaterialRound = false;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 横移取材收场（fix182） | outcome=" + stripOutcome
+                        + " 垫脚料存量=" + shelterBuildBlockCount()
+                        + " 新列=" + me.toShortString() + "（回 ascend 腿重试垫脚）");
+            } else {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 横移收场（fix154） | outcome=" + stripOutcome
+                        + " 新列=" + me.toShortString() + "（回 ascend 腿重新计数）");
+            }
             surfAscendIssued = true;
             surfAscendSeq = skills.outcomeSeq();
             return skill(stage, "ascend");
@@ -2915,10 +3066,28 @@ public final class ProgressionPlanner {
                 hungerAscendGiveUpPos = null;
                 hungerAscendFailStreak = 0;
                 hungerAscendIssued = false;
+                hungerMaterialRounds = 0;
             }
         }
         if (hungerAscendGiveUpPos != null) {
             return null;
+        }
+        // 【fix182】取材轮次进行中：持续派 strip 等结局回读，回读后回 ascend 腿。
+        if (hungerMaterialIssued) {
+            Step mat = new Step("饥饿求生：先取材", Kind.SKILL,
+                    new Intent("", "strip", params("block", "iron_ore", "length", 8)));
+            if (skills.outcomeSeq() == hungerMaterialSeq) {
+                return mat;
+            }
+            String matOutcome = skills.lastOutcome();
+            hungerMaterialIssued = false;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 饥饿 ascend 取材收场（fix182） | outcome=" + matOutcome
+                    + " 垫脚料存量=" + shelterBuildBlockCount()
+                    + "（回 ascend 腿重试垫脚）");
+            hungerAscendIssued = true;
+            hungerAscendSeq = skills.outcomeSeq();
+            return skill("饥饿求生：先回地表", "ascend");
         }
         if (!hungerAscendIssued) {
             hungerAscendIssued = true;
@@ -2934,12 +3103,27 @@ public final class ProgressionPlanner {
         if (ascendOutcome != null && ascendOutcome.startsWith("ascend 已回到地表")) {
             hungerAscendIssued = false;
             hungerAscendFailStreak = 0;
+            hungerMaterialRounds = 0;
             LOG.info("[AIV][PLAN] " + npc.npcName()
                     + " 饥饿 ascend 结局回读（fix149） | outcome=" + ascendOutcome
                     + "（已回地表，落回地表口径处置）");
             return null;
         }
         if (ascendOutcome != null && ascendOutcome.startsWith("ascend ")) {
+            // 【fix182】无垫脚料收场且存量见底：先取材一轮、不计连败
+            // （轮次用满仍无料才落回下方连败/放弃计数，不无限循环）。
+            if (ascendOutcome.contains("没有垫脚方块") && shelterBuildBlockCount() < 2
+                    && hungerMaterialRounds < 1) {
+                hungerMaterialRounds++;
+                hungerMaterialIssued = true;
+                hungerMaterialSeq = skills.outcomeSeq();
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 饥饿 ascend 无垫脚料，先横移取材（fix182） | 垫脚料存量="
+                        + shelterBuildBlockCount()
+                        + " 位置=" + npc.blockPosition().toShortString());
+                return new Step("饥饿求生：先取材", Kind.SKILL,
+                        new Intent("", "strip", params("block", "iron_ore", "length", 8)));
+            }
             hungerAscendFailStreak++;
             LOG.info("[AIV][PLAN] " + npc.npcName()
                     + " 饥饿 ascend 结局回读（fix149） | outcome=" + ascendOutcome

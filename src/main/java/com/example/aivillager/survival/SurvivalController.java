@@ -1258,10 +1258,15 @@ public final class SurvivalController {
                         + (rangedStandOff ? " 远程威胁不接战" : ""));
                 skills.stop();
             }
-            if (npc.isUsingItem()) {
+            // 【fix175】停用豁免「正在吃食物」：本支停用后同 tick 的
+            // eat(true) 又因 desperate 抢吃重新起吃，下一 tick 再被本支
+            // 停掉——32 tick 进食永走不完（#38 逃亡窗约 3 Hz 连发 20+
+            // 次、food 不升反降实证）。逃跑支命中的威胁不在贴脸距离，
+            // 边跑边吃是玩家基本功；举盾仍照停（举盾慢速碍逃），贴脸
+            // 自卫支的腾手停用不受此豁免（fix163 换武器链在彼处覆盖）。
+            if (npc.isUsingItem() && !isEatingFood()) {
                 npc.stopUsingItem();
             }
-            // 【第二十四轮】直线脱离兜底进行中、身体已经停下（走完或卡住放弃）
             // 时不等 fleeCooldown：立刻重规划——A* 先行，仍无路就轮换方向接着跑。
             // 长跑#8 F 段实证旧节奏是灾难：逃跑失败每约 20 秒才重试一次，其余
             // 时间原地挨箭，直到被掠夺者射杀（第 4 次死亡，hpPrev=2.2）。
@@ -1873,6 +1878,12 @@ public final class SurvivalController {
     /** 【fix76】当前举着的是盾（而不是在吃东西/喝药）。 */
     private boolean usingShield() {
         return npc.isUsingItem() && npc.getUseItem().is(Items.SHIELD);
+    }
+
+    /** 【fix175】当前使用态是否为进食（useItem 带 FOOD 组件）：逃跑支停用豁免判定。 */
+    private boolean isEatingFood() {
+        return npc.isUsingItem()
+                && npc.getUseItem().get(DataComponents.FOOD) != null;
     }
 
     /**

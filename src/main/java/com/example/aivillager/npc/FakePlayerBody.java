@@ -1143,6 +1143,11 @@ public final class FakePlayerBody extends ServerPlayer {
      * +fix116 退避 600 秒，而本判定仍报「可立即合」→守卫拒挖铁镐、主线
      * 死锁）。放得下的口径：有空槽，或消耗本身会腾出一格（圆石总量恰好
      * 3、或存货木棍恰好 2 根——合成吃光该堆、产物落回原格）。
+     *
+     * <p>【fix183】空槽口径再对齐：fix123 的「有空槽」按 ≥1 算，但合成链
+     * 的真实门槛是 fix129 腾格 3 格；空槽 1–2 且丢弃腾不出格时合成仍恒
+     * 败、本判定却报可合，守卫委托落空成死局（farm148）。现口径：空槽
+     * ≥3，或消耗本身腾格（圆石恰好 3 / 木棍恰好 2）。
      */
     public boolean stonePickCraftableNow(StringBuilder missing) {
         Inventory inventory = this.getInventory();
@@ -1168,7 +1173,15 @@ public final class FakePlayerBody extends ServerPlayer {
         boolean stickMaterial = sticks >= 2 || planks >= 2 || logs >= 1;
         boolean bench = countInventoryItem(inventory, Items.CRAFTING_TABLE) > 0
                 || nearbyCraftingTable();
-        boolean placeable = emptySlots >= 1 || cobble == 3 || sticks == 2;
+        // 【fix183】placeable 空槽门槛 ≥1→≥3：fix123 的 ≥1 只算了产物本身
+        // 一格，但合成系统真实门槛是 fix129 的腾格 3 格（合木棍中间产物+
+        // 石镐产物+腾格余量，且腾格靠丢弃、无受害者时腾不出）。farm148
+        // 实证两口径打架死局：包剩 1–2 格、无可丢受害者时合成恒败「背包
+        // 已满」，本判定却报「可立即合」→ 分级守卫持续拒挖高级镐「交规划
+        // 层补造」、委托落空，NPC 钉死恢复栈台阶（descend 挖不动+travel
+        // A* 耗尽双循环）。守卫必配兜底（fix101 通则）：紧包时如实报合不
+        // 出 → pick-fallback 顺位开挖（铁>钻）脱困；空槽 ≥3 省镐口径不变。
+        boolean placeable = emptySlots >= 3 || cobble == 3 || sticks == 2;
         if (cobble < 3) {
             missing.append("圆石=").append(cobble).append("/3 ");
         }

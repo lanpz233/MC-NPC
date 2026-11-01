@@ -1377,9 +1377,12 @@ public final class SkillRunner {
                 double dz = targetZ - npc.getZ();
                 // 【fix156】宽带早退：水平 ≤8 格 ∧ 高差 ≥6 时同样交目标层竖直
                 // 对齐，不等 A* 磨到无路（与 GoalExecutor.tickTravel 收尾带对齐）。
+                // 【fix176】带宽 8→12 格：farm141 旧田唇口实测水平Sq≈97–110
+                // （约 10.5 格）落在 8 格带外冻死 577 秒；12 格覆盖实测+余量，
+                // 更宽会在可走缓坡上也抢派 descend，故止于 12。
                 if ((dx * dx + dz * dz <= tolerance * tolerance
                         && Math.abs(targetY - npc.getY()) > 2.5D)
-                        || (dx * dx + dz * dz <= 64.0D
+                        || (dx * dx + dz * dz <= 144.0D
                         && Math.abs(targetY - npc.getY()) >= 6.0D)) {
                     npc.stopWalking();
                     finish(id, "travel", "水平到位，需要竖直对齐");
@@ -1412,6 +1415,83 @@ public final class SkillRunner {
                         // 【fix165】中间点走地表口径解析（resolveSurfaceGoal）：
                         // 原向下扫会被洞穿列劫持进洞网（fix136 存箱腿实证）。
                         chunkGoal = resolveSurfaceGoal(cell);
+                        // 【fix178】解析后验真：两级地表口径皆空时回落的
+                        // resolveTravelGoal 可能返回不可站立的原格（埋藏格/
+                        // 水面列——水体列下扫的脚格恒含流体、无一可站），
+                        // PathFinder 恒判「终点不可站立」、目标层约 6 秒
+                        // 热循环至 480 秒看门狗（farm142 回程腿中间点
+                        // (521,73,-143) 实证）。玩家落点站不住会就近找个
+                        // 能站的点再朝大方向走：沿同方向缩短段长 24→16
+                        // →12 逐级重解析+验真，首个可站立者采用；全灭
+                        // 维持原值（诚实失败+travelStepToward+看门狗兜底）。
+                        if (!PathFinder.isStandable(npc.level(), chunkGoal)) {
+                            for (int segLen : new int[]{16, 12}) {
+                                double fbScale = segLen / horizontal;
+                                BlockPos fbCell = new BlockPos(
+                                        (int) Math.floor(npc.getX() + dx * fbScale),
+                                        (int) Math.floor(targetY),
+                                        (int) Math.floor(npc.getZ() + dz * fbScale));
+                                BlockPos fbGoal = resolveSurfaceGoal(fbCell);
+                                if (PathFinder.isStandable(npc.level(), fbGoal)) {
+                                    LOG.info("[AIV][SKILL] " + npc.npcName()
+                                            + " 段中间点回退取点（fix178） | 原点="
+                                            + cell.toShortString() + " 解析不可站立，缩短段长="
+                                            + segLen + " 改取=" + fbGoal.toShortString());
+                                    chunkCell = fbCell;
+                                    chunkGoal = fbGoal;
+                                    break;
+                                }
+                            }
+                        }
+                        // 【fix186】缩短全灭（宽河型：24/16/12 落点全在河面、
+                        // 整列无可站格，farm152 河岸 (509,65,-201) 实证）→
+                        // 玩家找过河口的两手：先加长段长瞄对岸（A* 以对岸
+                        // 为目标会在节点预算内沿岸找出路），再横移沿岸取点
+                        // （垂直于行进方向 ±16/±32）。均同口径验真、首个
+                        // 可站立者采用；全灭维持原值诚实失败，目标层另有
+                        // 平地停滞收场（fix186-B）兜底、不再 6 秒热循环。
+                        if (!PathFinder.isStandable(npc.level(), chunkGoal)) {
+                            for (int segLen : new int[]{32, 48}) {
+                                if (segLen >= horizontal) {
+                                    continue;
+                                }
+                                double fbScale = segLen / horizontal;
+                                BlockPos fbCell = new BlockPos(
+                                        (int) Math.floor(npc.getX() + dx * fbScale),
+                                        (int) Math.floor(targetY),
+                                        (int) Math.floor(npc.getZ() + dz * fbScale));
+                                BlockPos fbGoal = resolveSurfaceGoal(fbCell);
+                                if (PathFinder.isStandable(npc.level(), fbGoal)) {
+                                    LOG.info("[AIV][SKILL] " + npc.npcName()
+                                            + " 段目标加长取点（fix186） | 原点="
+                                            + cell.toShortString() + " 缩短回退全灭，加长段长="
+                                            + segLen + " 改取=" + fbGoal.toShortString());
+                                    chunkCell = fbCell;
+                                    chunkGoal = fbGoal;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!PathFinder.isStandable(npc.level(), chunkGoal)) {
+                            double ux = dx / horizontal;
+                            double uz = dz / horizontal;
+                            for (int lat : new int[]{16, -16, 32, -32}) {
+                                BlockPos latCell = new BlockPos(
+                                        (int) Math.floor(cell.getX() + (-uz) * lat),
+                                        (int) Math.floor(targetY),
+                                        (int) Math.floor(cell.getZ() + ux * lat));
+                                BlockPos latGoal = resolveSurfaceGoal(latCell);
+                                if (PathFinder.isStandable(npc.level(), latGoal)) {
+                                    LOG.info("[AIV][SKILL] " + npc.npcName()
+                                            + " 段目标横移取点（fix186） | 原点="
+                                            + cell.toShortString() + " 直线落点全灭，横移="
+                                            + lat + " 改取=" + latGoal.toShortString());
+                                    chunkCell = latCell;
+                                    chunkGoal = latGoal;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     goal = chunkGoal;
                 }
@@ -1464,6 +1544,32 @@ public final class SkillRunner {
         for (int dy = 3; dy <= 260; dy++) {
             BlockPos cand = goal.offset(0, -dy, 0);
             if (PathFinder.isStandable(npc.level(), cand)) {
+                // 【fix177】下探拦截：传入 Y 埋在山体里时下扫会穿岩命中洞穴层
+                // 台地（farm141 实证解析到地表下 80 格的 Y=-5），那不是玩家
+                // 会去的「地面」。候选低于无叶地表 −8 即拒绝：改返地表口径
+                // 可站立格，无则原样返回走诚实失败。合法深扫（fix114 高空
+                // 传入扫回地表本尊、洼地目标地表即洼底）候选都在地表 −8 内，
+                // 按构造不触发。
+                int groundY = npc.level().getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types
+                                .MOTION_BLOCKING_NO_LEAVES,
+                        goal.getX(), goal.getZ());
+                if (cand.getY() < groundY - 8) {
+                    BlockPos bySurface = surfaceStandable(goal.getX(), goal.getZ(),
+                            net.minecraft.world.level.levelgen.Heightmap.Types
+                                    .MOTION_BLOCKING_NO_LEAVES);
+                    if (bySurface == null) {
+                        bySurface = surfaceStandable(goal.getX(), goal.getZ(),
+                                net.minecraft.world.level.levelgen.Heightmap.Types
+                                        .MOTION_BLOCKING);
+                    }
+                    LOG.info("[AIV][SKILL] " + npc.npcName()
+                            + " travel 终点 Y 解析下探拦截（fix177） | 传入="
+                            + goal.toShortString() + " 拦截候选=" + cand.toShortString()
+                            + " 无叶地表=" + groundY + " 改返="
+                            + (bySurface == null ? "原值" : bySurface.toShortString()));
+                    return bySurface == null ? goal : bySurface;
+                }
                 LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 终点 Y 解析 | 传入="
                         + goal.toShortString() + " 解析=" + cand.toShortString()
                         + "（fix114：传入 Y 悬空，沿终点列向下找可站立格）");
@@ -1486,20 +1592,38 @@ public final class SkillRunner {
      * 竖向收尾自有 fix156 宽带接管）。
      */
     private BlockPos resolveSurfaceGoal(BlockPos cell) {
-        int surfaceY = npc.level().getHeight(
-                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING,
-                cell.getX(), cell.getZ());
+        BlockPos bySurface = surfaceStandable(cell.getX(), cell.getZ(),
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING);
+        if (bySurface != null) {
+            return bySurface;
+        }
+        // 【fix177】树冠列：MOTION_BLOCKING 表面是树冠顶，isStandable 拒树叶
+        // 作支撑恒落空，旧版直接回落向下扫被洞穴层劫持（farm141 中间点
+        // (384,64,-186) 解析到 Y=-5、A* 恒超时 6 秒热循环）。先认无叶地表
+        // （树冠下的地面）再回落。
+        bySurface = surfaceStandable(cell.getX(), cell.getZ(),
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES);
+        if (bySurface != null) {
+            return bySurface;
+        }
+        return resolveTravelGoal(cell);
+    }
+
+    /** 某高度图表面 ±3 内第一个可站立格；没有返回 null。 */
+    private BlockPos surfaceStandable(int x, int z,
+            net.minecraft.world.level.levelgen.Heightmap.Types type) {
+        int surfaceY = npc.level().getHeight(type, x, z);
         for (int dy = 0; dy <= 3; dy++) {
-            BlockPos cand = new BlockPos(cell.getX(), surfaceY + dy, cell.getZ());
+            BlockPos cand = new BlockPos(x, surfaceY + dy, z);
             if (PathFinder.isStandable(npc.level(), cand)) {
                 return cand;
             }
-            cand = new BlockPos(cell.getX(), surfaceY - dy, cell.getZ());
+            cand = new BlockPos(x, surfaceY - dy, z);
             if (PathFinder.isStandable(npc.level(), cand)) {
                 return cand;
             }
         }
-        return resolveTravelGoal(cell);
+        return null;
     }
 
     /**
