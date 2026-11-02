@@ -1754,7 +1754,18 @@ public final class ProgressionPlanner {
                 } else if (!isNight() && foodNutrition() < 20
                         && (foodNutrition() <= 12 || reserveFailStreak >= 2)) {
                     if (underground()) {
-                        return skill("回程补给：先回地表", "ascend");
+                        // 【fix191】同储备步：裸派 ascend 无回读会同点死
+                        // 循环，改走 fix154 回地表状态机；已回地表→落回
+                        // 下方触发/派腿，放弃且仍地下→本轮不派。
+                        Step homeAscend = surfaceAscendStep("回程补给：先回地表");
+                        if (homeAscend != null) {
+                            return homeAscend;
+                        }
+                        if (underground()) {
+                            LOG.info("[AIV][PLAN] " + npc.npcName()
+                                    + " 回程补给回地表受阻（fix191） | 横移两轮未脱困，本轮不派回程腿");
+                            return null;
+                        }
                     }
                     LOG.info("[AIV][PLAN] " + npc.npcName()
                             + " 回程补给触发 | 目标=" + (homeFarm != null ? "农场" : "落脚点")
@@ -2480,9 +2491,24 @@ public final class ProgressionPlanner {
             // 都有 underground→ascend 先回地表，唯独步 13 漏了，此处补齐。
             // 夜里升到地表后由步 13 夜闸在下一轮拦，不会半夜地表裸猎。
             if (underground()) {
-                LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备食物 hunt 不在地下派：先回地表 | foodNutrition="
+                // 【fix191】改走 fix154 回读状态机（与步 -1/-0.5 同一台）：
+                // 裸派 ascend 在洞穴口袋里走位恒败、失败零后果，规划层每
+                // ~29 秒原样重派成死循环（farm160 实证：(410,27,-323) 同点
+                // 步数恒 0、连败计数跨派单重置，7 分钟+ 无进展）。状态机带
+                // 结局回读+同点连败 3 次 strip 横移 8 格换列+材料轮次（fix182）
+                // +两轮横移放弃。已回地表→返回 null 落下方地表口径；放弃且
+                // 仍在地下→本轮不派（落后续步），下轮从新列重试。
+                Step reserveAscend = surfaceAscendStep("储备食物：先回地表");
+                if (reserveAscend != null) {
+                    return reserveAscend;
+                }
+                if (underground()) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 储备食物回地表受阻（fix191） | 横移两轮未脱困，本轮不派 hunt（落后续步）");
+                    return null;
+                }
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备食物：已回地表，续派 hunt | foodNutrition="
                         + foodNutrition());
-                return skill("储备食物：先回地表", "ascend");
             }
             // 【fix39·夜晚总闸】储备是顺路型软向导：夜里地表不为囤食远行打
             // 猎，落到补仓/维持步，天亮再补。挨饿急救走步 0/6.6，不经这里。
@@ -2494,56 +2520,35 @@ public final class ProgressionPlanner {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 储备食物退避中，让位主线 | 连败=" + reserveFailStreak
                         + " 退避余秒=" + (reserveBackoffUntil - System.currentTimeMillis()) / 1000L
                         + " foodNutrition=" + foodNutrition());
+            } else if (planHas(StagePlan.PORTAL_PREP) && eyes < 12
+                    && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20
+                    && (!portalBuiltKnown() || goals.nearbyPortal() != null)) {
+                // 【fix193】储备软向导让位下界链：fix96 入境闸已满足且门未
+                // 建成（或亮门在侧待入）时，本轮不派储备 hunt，落 13.3/13.5
+                // 推进建门。fix189 后有获 hunt 不再喂连败退避，储备填到 40
+                // 前步 13 每轮必派 hunt——fix190 把下界链提了序，仍被步 13
+                // 本身饿死（farm162 实证：nutrition 过 20 后 hunt 仍连派、
+                // 建门链等不到 decide）。储备是软向导（Fong 口径：软数不许
+                // 硬卡主线），闸已过即算够用；门成之后本让位自动失效（亮门
+                // 在侧的待入情形除外），储备照常补到 40。
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 储备食物让位下界链（fix193） | 入境口粮闸已过 food="
+                        + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
+                        + "（储备未满 40，先建门）");
             } else {
                 return goal("储备食物", "hunt",
                         params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
             }
         }
 
-        // 13.3) 常备补仓（【fix38】顺路型软向导，Fong 04:11/04:14）：主线步骤都
-        // 走完才轮到这里——原木补到 LOG_RESERVE_TARGET（实物计数）、铁
-        // （生铁+铁锭）补到 INGOT_RESERVE_TARGET。只填空档、永不挡主线；
-        // 下潜硬门（木料安全线/口粮门/铁镐耐久门）在各自位置另行把关，
-        // 与补仓互不替代。挖铁补仓单趟封顶 16，防一趟挖太久变相常驻。
-        // 【fix39·夜晚总闸】原木补仓同为顺路型：夜里地表跳过，天亮再补；
-        // 挖铁补仓走地下、不受影响。
-        if (planHas(StagePlan.WOOD_RESERVE) && logs < LOG_RESERVE_TARGET && !underground() && !isNight()) {
-            return gatherLogs("原木常备补仓");
-        }
-        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < INGOT_RESERVE_TARGET
-                && hasStonePickaxe) {
-            return goal("铁储备补仓", "dig",
-                    params("resource", "iron", "count",
-                            Math.min(16, INGOT_RESERVE_TARGET - rawIron - ingots)));
-        }
-
-        // 13.35) 【fix182】垫脚料常备：圆石/泥土等可放置方块是 ascend 垫脚、
-        // 搭桥、脱困的物质前提——fix89 只保护不丢、没人保证带够，存量见底
-        // 时悬空点 ascend 以「没有垫脚方块」收场（#40 型死局）。软向导
-        // 口径：存量 <16 只在主线空档补一趟石（dig 自有连败换区兜底），
-        // 不设硬门、不挡主线。
-        if (buildBlocks < 16) {
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 垫脚料常备触发 | 可放置方块="
-                    + buildBlocks + "（<16，补一趟石）");
-            return goal("垫脚料常备补给", "dig",
-                    params("resource", "stone", "count", 16));
-        }
-
-        // 13.5) 下界传送门准备（通关路线的前置门槛）。
-        // 顺序严格照玩家做法：铁桶 -> 装水 -> 挖燧石 -> 打火石 -> 钻石镐浇铸 20 黑曜石 -> 建门进入。
-        // 这里用"眼睛不足 12 个"作为整个通关链的入口条件：
-        // 已经有 12 只眼睛说明下界阶段完成了，不应该再回头造门。
-        //
-        // 【模式分界】安稳发育模式到此为止：钻石套已齐（13.1 走完）、食物储备已在上面处理，
-        // 之后只维持生存，不再进入下界/末地线。通关模式不受影响，继续往下走原链。
-        // sustain 是终点站语义（第七轮起由计划决定，不再只看模式）：计划里有 sustain
-        // 且没启用任何后期阶段时，到此停步进维持循环；后期阶段同时启用时 sustain
-        // 不触发（StagePlan.resolvePlan 已在加载时打过 plan-note 提醒）。
-        boolean lateStagesEnabled = planHas(StagePlan.PORTAL_PREP) || planHas(StagePlan.NETHER)
-                || planHas(StagePlan.STRONGHOLD) || planHas(StagePlan.END);
-        if (planHas(StagePlan.SUSTAIN) && !lateStagesEnabled) {
-            return sustainStep(food, hasSword, wood);
-        }
+        // 【fix190】13.5 下界链提序至此（原在 13.3/13.35 之后）：常备补仓
+        // （原木<32/铁<32）与垫脚料补给排在建门链之前、又无退避让位，材料
+        // 齐备后 decide 仍被补仓长目标（采木/挖铁 300s+）轮占，浇铸黑曜石
+        // 永不派单（farm159 实证：入境闸日志 0 次、13.5 从未抵达）。与
+        // fix157（钻镐提序越补仓）、fix160（甲维护让位）同型处置：软向导
+        // 不许硬卡主线。兜底不缺：fix96 口粮闸在块内随行（跌破即跳过本
+        // 块、落回步 13 储备 hunt 补给）、步 0 真饿仍居首、垫脚料有
+        // fix182 ascend 取材轮次兜底。
         // 【fix96·审计C】入境口粮软闸：步 13 储备（目标营养 40）排在本段之前，
         // 白天路径营养已被顶住；漏口在夜里——步 13 被夜晚总闸只记日志跳过、
         // 直落本段带着低口粮建门/进门，下界没有计划内食物来源。整段加软闸：
@@ -2609,6 +2614,53 @@ public final class ProgressionPlanner {
                 return goal("浇铸黑曜石", "obsidian", params("count", 20));
             }
             return goal("建造传送门", "portal", params());
+        }
+
+        // 13.3) 常备补仓（【fix38】顺路型软向导，Fong 04:11/04:14）：主线步骤都
+        // 走完才轮到这里——原木补到 LOG_RESERVE_TARGET（实物计数）、铁
+        // （生铁+铁锭）补到 INGOT_RESERVE_TARGET。只填空档、永不挡主线；
+        // 下潜硬门（木料安全线/口粮门/铁镐耐久门）在各自位置另行把关，
+        // 与补仓互不替代。挖铁补仓单趟封顶 16，防一趟挖太久变相常驻。
+        // 【fix39·夜晚总闸】原木补仓同为顺路型：夜里地表跳过，天亮再补；
+        // 挖铁补仓走地下、不受影响。
+        if (planHas(StagePlan.WOOD_RESERVE) && logs < LOG_RESERVE_TARGET && !underground() && !isNight()) {
+            return gatherLogs("原木常备补仓");
+        }
+        if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < INGOT_RESERVE_TARGET
+                && hasStonePickaxe) {
+            return goal("铁储备补仓", "dig",
+                    params("resource", "iron", "count",
+                            Math.min(16, INGOT_RESERVE_TARGET - rawIron - ingots)));
+        }
+
+        // 13.35) 【fix182】垫脚料常备：圆石/泥土等可放置方块是 ascend 垫脚、
+        // 搭桥、脱困的物质前提——fix89 只保护不丢、没人保证带够，存量见底
+        // 时悬空点 ascend 以「没有垫脚方块」收场（#40 型死局）。软向导
+        // 口径：存量 <16 只在主线空档补一趟石（dig 自有连败换区兜底），
+        // 不设硬门、不挡主线。
+        if (buildBlocks < 16) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 垫脚料常备触发 | 可放置方块="
+                    + buildBlocks + "（<16，补一趟石）");
+            return goal("垫脚料常备补给", "dig",
+                    params("resource", "stone", "count", 16));
+        }
+
+        // 13.5) 下界传送门准备（通关路线的前置门槛）。
+        // 【fix190】链体（fix96 闸+金靴/桶/打火石/黑曜石/建门）已提序到步 13
+        // 之后、13.3 之前（见上方 fix190 注）；此处只余模式分界守卫。
+        // 顺序严格照玩家做法：铁桶 -> 装水 -> 挖燧石 -> 打火石 -> 钻石镐浇铸 20 黑曜石 -> 建门进入。
+        // 这里用"眼睛不足 12 个"作为整个通关链的入口条件：
+        // 已经有 12 只眼睛说明下界阶段完成了，不应该再回头造门。
+        //
+        // 【模式分界】安稳发育模式到此为止：钻石套已齐（13.1 走完）、食物储备已在上面处理，
+        // 之后只维持生存，不再进入下界/末地线。通关模式不受影响，继续往下走原链。
+        // sustain 是终点站语义（第七轮起由计划决定，不再只看模式）：计划里有 sustain
+        // 且没启用任何后期阶段时，到此停步进维持循环；后期阶段同时启用时 sustain
+        // 不触发（StagePlan.resolvePlan 已在加载时打过 plan-note 提醒）。
+        boolean lateStagesEnabled = planHas(StagePlan.PORTAL_PREP) || planHas(StagePlan.NETHER)
+                || planHas(StagePlan.STRONGHOLD) || planHas(StagePlan.END);
+        if (planHas(StagePlan.SUSTAIN) && !lateStagesEnabled) {
+            return sustainStep(food, hasSword, wood);
         }
 
         // 13.2) 弓与箭：末地的水晶几乎都在高柱上，必须远程拆。

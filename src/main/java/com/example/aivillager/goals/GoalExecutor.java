@@ -327,6 +327,10 @@ public final class GoalExecutor {
      * （宽河岸平地热循环无人收场的兜底），见 tickTravel。 */
     private int travelStallAnyCount;
     private double travelStallLastHorizontal = -1.0D;
+    /** 【fix192】上次派单时 NPC 高度：高空起点死线（fix156）的高度收敛口径——
+     * 高出目标层 >12 时，两派单间高度没降 ≥2 格即视为高度不收敛，水平推进
+     * 不许清高空停滞账（高空搭桥棘轮实证，见 tickTravel）。 */
+    private double travelStallLastY = -1.0D;
     private double travelStallTargetX = Double.NaN;
     private double travelStallTargetZ = Double.NaN;
     /** 传送门选址结果：origin 是框架左下角，alongX 表示门面横向沿 X 轴。 */
@@ -4631,6 +4635,21 @@ public final class GoalExecutor {
                 return;
             }
             if (huntAttempts >= 8) {
+                // 【fix189】按存量增量判成败（Fong 口径「判定成败按存量增量」）：
+                // 起始存量 chaseBaseline（fix106 同源、目标起始捕获）在任，
+                // 本轮净增 >0 说明本地 hunt 喂得动它——未达标只是靶高，
+                // 不算失败：中性收工、不自增 huntFailStreak，规划层两侧
+                // 连败（步 0 hungerHuntFailStreak、步 13 reserveFailStreak
+                // 均按 goalFailed 消费本结局）一并不喂。零增/净减（打猎
+                // 期间吃掉存量等）照旧判放弃，兜底不缺。旧版只认
+                // stock>=target 一刀切：存量 3→21（靶 24）亦判放弃，
+                // 连败虚高放大饥饿接缝循环（第五十二棒实证 7/12、21/24）。
+                int gained = stock - chaseBaseline;
+                if (gained > 0) {
+                    finish("狩猎收工（有获 +" + gained + "，存量 " + stock + "/"
+                            + huntStockTarget + " 未达标）");
+                    return;
+                }
                 huntFailStreak++;
                 finish("狩猎放弃（存量未达标 " + stock + "/" + huntStockTarget
                         + "）：连续 8 次没找到目标");
@@ -4664,6 +4683,12 @@ public final class GoalExecutor {
             return;
         }
         if (huntAttempts >= 8) {
+            // 【fix189】计数分支同口径：本轮新得 have>0 按增量判有获
+            // 收工（不喂连败）；have=0 才是真打不着，照旧判放弃。
+            if (have > 0) {
+                finish("狩猎收工（有获 " + have + "/" + targetCount + "，未达标）");
+                return;
+            }
             huntFailStreak++;
             finish("狩猎放弃：连续 8 次附近没有可猎动物");
             return;
@@ -6053,29 +6078,47 @@ public final class GoalExecutor {
             travelStallCount = 0;
             travelStallAnyCount = 0;
             travelStallLastHorizontal = -1.0D;
+            travelStallLastY = -1.0D;
         }
         travelStallTargetX = travelX;
         travelStallTargetZ = travelZ;
         if (travelStallLastHorizontal >= 0.0D) {
+            boolean highAbove = npc.getY() - travelY > 12.0D;
+            // 【fix192】高度不收敛口径：高出目标层 >12 且两派单间高度没降
+            // ≥2 格时，水平推进不算真推进——farm161 实证：自恢复栈顶
+            // Y=199 出发回农场（目标层 62），travel 水平腿以当前高度为
+            // 目标 Y（本段下方注释的既有口径，前提是人站在地形上），在
+            // 空中搭桥棘轮反爬到 Y=293，水平距却在缩，fix156 的「无推进」
+            // 死线永远不触发。玩家从高柱去低处是先下到地面再走，不会
+            // 在 130 格高空搭桥横移。高度不收敛时不清高空账、照样累加，
+            // 满 3 次走下方 descend 先下行；正常下山高度逐段收敛不误伤。
+            boolean altitudeStuck = highAbove && travelStallLastY >= 0.0D
+                    && npc.getY() > travelStallLastY - 2.0D;
             if (horizontalNow <= travelStallLastHorizontal - 2.0D) {
-                travelStallCount = 0;
                 travelStallAnyCount = 0;
+                if (altitudeStuck) {
+                    travelStallCount++;
+                } else {
+                    travelStallCount = 0;
+                }
             } else {
                 // 【fix186】无推进（<2 格）时平地计数同步累加（fix156 的
                 // travelStallCount 仍只在高出 >12 格时累加、口径不变）。
                 travelStallAnyCount++;
-                if (npc.getY() - travelY > 12.0D) {
+                if (highAbove) {
                     travelStallCount++;
                 }
             }
         }
         travelStallLastHorizontal = horizontalNow;
+        travelStallLastY = npc.getY();
         if (travelStallAnyCount >= 6) {
             // 【fix186】平地停滞收场：宽河岸实证旧版每 6 秒同参重派、
             // 烧 attempts 240 帽≈24 分钟（farm152 (486,65,-208) 74+ 轮）。
             // 连续 6 次派单推进 <2 格即诚实收场，交规划层退避/换路。
             travelStallAnyCount = 0;
             travelStallLastHorizontal = -1.0D;
+            travelStallLastY = -1.0D;
             LOG.info("[AIV][GOAL] " + npc.npcName() + " 长途停滞收场（fix186） | 水平="
                     + Math.round(horizontalNow) + " 目标=" + Math.round(travelX) + ","
                     + Math.round(travelZ) + "（连续 6 次派单推进 <2 格，交规划层退避/换路）");
@@ -6085,6 +6128,7 @@ public final class GoalExecutor {
         if (travelStallCount >= 3) {
             travelStallCount = 0;
             travelStallLastHorizontal = -1.0D;
+            travelStallLastY = -1.0D;
             LOG.info("[AIV][GOAL] " + npc.npcName() + " 高空起点先下行（fix156） | 水平="
                     + Math.round(horizontalNow) + " 高出目标="
                     + Math.round(npc.getY() - travelY) + "，改派 descend 至目标层");
