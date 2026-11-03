@@ -115,6 +115,46 @@ public final class FarmMemory {
         return farm(npcName) != null;
     }
 
+    /**
+     * 【fix198】该格是不是本 NPC 注册田格的土、或土正上方一格（作物位）：
+     * 身体层 mine 农田守卫用。farm164/166/167 三度实证：dig 的 descend 以
+     * 当前位置为井口原地开挖，NPC 站在自家田上时楼梯井斜穿田面、把耕地
+     * 连土带苗挖成空气（每次恰死 2 格、土成空气后补锄无从下手），田格
+     * 注册数 8→6→4→2 一路缩水至全毁重开。
+     */
+    public static boolean isFarmCell(String npcName, BlockPos pos) {
+        Farm farm = farm(npcName);
+        if (farm == null) {
+            return false;
+        }
+        for (Cell cell : farm.cells()) {
+            if (cell.x() == pos.getX() && cell.z() == pos.getZ()
+                    && (cell.y() == pos.getY() || cell.y() + 1 == pos.getY())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 【fix198】该位水平 Chebyshev 距离 radius 内（层差 ≤2）有没有本 NPC 的
+     * 注册田格：descend 井口避让用——站位离田太近不开井、先挪开。
+     */
+    public static boolean nearFarmCells(String npcName, BlockPos pos, int radius) {
+        Farm farm = farm(npcName);
+        if (farm == null) {
+            return false;
+        }
+        for (Cell cell : farm.cells()) {
+            if (Math.abs(cell.y() - pos.getY()) <= 2
+                    && Math.max(Math.abs(cell.x() - pos.getX()),
+                            Math.abs(cell.z() - pos.getZ())) <= radius) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 落盘一块田（开田完成/维护后格子变更都走这里）。 */
     public static synchronized void save(String npcName, Farm farm) {
         BY_NPC.put(npcName, farm);

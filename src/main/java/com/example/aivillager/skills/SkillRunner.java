@@ -755,10 +755,17 @@ public final class SkillRunner {
                 // Y 活动幅度 ≤0.1 格且水平格不变，按已站稳放行并清走位状态；
                 // 真下落时 Y 幅度数格、真行走时锚格每轮在变，窗口都会被重置，
                 // 不会误放（与 descend 放行同一安全论证）。
+                // 【fix209】窗口参数对齐 descend 第四十一轮实证修正值：幅度
+                // 0.1→0.25（台阶边缘微幅蠕动常在 0.1~0.2，旧阈值整局零放行——
+                // 本窗口放行行自上线以来各长跑 boot 零触发、farm179 实证同点
+                // 超时 19 次连环）；格锚重置放宽到移位 ≥2 格才重置（站在格
+                // 边界上 blockPosition 双格振荡是台阶楔住的常态，±1 格抖动
+                // 不算移动；真行走 6 秒必移 ≥2 格、仍会重置，不误放）。
                 BlockPos cellNow = npc.blockPosition();
                 double yNow = npc.getY();
                 if (settleCellX == Integer.MIN_VALUE
-                        || cellNow.getX() != settleCellX || cellNow.getZ() != settleCellZ
+                        || Math.abs(cellNow.getX() - settleCellX) >= 2
+                        || Math.abs(cellNow.getZ() - settleCellZ) >= 2
                         || Double.isNaN(settleMinY)) {
                     settleCellX = cellNow.getX();
                     settleCellZ = cellNow.getZ();
@@ -768,7 +775,7 @@ public final class SkillRunner {
                 } else {
                     settleMinY = Math.min(settleMinY, yNow);
                     settleMaxY = Math.max(settleMaxY, yNow);
-                    if (settleMaxY - settleMinY > 0.1D) {
+                    if (settleMaxY - settleMinY > 0.25D) {
                         settleMinY = yNow;
                         settleMaxY = yNow;
                         settleRounds = 0;
@@ -791,7 +798,10 @@ public final class SkillRunner {
                     npc.stopWalking();
                     stepFails++;
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " ore-reach 等待落定超时 | mode=" + mode
-                            + " 连续失败=" + stepFails);
+                            + " 连续失败=" + stepFails
+                            + " 窗口幅=" + (Double.isNaN(settleMinY) ? "?"
+                                    : String.format(java.util.Locale.ROOT, "%.2f", settleMaxY - settleMinY))
+                            + " 格=" + npc.blockPosition().toShortString());
                     if (stepFails >= 6) {
                         failReach("多次等待落定超时");
                     }
@@ -1355,6 +1365,11 @@ public final class SkillRunner {
         tasks.add(Bukkit.getScheduler().runTaskTimer(plugin, new Runnable() {
             private int noPathRounds;
             private int lastLogTick;
+            // 【fix202】无菌重规划计数：issuedPos 记上次 followPath 的发路位置；
+            // 路径走完/被身体 abort 后水平位移 <1 格 = 原地打转（台阶高差
+            // abort 热循环），连续 2 次后本轮改走 travelStepToward 挖/搭兜底。
+            private BlockPos issuedPos;
+            private int sterileReplans;
             // 【fix138】中间点解析缓存：原始中间点格位移 <4 格时复用上次解析，
             // 防原地失败时每 0.5 秒重跑 resolveTravelGoal 的深扫（260 格）+刷日志。
             private BlockPos chunkCell;
@@ -1391,6 +1406,29 @@ public final class SkillRunner {
                 // 正在走就先让它走完这一小段，每 tick 重算路径会把身体锁死在原地。
                 if (npc.isFollowingPath() || npc.isWalking()) {
                     return;
+                }
+                // 【fix202】结算上一条路的产量：人没挪窝（<1 格）就是无菌
+                // 重规划（身体高差 abort 后技能层无状态重喂同一条路，farm168
+                // (327,-69) 同点热循环约 20 分钟实证）。连续 2 次无菌，本轮
+                // 先走挖/搭一步的玩家式兜底；兜底也失败则清零照常 A*，诚实
+                // 失败仍有 noPathRounds 与目标看门狗收尾，不另设死路。
+                if (issuedPos != null) {
+                    double movedDx = npc.getX() - (issuedPos.getX() + 0.5D);
+                    double movedDz = npc.getZ() - (issuedPos.getZ() + 0.5D);
+                    if (movedDx * movedDx + movedDz * movedDz < 1.0D) {
+                        sterileReplans++;
+                    } else {
+                        sterileReplans = 0;
+                    }
+                    issuedPos = null;
+                }
+                if (sterileReplans >= 2) {
+                    LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 无菌重规划改走挖/搭一步（fix202）"
+                            + " | 位置=" + npc.blockPosition().toShortString());
+                    sterileReplans = 0;
+                    if (travelStepToward(targetX, targetZ)) {
+                        return;
+                    }
                 }
                 BlockPos goal = pathGoal;
                 // 【fix138】长途分段寻路：水平 >24 格时本轮只搜朝终点方向 24 格的
@@ -1500,6 +1538,7 @@ public final class SkillRunner {
                 if (result.found() && result.path().size() >= 2) {
                     noPathRounds = 0;
                     npc.followPath(result.path(), true, null, null);
+                    issuedPos = npc.blockPosition();
                     if (npc.level().getServer().getTickCount() - lastLogTick > 200) {
                         lastLogTick = npc.level().getServer().getTickCount();
                         LOG.info("[AIV][SKILL] " + npc.npcName() + " travel 找到路径 | 剩余="
@@ -1720,6 +1759,48 @@ public final class SkillRunner {
         return true;
     }
 
+    /**
+     * 【fix194】流体脱困垫柱入口（生存层调用）：全淹水囊里游不动、横挖也无推进时，
+     * 玩家会脚下垫块逐格把自己垫出水面。此处只负责「垫一格」：目标=脚下一格，
+     * 须为空气/流体且再下一格有支撑（实心碰撞），选料/消耗/自放登记与
+     * placeBuildingBlockAt 同款；顶升与节奏由生存层负责。每放一格脚下支撑面上移
+     * 一格，天然逐格不同位，不套用搭桥的同格 60 tick 去重。无料/无支撑/已是
+     * 实心时诚实返回 false。
+     */
+    public boolean placeFluidPillarStep() {
+        BlockPos feet = npc.blockPosition();
+        BlockPos target = feet.below();
+        net.minecraft.world.level.block.state.BlockState targetState =
+                npc.level().getBlockState(target);
+        if (!targetState.isAir() && targetState.getFluidState().isEmpty()) {
+            return false;
+        }
+        BlockPos support = target.below();
+        if (npc.level().getBlockState(support)
+                .getCollisionShape(npc.level(), support).isEmpty()) {
+            return false;
+        }
+        String path = pickBuildingBlock();
+        if (path == null) {
+            return false;
+        }
+        Item item = itemOf(path);
+        Block block = blockOf(path);
+        if (item == null || block == null || countItem(path) <= 0) {
+            return false;
+        }
+        consumeItem(path, 1);
+        npc.level().setBlockAndUpdate(target, block.defaultBlockState());
+        long nowTick = npc.level().getGameTime();
+        lastBridgePos = target;
+        lastBridgeTick = nowTick;
+        SELF_PLACED.put(target, nowTick);
+        SELF_PLACED.values().removeIf(t -> nowTick - t > 400L);
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " fluid-pillar | block=" + path
+                + " pos=" + target.toShortString());
+        return true;
+    }
+
     /** 背包里是否有弓，且箭至少 1 支。 */
     private boolean hasBowAndArrow() {
         return countItem("bow") > 0 && countItem("arrow") > 0;
@@ -1830,6 +1911,39 @@ public final class SkillRunner {
      * 阶梯通道每步只降 1 格，随时能走回去，也是玩家最常用的下矿方式。
      * 每一步先检查前方/下方是不是流体或基岩，遇到就转 90 度，避免挖进岩浆。
      */
+    /**
+     * 【fix198】为 descend 找避开自家农田的井口列：自 NPC 脚位向外 3..6 格扫
+     * 8 向，要求该列离任一注册田格 ≥3（nearFarmCells 半径 2 不命中）、脚下是
+     * 实心非耕地非液体、身位两格无碰撞。找不到返回 null（调用方避让收场）。
+     */
+    private Vec3 findFarmRelocColumn() {
+        BlockPos feet = npc.blockPosition();
+        int[][] dirs8 = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+        for (int r = 3; r <= 6; r++) {
+            for (int[] d : dirs8) {
+                BlockPos cand = feet.offset(d[0] * r, 0, d[1] * r);
+                if (com.example.aivillager.goals.FarmMemory.nearFarmCells(
+                        npc.npcName(), cand, 2)) {
+                    continue;
+                }
+                net.minecraft.world.level.block.state.BlockState ground =
+                        npc.level().getBlockState(cand.below());
+                if (ground.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock
+                        || ground.is(net.minecraft.world.level.block.Blocks.FARMLAND)
+                        || ground.getCollisionShape(npc.level(), cand.below()).isEmpty()) {
+                    continue;
+                }
+                if (!npc.level().getBlockState(cand).getCollisionShape(npc.level(), cand).isEmpty()
+                        || !npc.level().getBlockState(cand.above())
+                                .getCollisionShape(npc.level(), cand.above()).isEmpty()) {
+                    continue;
+                }
+                return new Vec3(cand.getX() + 0.5D, cand.getY(), cand.getZ() + 0.5D);
+            }
+        }
+        return null;
+    }
+
     private boolean runDescend(Intent intent, int id) {
         int targetY = intent.intParam("y", 16);
         int maxSteps = Math.max(10, Math.min(300, intent.intParam("steps", 260)));
@@ -1875,6 +1989,18 @@ public final class SkillRunner {
             private double lastRealY = Double.NaN;
             private int stepsAtLastReal = -1;
             private int roundsWithoutRealDescent;
+            /**
+             * 【fix211】崖面转换（脚下垂直下挖穿岩）状态：阶梯步在涨但真降
+             * 断档（fix113 三件套）时，沿崖横漂永远有一向可站、unsafeTurns
+             * 集不满四向，垂直下挖分支轮不到（farm183 第二/四轮同崖面
+             * 实证）。断档过半看门狗窗口且脚下是可挖实块时，一次性转
+             * 脚下穿岩：shaftMode 下每 tick 走既有垂直下挖动作与结算，
+             * 真降恢复或脚下转空/流体或级数到帽即回阶梯逻辑。
+             */
+            private boolean shaftTried;
+            private boolean shaftMode;
+            private int shaftSteps;
+            private double shaftStartY = Double.NaN;
             /** 总进度看门狗：步数不变的轮数（每轮 3 tick）。见 run() 开头说明。 */
             private int lastStepsSeen;
             private int roundsWithoutProgress;
@@ -1925,11 +2051,55 @@ public final class SkillRunner {
              * （150 轮×3 tick）仍在水里就快速认输，让目标层换区挖干地。
              */
             private int waterRounds;
+            /**
+             * 【fix198】井口避让自家农田的状态：-1=未判定，0=正在挪井口，1=已就绪。
+             * descend 以当前位置为井口原地开挖，NPC 站在自家田上被派 dig 时
+             * 楼梯井会斜穿田面挖穿耕地（farm164/166/167 三度实证、各死 2 格）。
+             * 开挖前先判：脚位离注册田格 ≤2 格就横挪到 3 格外的安全列再开挖
+             * （走原版行走、不传送）；挪不开/挪超时以避让 outcome 收场。
+             * 身体层 mine-farm-guard 是第二道：井道半途撞进田同样拒挖+避让收场。
+             */
+            private int farmRelocPhase = -1;
+            private Vec3 farmRelocTarget;
+            private int farmRelocRounds;
 
             @Override
             public void run() {
                 if (runId != id) {
                     return;
+                }
+                if (farmRelocPhase < 0) {
+                    farmRelocPhase = 1;
+                    com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+                    if (com.example.aivillager.goals.FarmMemory.nearFarmCells(
+                            npc.npcName(), npc.blockPosition(), 2)) {
+                        farmRelocTarget = findFarmRelocColumn();
+                        if (farmRelocTarget == null) {
+                            finish(id, "descend", "农田避让收场：井口在自家田里且附近无安全井口 Y="
+                                    + Math.round(npc.getY()));
+                            return;
+                        }
+                        farmRelocPhase = 0;
+                        LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 农田避让 | 井口离自家田太近，先挪到 "
+                                + String.format(java.util.Locale.ROOT, "%.1f,%.1f",
+                                        farmRelocTarget.x, farmRelocTarget.z));
+                    }
+                }
+                if (farmRelocPhase == 0) {
+                    double rdx = npc.getX() - farmRelocTarget.x;
+                    double rdz = npc.getZ() - farmRelocTarget.z;
+                    if (rdx * rdx + rdz * rdz < 0.81D) {
+                        farmRelocPhase = 1;
+                    } else if (++farmRelocRounds > 200) {
+                        finish(id, "descend", "农田避让收场：挪井口超时 Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    } else {
+                        if (!npc.isWalking()) {
+                            npc.walkTo(farmRelocTarget, false, null);
+                        }
+                        return;
+                    }
                 }
                 if (npc.isInWater()) {
                     if (++waterRounds > 150) {
@@ -1977,6 +2147,32 @@ public final class SkillRunner {
                     finish(id, "descend", "无实际下降（步数=" + steps
                             + " 但高度约 90 秒未降） Y=" + Math.round(npc.getY()));
                     return;
+                }
+                // 【fix211】崖面转换触发：步数在涨、真降断档过半个看门狗
+                // 窗口（约 45 秒）、脚下是可挖实块（非空气/流体/基岩/
+                // 钟乳石链）——判定为崖面横漂陷阱，转脚下穿岩模式。
+                // 只转一次：穿岩仍不降则由 fix113 看门狗照旧收场，兜底不缺。
+                // 【fix211b】站立判定放宽：楔挂型陷阱 onGround 恒 false
+                // （farm184 洞内 (304,45,-205) 实证：站立窗口不足 45 秒
+                // 即楔住、原条件永远轮不到）；airTotalRounds>200 是悬空
+                // 总死线已放行、主流程本就按已站稳处理的状态，同等受理。
+                if (!shaftTried && !shaftMode && roundsWithoutRealDescent > 300
+                        && steps > stepsAtLastReal
+                        && (npc.onGround || airTotalRounds > 200)) {
+                    BlockPos shaftBelow = npc.blockPosition().below();
+                    BlockState shaftBelowState = npc.level().getBlockState(shaftBelow);
+                    if (!shaftBelowState.isAir() && !isFluid(shaftBelowState)
+                            && !shaftBelowState.is(Blocks.BEDROCK)
+                            && stalactiteHazard(shaftBelow) == null) {
+                        shaftTried = true;
+                        shaftMode = true;
+                        shaftSteps = 0;
+                        shaftStartY = npc.getY();
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 崖面转换 | 横漂多步无真降，改脚下垂直下挖穿岩"
+                                + " 脚下=" + shaftBelowState.getBlock()
+                                + " Y=" + Math.round(npc.getY()));
+                    }
                 }
                 // 诊断心跳（第八轮补充）：descend 曾出现"步数看门狗按时收手、但中间
                 // 3 分钟零日志零挖掘"的静默卡死，所有动作分支都会打日志，唯独等待类
@@ -2171,6 +2367,35 @@ public final class SkillRunner {
                 }
 
                 BlockPos feet = npc.blockPosition();
+                // 【fix211】崖面穿岩模式：与既有垂直下挖同动作同结算（挖
+                // 脚下一格、重力带落一级、lastTarget 走上方结算分支）。
+                // 退出条件：脚下转空/流体/基岩/钟乳石链（岩层性状变了、
+                // 交回阶梯逻辑重评）、自转换点真降 ≥8 格（已穿过崖面带）、
+                // 或穿岩 16 级到帽（防异常深穿，退出后看门狗仍在）。
+                if (shaftMode) {
+                    BlockPos shaftFeet = feet.below();
+                    BlockState shaftState = npc.level().getBlockState(shaftFeet);
+                    if (shaftState.isAir() || isFluid(shaftState)
+                            || shaftState.is(Blocks.BEDROCK)
+                            || stalactiteHazard(shaftFeet) != null
+                            || npc.getY() <= shaftStartY - 8.0D
+                            || shaftSteps >= 16) {
+                        shaftMode = false;
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 崖面转换结束 | 回阶梯逻辑 穿岩级数=" + shaftSteps
+                                + " Y=" + Math.round(npc.getY()));
+                    } else {
+                        stepStartY = feet.getY();
+                        npc.mineWithBestTool(shaftFeet);
+                        lastTarget = shaftFeet;
+                        settleRecentered = false;
+                        shaftSteps++;
+                        LOG.info("[AIV][SKILL] " + npc.npcName()
+                                + " descend 垂直下挖（崖面转换）| 脚下=" + shaftState.getBlock()
+                                + " 级数=" + shaftSteps + " Y=" + feet.getY());
+                        return;
+                    }
+                }
                 int[] dir = dirs[dirIndex % dirs.length];
                 BlockPos ahead = feet.offset(dir[0], 0, dir[1]);
                 BlockPos aheadHead = ahead.above();
@@ -2328,6 +2553,21 @@ public final class SkillRunner {
                 // 挖完立刻检查：下一格的脚部如果还有碰撞，说明镐子碎了或方块挖不动。
                 // 这时候再 walkTo 只会白等 4 秒并被判卡住，直接转向更省时间。
                 if (!npc.level().getBlockState(nextFeet).getCollisionShape(npc.level(), nextFeet).isEmpty()) {
+                    // 【fix196】分级守卫礼让（石镐可合、拒用高级镐）不是挖不动：
+                    // 立即礼让收场交规划层补造，不喂挖不动连败、outcome 不带
+                    // "缺少镐"字样免触发 fix109 速断（staging fix195e 实证全链）。
+                    if (npc.mineRefusedByTierGuardRecently()) {
+                        finish(id, "descend", "礼让收场：分级守卫拒用高级镐（石镐可合），交规划层补造石镐 Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    }
+                    // 【fix198】农田守卫拒挖同理不是挖不动：井道半途撞进自家
+                    // 田（井口避让只管起点），避让收场、不喂挖不动连败。
+                    if (npc.mineRefusedByFarmGuardRecently()) {
+                        finish(id, "descend", "农田避让收场：井道撞进自家农田，拒挖田格 Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    }
                     dirIndex++;
                     failedSteps++;
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " descend 挖不动 | 下一格="
@@ -3056,6 +3296,18 @@ public final class SkillRunner {
                 npc.mineWithBestTool(ahead.above());
                 // 挖完还挡着：镐子碎了或这块挖不动，继续 walkTo 只是空等卡住。
                 if (!npc.level().getBlockState(ahead).getCollisionShape(npc.level(), ahead).isEmpty()) {
+                    // 【fix196】同 descend：分级守卫礼让不算挖不动，立即收场交补造。
+                    if (npc.mineRefusedByTierGuardRecently()) {
+                        end("礼让收场：分级守卫拒用高级镐（石镐可合），交规划层补造石镐 Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    }
+                    // 【fix198】同 descend：农田守卫拒挖不算挖不动，避让收场。
+                    if (npc.mineRefusedByFarmGuardRecently()) {
+                        end("农田避让收场：矿道撞进自家农田，拒挖田格 Y="
+                                + Math.round(npc.getY()));
+                        return;
+                    }
                     dirIndex++;
                     failedSteps++;
                     LOG.info("[AIV][SKILL] " + npc.npcName() + " strip 挖不动 | 前方="
@@ -3677,10 +3929,13 @@ public final class SkillRunner {
             PathFinder.Result path = PathFinder.find(npc.level(), npc.blockPosition(), stand,
                     !npc.wearingLeatherBoots());
             if (!path.found()) {
-                finish(id, "mineobsidian", mined > 0
-                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
-                        : "mineobsidian 未挖到 reason=到不了岩浆边 stand="
-                        + stand.toShortString());
+                // 【fix222】走路 A* 无路 ≠ 到不了：提示点在地下深处时站位
+                // 隔着整片岩层，walk-only 必然 found=false，旧版就地秒收
+                // 「到不了岩浆边」（farm196 实证：人已到 (262,-52,-184)、
+                // 站位 (237,-53,-167) 只隔 30 格深板岩被秒拒、目标层一秒
+                // 一败热循环）。改走挖路兜底（fillbucket 同款成例）：直线
+                // 挖到站位再续浇。挖路自身失败才落回原来的诚实收尾。
+                startObsidianDigAdvance(id, stand, pour, mined, want);
                 return;
             }
             npc.followPath(path.path(), false, pour, () -> {
@@ -3697,6 +3952,110 @@ public final class SkillRunner {
      * 高度优先：先找脚比岩浆面高 2 格的（站在高一格的岸上，水漫不到），
      * 再退高 1 格/同层/低层——浇出的水在岩浆面上层横流，同层岸边站位
      * 会被水流推走（staging 实证被冲下地形）。 */
+    /**
+     * 【fix222】浇水周期站位的挖路兜底：走路 A* 找不到路（站位隔着整片
+     * 岩层）时，照 fillbucket startFillBucketMining 的成例朝 stand 直线
+     * 挖过去——主轴推进、每步挖掉当前头顶/目标脚格/目标头格、跟上一步；
+     * fix74 同款位移监测（40 步一查、连两次没挪窝收手）+ 240 步上限，
+     * 挖不动以原词汇诚实收尾。岩浆守卫：目标格本身是流体、或待挖块
+     * 正上方是岩浆（挖开会灌进通道）→ 立刻停步收手，绝不挖穿液体层；
+     * 站位本身贴岩浆是 findObsidianStand 的设计内口径（离岩浆 ≤3 格、
+     * 末格必然岩浆邻接——真玩家挖到湖边同样如此），不拦。抵达（同格
+     * 或距 ≤2）自停本定时器并续跑 pour。
+     */
+    private void startObsidianDigAdvance(int id, BlockPos stand, Runnable pour,
+                                         int mined, int want) {
+        LOG.info("[AIV][SKILL] " + npc.npcName() + " 黑曜石挖路（fix222） | stand="
+                + stand.toShortString() + "（走路 A* 无路，改直线挖进）");
+        final int[] stepsDone = {0};
+        final BlockPos[] lastCheckPos = {npc.blockPosition()};
+        final int[] stallChecks = {0};
+        final org.bukkit.scheduler.BukkitTask[] self = new org.bukkit.scheduler.BukkitTask[1];
+        armWatchdog(id, "mineobsidian");
+        self[0] = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (runId != id) {
+                return;
+            }
+            BlockPos feet = npc.blockPosition();
+            if (feet.equals(stand) || feet.distSqr(stand) <= 2.0D) {
+                LOG.info("[AIV][SKILL] " + npc.npcName() + " 黑曜石挖路抵达（fix222） | stand="
+                        + stand.toShortString() + " 步数=" + stepsDone[0]);
+                self[0].cancel();
+                pour.run();
+                return;
+            }
+            if (!npc.level().getBlockState(feet).getFluidState().isEmpty()
+                    || !npc.level().getBlockState(feet.above()).getFluidState().isEmpty()) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=挖路陷入流体 stand="
+                        + stand.toShortString());
+                return;
+            }
+            int dx = stand.getX() - feet.getX();
+            int dy = stand.getY() - feet.getY();
+            int dz = stand.getZ() - feet.getZ();
+            int mx = 0, my = 0, mz = 0;
+            if (Math.abs(dx) >= Math.abs(dz) && Math.abs(dx) >= Math.abs(dy) && dx != 0) {
+                mx = (int) Math.signum(dx);
+            } else if (Math.abs(dz) >= Math.abs(dy) && dz != 0) {
+                mz = (int) Math.signum(dz);
+            } else if (dy != 0) {
+                my = (int) Math.signum(dy);
+            } else if (dx != 0) {
+                mx = (int) Math.signum(dx);
+            } else if (dz != 0) {
+                mz = (int) Math.signum(dz);
+            }
+            if (mx == 0 && my == 0 && mz == 0) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=挖路找不到方向 stand="
+                        + stand.toShortString());
+                return;
+            }
+            BlockPos targetFeet = feet.offset(mx, my, mz);
+            BlockPos targetHead = targetFeet.above();
+            // 岩浆/流体守卫：目标格是流体、或待挖块正上方压着岩浆，停步。
+            if (!npc.level().getBlockState(targetFeet).getFluidState().isEmpty()
+                    || !npc.level().getBlockState(targetHead).getFluidState().isEmpty()
+                    || npc.level().getBlockState(targetHead.above()).is(Blocks.LAVA)) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=挖路遇流体层收手 stand="
+                        + stand.toShortString());
+                return;
+            }
+            npc.mineWithBestTool(feet.above());
+            npc.mineWithBestTool(targetFeet);
+            npc.mineWithBestTool(targetHead);
+            npc.walkTo(new Vec3(targetFeet.getX() + 0.5D, targetFeet.getY(),
+                    targetFeet.getZ() + 0.5D), false, null);
+            stepsDone[0]++;
+            if (stepsDone[0] % 40 == 0) {
+                if (feet.distSqr(lastCheckPos[0]) < 1.0D) {
+                    if (++stallChecks[0] >= 2) {
+                        finish(id, "mineobsidian", mined > 0
+                                ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                                : "mineobsidian 未挖到 reason=挖路无位移 stand="
+                                + stand.toShortString());
+                        return;
+                    }
+                } else {
+                    stallChecks[0] = 0;
+                    lastCheckPos[0] = feet;
+                }
+            }
+            if (stepsDone[0] > 240) {
+                finish(id, "mineobsidian", mined > 0
+                        ? "mineobsidian 完成 mined=" + mined + " want=" + want
+                        : "mineobsidian 未挖到 reason=到不了岩浆边 stand="
+                        + stand.toShortString());
+            }
+        }, 1L, 2L);
+        tasks.add(self[0]);
+    }
+
     private BlockPos findObsidianStand(BlockPos lavaCell, BlockPos pourAt) {
         for (int dy : new int[] {2, 1, 0, -1}) {
             for (int dx = -3; dx <= 3; dx++) {

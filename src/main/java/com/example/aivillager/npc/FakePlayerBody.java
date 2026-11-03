@@ -79,6 +79,8 @@ public final class FakePlayerBody extends ServerPlayer {
     /** A* 路径；非 null 时优先级高于 walkTarget。 */
     private List<BlockPos> path;
     private int pathIndex;
+    /** 【fix205】高台悬空航点脱困专行的节流记账：同一航点只打一次。 */
+    private int lastLedgeSkipIndex = -1;
     private boolean pathSprint;
     private Runnable pathArrive;
     private Runnable pathAbandon;
@@ -92,12 +94,22 @@ public final class FakePlayerBody extends ServerPlayer {
     private int toolLogCounter;
     /** fix44 守卫拒挖日志节流：技能收场前会反复试挖，10 秒最多打一行。 */
     private long lastTierGuardLogTick = -100000L;
+    // 【fix196】最近一次被分级守卫礼让拒挖的 tick（技能层据此区分"礼让"与真挖不动）。
+    private long lastTierGuardRefusalTick = -100000L;
     /** 【fix101】镐子兜底链状态：无可用石镐且合不出石镐时，降级用铁/钻镐
      * 顶上干活（Fong 2026-10-28 通则：守卫必须配兜底，只堵不疏不许出厂）。
      * 启用/解除各打一条 pick-fallback 专行日志；石镐回包即解除。 */
     private boolean pickFallbackActive;
     /** fix99 床块守卫日志节流：卡住自救会反复试挖床格，10 秒最多打一行。 */
     private long lastBedGuardLogTick = -100000L;
+    /** fix198 农田守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
+    private long lastFarmGuardLogTick = -100000L;
+    /** fix199 基岩守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
+    private long lastBedrockGuardLogTick = -100000L;
+    /** 【fix198】最近一次被自家农田守卫拒挖的 tick（技能层据此区分"避让"与真挖不动，同 fix196 探针）。 */
+    private long lastFarmGuardRefusalTick = -100000L;
+    /** 【fix198】田间作业许可：仅 farm 目标执行期间为真（收获走 mineBareHand 必须能挖作物格）。 */
+    private boolean farmWorkPermit;
     /** 【第四十五轮】逃生后岩浆位置记忆：生存层接触岩浆时写入的最后一格 + tick。 */
     private BlockPos recentLavaCell;
     private long recentLavaTick = -100000L;
@@ -494,9 +506,21 @@ public final class FakePlayerBody extends ServerPlayer {
         // 水平已经对准但人还在上一层（崖边、台阶上方）：直接朝下一格走，避免原地打转。
         // 只在"人比 waypoint 高"时这样做：如果人在下面，朝下一格走会背离台阶，
         // 应该继续对准头上那一格、靠跳跃上去。
-        if (distanceSq < 1.0D
+        // 【fix205】水平阈值由 1.0 放宽到 2.25（1.5 格）：#53 实证卡点水平距²
+        // 1.37、高 2 格、四周全 air——挖解无物可挖、原阈值差一线未触发脱困支，
+        // 身体对着航点中心原地滑动被僵尸磨死。放宽带（1.0–2.25）加落差上限
+        // 3.0 格（3 格内坠落无伤），原带（<1.0）行为不变。
+        if (distanceSq < 2.25D
                 && this.getY() - ty > ARRIVE_Y_TOLERANCE
+                && (distanceSq < 1.0D || this.getY() - ty <= 3.0D)
                 && this.pathIndex + 1 < this.path.size()) {
+            if (distanceSq >= 1.0D && this.lastLedgeSkipIndex != this.pathIndex) {
+                this.lastLedgeSkipIndex = this.pathIndex;
+                log(npcName, "path-ledge-skip", "高台悬空航点改朝下一格 | idx=" + this.pathIndex
+                        + " distSq=" + String.format(java.util.Locale.ROOT, "%.2f", distanceSq)
+                        + " dy=" + String.format(java.util.Locale.ROOT, "%.1f", this.getY() - ty)
+                        + " " + this.describe());
+            }
             BlockPos next = this.path.get(this.pathIndex + 1);
             tx = next.getX() + 0.5D;
             tz = next.getZ() + 0.5D;
@@ -705,6 +729,7 @@ public final class FakePlayerBody extends ServerPlayer {
         this.walkCallback = null;
         this.path = path;
         this.pathIndex = 0;
+        this.lastLedgeSkipIndex = -1;
         this.pathSprint = sprint;
         this.pathArrive = onArrive;
         this.pathAbandon = onAbandon;
@@ -810,6 +835,35 @@ public final class FakePlayerBody extends ServerPlayer {
             }
             return false;
         }
+        // 【fix199】基岩永不挖：本体 destroyBlock 对假人真移除基岩（staging
+        // 直读铁证），与移动层多处"基岩禁入"口径不一致——真玩家挖不动基岩。
+        // 当前危害低（-59 封底与基岩交错层错开一层），仍按玩家口径钉死。
+        if (targetState.is(net.minecraft.world.level.block.Blocks.BEDROCK)) {
+            if (this.tickCount - lastBedrockGuardLogTick >= 200) {
+                lastBedrockGuardLogTick = this.tickCount;
+                log(npcName, "mine-bedrock-guard", "拒绝挖基岩 " + pos.toShortString());
+            }
+            return false;
+        }
+        // 【fix198】自家农田永不挖（田间作业许可期间除外）：全插件挖掘都过
+        // 本方法，一处守卫全覆盖。farm164/166/167 三度实证 descend 在田上
+        // 开井把耕地连土带苗挖成空气、田格 8→2 缩水至全毁。收获是 farm
+        // 目标自己的活（mineBareHand 挖作物格），靠 GoalExecutor 每 tick
+        // 刷新的 farmWorkPermit 放行；其余任何技能/生存层一律拒挖。
+        // 兜底（Fong 通则）：descend 有井口避让挪位+避让收场两条疏路，
+        // 不是只堵不疏。
+        if (!farmWorkPermit) {
+            com.example.aivillager.goals.FarmMemory.bindWorld(this.level());
+            if (com.example.aivillager.goals.FarmMemory.isFarmCell(npcName, pos)) {
+                lastFarmGuardRefusalTick = this.tickCount;
+                if (this.tickCount - lastFarmGuardLogTick >= 200) {
+                    lastFarmGuardLogTick = this.tickCount;
+                    log(npcName, "mine-farm-guard", "拒绝挖自家农田格 " + targetState.getBlock()
+                            + " " + pos.toShortString());
+                }
+                return false;
+            }
+        }
         String before = this.level().getBlockState(pos).toString();
         // 【第二十三轮】工具损坏取证：动作前先记下主手工具，挖完比对（标准第 4 条）。
         ItemStack handBefore = this.getMainHandItem();
@@ -886,6 +940,25 @@ public final class FakePlayerBody extends ServerPlayer {
 
     public boolean mineWithBestTool(BlockPos pos) {
         return mineWithBestTool(pos, true);
+    }
+
+    /**
+     * 【fix196】最近 2 tick 内是否有挖掘被分级守卫礼让拒挖（石镐可合、拒用高级镐）。
+     * descend/strip 在同 tick 挖后查格调用：礼让是偏好事件不是工具缺失，
+     * 技能层应立即礼让收场交规划层补造石镐，不许累计"挖不动"连败。
+     */
+    public boolean mineRefusedByTierGuardRecently() {
+        return this.tickCount - lastTierGuardRefusalTick <= 2;
+    }
+
+    /** 【fix198】最近 2 tick 内是否被自家农田守卫拒挖（技能层避让收场判定，同 fix196 探针）。 */
+    public boolean mineRefusedByFarmGuardRecently() {
+        return this.tickCount - lastFarmGuardRefusalTick <= 2;
+    }
+
+    /** 【fix198】田间作业许可开关（GoalExecutor 每 tick 按当前目标类型刷新：仅 farm 目标为真）。 */
+    public void setFarmWorkPermit(boolean permit) {
+        this.farmWorkPermit = permit;
     }
 
     /**
@@ -1036,6 +1109,10 @@ public final class FakePlayerBody extends ServerPlayer {
                             + state.getBlock() + "（交规划层补造石镐） "
                             + pos.toShortString());
                 }
+                // 【fix196】记下礼让时点：技能层（descend/strip）挖后查格仍实心时
+                // 先问本探针，礼让不许记成"挖不动/缺少镐"（staging fix195e 实证：
+                // descend 同格连试 6 次速败、误喂 fix109 缺镐速断把连败顶满）。
+                lastTierGuardRefusalTick = this.tickCount;
                 return false;
             }
             if (!pickFallbackActive) {

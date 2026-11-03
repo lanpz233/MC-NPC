@@ -87,6 +87,8 @@ public final class AiVillagerPlugin extends JavaPlugin {
         com.example.aivillager.goals.BaseMemory.init(getDataFolder());
         // 【fix160】传送门账本落盘目录（portal-memory/<NPC>.json）。
         com.example.aivillager.goals.PortalMemory.init(getDataFolder());
+        // 【fix195】已知岩浆点账本落盘目录（lava-memory/<NPC>.json）。
+        com.example.aivillager.goals.LavaMemory.init(getDataFolder());
         com.example.aivillager.goals.DeathMemory.init(getDataFolder());
         com.example.aivillager.goals.LootMemory.init(getDataFolder());
         com.example.aivillager.goals.DigDepthMemory.init(getDataFolder());

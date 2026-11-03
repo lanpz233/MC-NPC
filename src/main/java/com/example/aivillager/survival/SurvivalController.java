@@ -132,6 +132,28 @@ public final class SurvivalController {
     /** 【fix137】挖岸/挖顶升级试挖失败的节流诊断上次打行时刻（毫秒）：旧版失败无声、空转 1 小时零证据（farm104）。 */
     private long lastEscapeMissLogMillis;
     /**
+     * 【fix194】推进看门狗基线：升级武装（checks≥12）时记下位置、时刻与到岸
+     * 水平距；任一臂产生推进（岸距降 ≥1 或位移 ≥1）即刷新。旧三臂（游岸/挖岸/
+     * 挖顶）都没有推进量监测，全淹水囊里岸在半径外、挖岸无方向、挖顶够不着，
+     * 三臂同点循环至溺亡（死亡 #49）。
+     */
+    private boolean fluidProgressArmed;
+    private double fluidProgressX;
+    private double fluidProgressZ;
+    private long fluidProgressMillis;
+    private double fluidProgressShoreDist = -1.0D;
+    /** 【fix194】最近一次由本层下发的游泳目标（岸格或 press 点），横挖朝向的依据。 */
+    private net.minecraft.core.BlockPos fluidLastShore;
+    /** 【fix194】横挖向岸模式：朝岸向逐格挖穿岩壁、挖开即短跳游入。 */
+    private boolean fluidLateral;
+    private net.minecraft.core.BlockPos fluidLateralDir;
+    private int fluidLateralFailStreak;
+    private long fluidLateralLastMillis;
+    /** 【fix194】垫柱模式：横挖亦无推进时的末线兜底，脚下逐格垫块顶出水面。 */
+    private boolean fluidPillar;
+    private int fluidPillarPlaced;
+    private long fluidPillarLastMillis;
+    /**
      * "原地不动"锚点与计数（第六轮补充·树干顶脱困）：水平离开锚点 2 格以上清零，
      * 垂直下落不算移动（逐层挖树干时每挖一层只落 1 格，不能被误判成"在动")。
      * 约 10 次检查（约 10 秒）不动且脚下是原木，才判定困在树干顶上。
@@ -166,6 +188,14 @@ public final class SurvivalController {
     private LivingEntity fleeThreatRef;
     /** 暂时无视的威胁：实体 UUID → 解除无视的时间戳（毫秒）。 */
     private final java.util.Map<java.util.UUID, Long> ignoredThreats = new java.util.HashMap<>();
+    /** 【fix201】跨回合逃脱记忆：脱离成功但威胁还活着时记一笔（类型+位置+
+     * 45 秒窗）。fix39 的记忆只管单回合内（拉开 28 格释放即全清），同一只苦力怕
+     * 堵在旅行走廊上、目标层沿原路走回必再触发（farm169：90 秒 7 回合 yo-yo、
+     * 末回合被引爆 hp 20→6.2）。窗内同类型威胁在记忆点附近再现时，flee()
+     * 自动升级加长档，让第二次逃跑真拉开距离。 */
+    private net.minecraft.world.entity.EntityType<?> lastEscapeType;
+    private BlockPos lastEscapePos;
+    private long lastEscapeUntilMs;
     /**
      * 【第二十四轮】逃跑直线脱离兜底（长跑#8 F 段实证）：A* 各档落点全灭时
      * 不再站着挨打——沿远离威胁方向 walkTo 直线跑，靠身体层的撞墙跳/卡住挖路
@@ -691,12 +721,15 @@ public final class SurvivalController {
                 int shoreRadius = fluidStuckChecks <= 3 ? 4 : fluidStuckChecks <= 8 ? 7 : 11;
                 net.minecraft.core.BlockPos shore = findShoreCell(feet, shoreRadius);
                 if (shore != null) {
+                    fluidLastShore = shore;
                     npc.swimTo(shore);
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，游泳上岸 | fluid="
                             + fluidName + " pos=" + feet.toShortString() + " 岸边=" + shore.toShortString());
                 } else if (fluidStuckChecks >= 12 && fluidEscapeDir != null && stillChecks >= 5) {
                     // 没有能爬的岸：朝岸壁方向贴过去，配合下面的挖岸台阶脱困。
-                    npc.swimTo(feet.offset(fluidEscapeDir.getX() * 3, 0, fluidEscapeDir.getZ() * 3));
+                    fluidLastShore = feet.offset(
+                            fluidEscapeDir.getX() * 3, 0, fluidEscapeDir.getZ() * 3);
+                    npc.swimTo(fluidLastShore);
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-press | fluid="
                             + fluidName + " pos=" + feet.toShortString()
                             + " dir=" + fluidEscapeDir.toShortString());
@@ -707,12 +740,84 @@ public final class SurvivalController {
                             + fluidName + " pos=" + feet.toShortString());
                 }
             }
+            // 【fix194】推进看门狗 + 横挖向岸 + 垫柱兜底（死亡 #49 定谳）：旧三臂
+            // 都没有推进量监测——全淹水囊里岸在半径外且直线被岩壁隔断（游岸零
+            // 推进）、挖岸选向要求 10 格内有可站立旱地列（深囊恒 null）、挖顶
+            // 头顶 +7 岩层超出可达（恒 miss），三臂同点循环 115 秒溺亡。现以
+            // 推进量统一调度：任一臂产生推进（位移 ≥1 或岸距降 ≥1）看门狗即
+            // 刷新（挖顶凿得动时人会上浮、天然优先，无需另设探针闸）；≥10 秒
+            // 无推进进横挖向岸（朝岸向逐格挖穿岩壁、挖开即短跳游入）；横挖
+            // 三轮全空或 15 秒仍无推进转垫柱（脚下逐格垫块出水面）。仅水域
+            // 启用（岩浆维持旧臂）。模式由 resetFluidTrap 随真脱困全清。
+            boolean fluid194Handled = false;
+            if (isWater && fluidStuckChecks >= 12) {
+                long nowMs = System.currentTimeMillis();
+                double curX = npc.getX();
+                double curZ = npc.getZ();
+                double shoreDist = fluidLastShore == null ? -1.0D
+                        : Math.hypot(fluidLastShore.getX() + 0.5D - curX,
+                                fluidLastShore.getZ() + 0.5D - curZ);
+                if (!fluidProgressArmed) {
+                    fluidProgressArmed = true;
+                    fluidProgressX = curX;
+                    fluidProgressZ = curZ;
+                    fluidProgressMillis = nowMs;
+                    fluidProgressShoreDist = shoreDist;
+                } else {
+                    double moved = Math.hypot(curX - fluidProgressX, curZ - fluidProgressZ);
+                    boolean shoreGain = fluidProgressShoreDist >= 0.0D && shoreDist >= 0.0D
+                            && fluidProgressShoreDist - shoreDist >= 1.0D;
+                    if (moved >= 1.0D || shoreGain) {
+                        fluidProgressX = curX;
+                        fluidProgressZ = curZ;
+                        fluidProgressMillis = nowMs;
+                        fluidProgressShoreDist = shoreDist;
+                    } else if (fluidLateral && nowMs - fluidProgressMillis >= 15_000L) {
+                        fluidLateral = false;
+                        fluidPillar = true;
+                        fluidPillarPlaced = 0;
+                        fluidProgressMillis = nowMs;
+                        LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                + " fluid-escape-pillar start | fluid=" + fluidName
+                                + " pos=" + feet.toShortString()
+                                + " why=横挖 15 秒无推进");
+                    } else if (!fluidLateral && !fluidPillar
+                            && nowMs - fluidProgressMillis >= 10_000L) {
+                        fluidLateralDir = pickLateralDir(feet);
+                        if (fluidLateralDir != null) {
+                            fluidLateral = true;
+                            fluidLateralFailStreak = 0;
+                            LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                    + " fluid-escape-lateral start | fluid=" + fluidName
+                                    + " pos=" + feet.toShortString()
+                                    + " dir=" + fluidLateralDir.toShortString()
+                                    + " shore=" + (fluidLastShore == null ? "none"
+                                            : fluidLastShore.toShortString())
+                                    + " shoreDist=" + (shoreDist < 0.0D ? "-1"
+                                            : String.format(java.util.Locale.ROOT, "%.1f", shoreDist)));
+                        } else {
+                            fluidPillar = true;
+                            fluidPillarPlaced = 0;
+                            LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                    + " fluid-escape-pillar start | fluid=" + fluidName
+                                    + " pos=" + feet.toShortString()
+                                    + " why=身前无墙可挖");
+                        }
+                        fluidProgressMillis = nowMs;
+                    }
+                }
+                if (fluidLateral) {
+                    fluid194Handled = fluidLateralStep(feet, fluidName, nowMs);
+                } else if (fluidPillar) {
+                    fluid194Handled = fluidPillarStep(fluidName, nowMs);
+                }
+            }
             // 升级脱困（第四轮修复 B）：泡够约 12 秒还没上岸，说明附近没有能爬的岸
             // （陡岸/崖壁水洼/全淹洞穴），光游永远出不去——改走玩家式物理脱困：
             // 有岸壁方向就贴墙把水面以上两格挖成台阶口，挖通后那一格自然成为合格的岸，
             // 上面的找岸逻辑会把 NPC 领进去站稳；全淹洞穴没有岸壁方向时挖头顶开气腔。
             // 只挖和走，全程无传送。挖岸节奏约 2 秒一次，给身体留出贴墙/上浮的时间。
-            if (fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0 && stillChecks >= 5) {
+            if (!fluid194Handled && fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0 && stillChecks >= 5) {
                 boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
                 if (dug) {
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
@@ -722,7 +827,7 @@ public final class SurvivalController {
                 } else if (fluidEscapeDirPicked) {
                     logEscapeDigMiss(fluidName, feet);
                 }
-            } else if (fluidStuckChecks >= 3 && fluidStuckChecks % 5 == 3 && npc.digOutAbove()) {
+            } else if (!fluid194Handled && fluidStuckChecks >= 3 && fluidStuckChecks % 5 == 3 && npc.digOutAbove()) {
                 // 未进入挖岸阶段前的旧升级：泡约 3 秒先试挖头顶（被水洞顶盖住时凿开继续上浮）。
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 流体脱困：挖开头顶 | fluid="
                         + fluidName + " pos=" + feet.toShortString());
@@ -826,6 +931,15 @@ public final class SurvivalController {
         fluidEscapeDir = null;
         fluidTrapAnchor = null;
         fluidEscapeDirPicked = false;
+        fluidProgressArmed = false;
+        fluidProgressMillis = 0L;
+        fluidProgressShoreDist = -1.0D;
+        fluidLastShore = null;
+        fluidLateral = false;
+        fluidLateralDir = null;
+        fluidLateralFailStreak = 0;
+        fluidPillar = false;
+        fluidPillarPlaced = 0;
     }
 
     /**
@@ -845,6 +959,136 @@ public final class SurvivalController {
                 + " dir=" + (fluidEscapeDir == null ? "above"
                         : fluidEscapeDir.toShortString())
                 + " aboveProbe=" + npc.aboveColumnProbe());
+    }
+
+    /**
+     * 【fix194】横挖选向：首选朝最近一次下发岸格的 8 向单位向量；无岸格时用
+     * 挖岸方向；再无则取身前第一格为可挖实心的方向（贴着墙才有横挖对象）。
+     * 身前全是水/空气（不在墙边）返回 null，调用方直转垫柱。
+     */
+    private net.minecraft.core.BlockPos pickLateralDir(net.minecraft.core.BlockPos feet) {
+        if (fluidLastShore != null) {
+            int dx = fluidLastShore.getX() - feet.getX();
+            int dz = fluidLastShore.getZ() - feet.getZ();
+            if (dx != 0 || dz != 0) {
+                return new net.minecraft.core.BlockPos(
+                        Integer.signum(dx), 0, Integer.signum(dz));
+            }
+        }
+        if (fluidEscapeDir != null) {
+            return fluidEscapeDir;
+        }
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int[] d : dirs) {
+            net.minecraft.core.BlockPos cell = feet.offset(d[0], 0, d[1]);
+            net.minecraft.world.level.block.state.BlockState st = npc.level().getBlockState(cell);
+            if (st.isAir() || !st.getFluidState().isEmpty()) {
+                continue;
+            }
+            float hardness = st.getDestroySpeed(npc.level(), cell);
+            if (hardness >= 0.0F && hardness <= 3.0F) {
+                return new net.minecraft.core.BlockPos(d[0], 0, d[1]);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 【fix194】横挖一轮（约 1.5 秒节流）：按朝岸向重算方向（贪心转向），挖身前
+     * feet 层与 feet+1 层两格（挖链同 digBankStep：镐→素手→脱困口径，跳空气/
+     * 液体诚实不算挖开），挖开任一或前方已通即短跳 swimTo 游入。实心挖不动
+     * 连续 3 轮转垫柱。横挖模式内恒返回 true（本 tick 由横挖臂接管，旧臂不插手）。
+     */
+    private boolean fluidLateralStep(net.minecraft.core.BlockPos feet, String fluidName, long nowMs) {
+        if (nowMs - fluidLateralLastMillis < 1_500L) {
+            return true;
+        }
+        fluidLateralLastMillis = nowMs;
+        net.minecraft.core.BlockPos toward = pickLateralDir(feet);
+        if (toward != null) {
+            fluidLateralDir = toward;
+        }
+        // 【fix194b】连头顶格一起挖：staging 实证 NPC 浮在水面层时是站立身高（1.8 格），
+        // 只挖两格会被第三格卡住进不了隧道；真人挖隧道也是身位 2 格加 1 格余量。
+        // 【fix194c】对角向挖 2×2 前锋：实体包围盒 0.6 宽，斜穿单列隧道会被两侧角格
+        // 刮住（staging 第二轮实证：对角单列挖通后位置纹丝不动、15 秒无推进转垫柱）；
+        // 真人挖斜洞同样清整个断面。正交向仍只挖一列。
+        int dx = fluidLateralDir.getX();
+        int dz = fluidLateralDir.getZ();
+        int[][] frontCols = (dx != 0 && dz != 0)
+                ? new int[][]{{dx, 0}, {0, dz}, {dx, dz}}
+                : new int[][]{{dx, dz}};
+        boolean dug = false;
+        boolean allOpen = true;
+        for (int[] col : frontCols) {
+            net.minecraft.core.BlockPos colFeet = feet.offset(col[0], 0, col[1]);
+            for (int up = 0; up <= 2; up++) {
+                net.minecraft.core.BlockPos cell = colFeet.above(up);
+                if (isFluidOrAir(cell)) {
+                    continue;
+                }
+                allOpen = false;
+                dug |= digLateralCell(cell);
+            }
+        }
+        if (dug || allOpen) {
+            if (dug) {
+                fluidLateralFailStreak = 0;
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-lateral-dug | fluid="
+                        + fluidName + " pos=" + feet.toShortString()
+                        + " dir=" + fluidLateralDir.toShortString());
+            }
+            npc.swimTo(feet.offset(
+                    fluidLateralDir.getX() * 2, 0, fluidLateralDir.getZ() * 2));
+        } else {
+            fluidLateralFailStreak++;
+            if (fluidLateralFailStreak >= 3) {
+                fluidLateral = false;
+                fluidPillar = true;
+                fluidPillarPlaced = 0;
+                fluidProgressMillis = nowMs;
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                        + " fluid-escape-pillar start | fluid=" + fluidName
+                        + " pos=" + feet.toShortString()
+                        + " why=横挖三轮全空");
+            }
+        }
+        return true;
+    }
+
+    /** 【fix194】横挖单格：空气/液体不挖（fix135b 诚实口径），挖链同 digBankStep。 */
+    private boolean digLateralCell(net.minecraft.core.BlockPos cell) {
+        if (isFluidOrAir(cell)) {
+            return false;
+        }
+        return npc.mineWithBestTool(cell) || npc.mine(cell) || npc.mineEscapeBank(cell);
+    }
+
+    private boolean isFluidOrAir(net.minecraft.core.BlockPos cell) {
+        net.minecraft.world.level.block.state.BlockState st = npc.level().getBlockState(cell);
+        return st.isAir()
+                || st.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock;
+    }
+
+    /**
+     * 【fix194】垫柱一轮（约 1.5 秒节流）：委托 SkillRunner 在脚下垫一格并上浮
+     * 顶升。放成功返回 true（本 tick 已接管）；无料/无支撑返回 false——不接管，
+     * 让旧臂（挖岸/挖顶）在同一 tick 的升级槽照常试，垫柱下轮再来。
+     */
+    private boolean fluidPillarStep(String fluidName, long nowMs) {
+        if (nowMs - fluidPillarLastMillis < 1_500L) {
+            return true;
+        }
+        fluidPillarLastMillis = nowMs;
+        if (skills.placeFluidPillarStep()) {
+            fluidPillarPlaced++;
+            npc.swimUp();
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-pillar | fluid="
+                    + fluidName + " placed=" + fluidPillarPlaced
+                    + " pos=" + npc.blockPosition().toShortString());
+            return true;
+        }
+        return false;
     }
 
     /** 脚位四邻（同层与下一层）是否有流体格：唇口栖息立锚判据（身边就是水）。 */
@@ -1187,6 +1431,13 @@ public final class SurvivalController {
                         + " 距离=" + (fleeThreatRef.isAlive()
                             ? String.format(Locale.ROOT, "%.1f", Math.sqrt(npc.distanceToSqr(fleeThreatRef)))
                             : "已死亡"));
+                if (fleeThreatRef.isAlive()) {
+                    // 【fix201】威胁还活着就记跨回合记忆：目标层马上要沿原路
+                    // 恢复推进，它若还堵在走廊上，再遇时 flee() 升级加长档。
+                    lastEscapeType = fleeThreatRef.getType();
+                    lastEscapePos = fleeThreatRef.blockPosition();
+                    lastEscapeUntilMs = System.currentTimeMillis() + 45_000L;
+                }
             }
             fleeing = false;
             fleeThreatRef = null;
@@ -1428,6 +1679,16 @@ public final class SurvivalController {
      */
     private boolean flee(LivingEntity threat, boolean extended) {
         fleeThreatRef = threat;
+        // 【fix201】逃脱记忆升级：刚从同类型威胁手里脱身、它还在记忆点附近，
+        // 说明 16 格普通档拉不开（走廊 yo-yo），这次直接用加长档跑远。
+        if (!extended && lastEscapeType != null && lastEscapePos != null
+                && System.currentTimeMillis() < lastEscapeUntilMs
+                && threat.getType() == lastEscapeType
+                && threat.blockPosition().distSqr(lastEscapePos) <= 24.0D * 24.0D) {
+            extended = true;
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃脱记忆升级 | threat=" + threat.getType()
+                    + " 记忆点=" + lastEscapePos.toShortString() + " 改用加长档逃跑");
+        }
         double dx = npc.getX() - threat.getX();
         double dz = npc.getZ() - threat.getZ();
         double length = Math.sqrt(dx * dx + dz * dz);
@@ -1488,6 +1749,14 @@ public final class SurvivalController {
             PathFinder.Result result = PathFinder.find(npc.level(), npc.blockPosition(), goal, 4000, !npc.wearingLeatherBoots());
             if (!result.found()) {
                 diag.append(distance).append("格:").append(result.detail()).append(' ');
+                continue;
+            }
+            // 【fix201】路径合理性上限：16 档终点被 A* 绕成 316 航点迷宫时，
+            // 顺着迷宫走比站着还慢、威胁走直线就追上引爆（farm169 定因）。
+            // 航点数超过 max(48, 档位×4) 判这档不可用、试下一档（正常 16 档
+            // 约 21 航点、不受影响）；全档皆超则落既有直线脱离兜底。
+            if (result.path().size() > Math.max(48, distance * 4)) {
+                diag.append(distance).append("格:路径过长").append(result.path().size()).append("航点 ");
                 continue;
             }
             resetStraightFlee();

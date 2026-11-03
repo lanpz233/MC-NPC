@@ -189,6 +189,32 @@ public final class GoalExecutor {
     private boolean obsidianRouteCasting;
     private int obsidianRouteFails;
     private boolean obsidianRouteLogged;
+    // 【fix195】岩浆账本旅途段：本目标选定的已知岩浆点、是否已消费账本
+    // （抵近/无账/放弃均算消费）、goto 真实派发次数、到点落空是否已记失败。
+    private BlockPos obsidianLavaTarget;
+    private boolean obsidianLavaTripDone;
+    /** 【fix212】本目标是否真抵达过账本点（选点 ≤20 格或旅途 ≤16 格）：
+     * 销账的资格凭据——抵达且整轮零产出才记账本失败，未抵达不记
+     * （fix195d 旅途放弃不销账的口径靠它与「结束位置漂移」解耦）。 */
+    private boolean obsidianLavaArrived;
+    /** 【fix213】旅途下地子段是否已执行（一次性）：高处出发先 descend
+     * 到地面再派水平跳，只试一次，成败都交回原派跳/放弃口径。 */
+    private boolean obsidianLavaGroundDone;
+    /** 【fix214】旅途绕行级数：正射线一跳无推进即逐级偏角
+     * （+45°/−45°/+90°/−90°），有推进清零回正射线。 */
+    private int obsidianLavaDetour;
+    /** 【fix215·备修未部署】descend 礼让待交接：礼让结局一到即置位，
+     * tickObsidian 消费后直接 finish 交规划层补镐，不再原地重派 descend
+     * 空转（farm189 实证 290+ 次 ~1 秒节律重派、靠看门狗 300 秒才收场）。 */
+    private boolean obsidianPickYieldPending;
+    private int obsidianLavaGotoTries;
+    private boolean obsidianLavaStruck;
+    private BlockPos lastLavaLedgerPos;
+    // 【fix195b】旅途段结算状态：启程时刻、当前跳起点、是否有跳在飞。
+    private long obsidianLavaTripStartMillis;
+    private double obsidianLavaHopX;
+    private double obsidianLavaHopZ;
+    private boolean obsidianLavaHopInFlight;
     /** 16 格探矿扫描的节流计数：全扫一次约 1.4 万格，只在技能空闲的决策点扫、且至少隔 4 次决策。 */
     private int oreScanCooldown;
     /** 上次探矿扫描选中的目标格：单格复核（方块还在、仍然裸露）通过就直接复用，省掉重复全扫。 */
@@ -214,6 +240,8 @@ public final class GoalExecutor {
     private BlockPos placedFurnacePos;
     private int smeltTicks;
     private int smeltBaseline;
+    // 【fix197】冶炼停滞探测计数（无燃料/无原料且炉冷时累计，见 tickSmelt）。
+    private int smeltStallTicks;
     /** 狩猎目标开始时的肉类数量，进度只看本轮新打到的。 */
     private int huntBaseline;
     private int huntAttempts;
@@ -333,6 +361,18 @@ public final class GoalExecutor {
     private double travelStallLastY = -1.0D;
     private double travelStallTargetX = Double.NaN;
     private double travelStallTargetZ = Double.NaN;
+    /**
+     * 【fix208】近终点竖向收尾宽带（fix156，水平 4–12 格）的无下降记账：
+     * 同站位连续派 ascend/descend 后高度差改善 &lt;2 格的次数 + 上次派单的
+     * 高度差与站位。fix107 死线只管 ≤6 格带、fix186/156 停滞账排在宽带
+     * 分支之后够不着——宽带内技能幻影收场（如楼梯块两级台面间 blockY
+     * 振荡喂出的假步数、靠 fix113 真降看门狗 90 秒一轮收场）后本层无记账
+     * 原样重派，farm178 山脊顶实证同点三轮空转、白烧应急口粮。
+     */
+    private int wideAlignFailCount;
+    private double wideAlignLastAbsDelta = -1.0D;
+    private int wideAlignLastX = Integer.MIN_VALUE;
+    private int wideAlignLastZ = Integer.MIN_VALUE;
     /** 传送门选址结果：origin 是框架左下角，alongX 表示门面横向沿 X 轴。 */
     private BlockPos portalOrigin;
     private boolean portalAlongX = true;
@@ -583,6 +623,9 @@ public final class GoalExecutor {
                 travelStallLastHorizontal = -1.0D;
                 travelStallTargetX = Double.NaN;
                 travelStallTargetZ = Double.NaN;
+                // 【fix208】宽带无下降记账同清，防跨目标误触发。
+                wideAlignFailCount = 0;
+                wideAlignLastAbsDelta = -1.0D;
             }
             case "endportal" -> {
                 newTarget = "endportal";
@@ -626,6 +669,7 @@ public final class GoalExecutor {
         baselineCount = "gather".equals(type) ? gatherCount()
                 : ("dig".equals(type) || "revisit".equals(type)) ? countItem(oreTarget.drop()) : 0;
         smeltTicks = 0;
+        smeltStallTicks = 0;
         smeltBaseline = "smelt".equals(type) ? countItem(targetId) : 0;
         furnacePos = null;
         huntBaseline = "hunt".equals(type) ? countHuntLoot() : 0;
@@ -698,6 +742,16 @@ public final class GoalExecutor {
         obsidianRouteCasting = false;
         obsidianRouteFails = 0;
         obsidianRouteLogged = false;
+        obsidianLavaTarget = null;
+        obsidianLavaTripDone = false;
+        obsidianLavaArrived = false;
+        obsidianLavaGroundDone = false;
+        obsidianLavaDetour = 0;
+        obsidianPickYieldPending = false;
+        obsidianLavaGotoTries = 0;
+        obsidianLavaStruck = false;
+        obsidianLavaTripStartMillis = 0L;
+        obsidianLavaHopInFlight = false;
         handledObsidianSeq = skills.outcomeSeq();
         // 【fix142】descend 结局消费水位线随新目标复位（同 handledObsidianSeq 口径）。
         handledDigDescendSeq = skills.outcomeSeq();
@@ -895,6 +949,10 @@ public final class GoalExecutor {
         if (++trimTickCounter % 10 == 0) {
             trimOverflow();
         }
+        // 【fix198】田间作业许可：只有 farm 目标自己能挖自家田格（收获走
+        // mineBareHand 挖作物格）；每 tick 按目标类型刷新，目标一换即收回，
+        // 其余技能/生存层挖田一律被身体层 mine-farm-guard 拒挖。
+        npc.setFarmWorkPermit("farm".equals(type));
         switch (type) {
             case "gather" -> tickGather();
             case "craft" -> tickCraft();
@@ -2159,6 +2217,19 @@ public final class GoalExecutor {
                         + "（fix144：途中目击、当前镐挖不了）");
             }
         }
+        // 【fix195】过境记岩浆：同节流扫一遍露面岩浆源，落 LavaMemory——
+        // 黑曜石目标靠这本账直奔旧湖，不再从脚下盲凿竖井（案 A）。
+        BlockPos lavaSeen = scanExposedLava(8, 4);
+        if (lavaSeen != null) {
+            LavaMemory.bindWorld(npc.level());
+            LavaMemory.record(npc.npcName(), lavaSeen);
+            if (lastLavaLedgerPos == null
+                    || lastLavaLedgerPos.distSqr(lavaSeen) > 12.0D * 12.0D) {
+                lastLavaLedgerPos = lavaSeen;
+                LOG.info("[AIV][GOAL] " + npc.npcName() + " 过境记岩浆 | pos="
+                        + lavaSeen.toShortString() + "（fix195：途中目击露面岩浆源）");
+            }
+        }
     }
 
     /** 扫描附近同名方块（矿石自动带深板岩变种），只返回至少一面暴露的。 */
@@ -2323,7 +2394,7 @@ public final class GoalExecutor {
         smeltTicks++;
         if (smeltTicks > 2400) {
             drainFurnace();
-            finish("熔炼超时：120 秒内只完成 " + done + "/" + targetCount);
+            finish("熔炼超时：长时间只完成 " + done + "/" + targetCount);
             return;
         }
         if (furnacePos == null) {
@@ -2341,6 +2412,35 @@ public final class GoalExecutor {
             return;
         }
         fillFurnace();
+        // 【fix197】停滞探测：炉冷（未点火）+ 产出槽空 +（燃料槽空且包里挑不出
+        // 燃料，或原料断供）时，fillFurnace 只会无声 no-op、目标静默挂死——
+        // farm167 实证：第 8 个生铁因 5 根原木只够烧 7 个而断火，包里
+        // coal/planks/log/stick 全 0，目标白挂 15 分钟靠看门狗超时收场。
+        // 玩家没柴会收炉去弄柴：持续 40 拍（≈20 秒，远超一锭 10 秒烧程，
+        // 而添柴是同拍动作不会误伤）即收回炉内余料收场，交规划层补燃料/补料。
+        if (furnacePos != null
+                && npc.level().getBlockEntity(furnacePos) instanceof AbstractFurnaceBlockEntity stallFurnace) {
+            boolean lit = npc.level().getBlockState(furnacePos).getValue(
+                    net.minecraft.world.level.block.state.properties.BlockStateProperties.LIT);
+            boolean fuelBlocked = stallFurnace.getItem(1).isEmpty() && pickFuel() == null;
+            String inputId = smeltInputFor(targetId);
+            boolean inputBlocked = stallFurnace.getItem(0).isEmpty()
+                    && (inputId == null || countItem(inputId) <= 0);
+            if (!lit && stallFurnace.getItem(2).isEmpty() && (fuelBlocked || inputBlocked)) {
+                smeltStallTicks++;
+                if (smeltStallTicks >= 40) {
+                    String reason = fuelBlocked
+                            ? "熔炼停滞：背包无可用燃料（炉内余料已收回），交规划层补燃料 "
+                            : "熔炼停滞：原料不足（炉内余料已收回），交规划层补料 ";
+                    smeltStallTicks = 0;
+                    drainFurnace();
+                    finish(reason + done + "/" + targetCount);
+                    return;
+                }
+            } else {
+                smeltStallTicks = 0;
+            }
+        }
     }
 
     /** 在脚边找一个空位放下熔炉；失败会直接结束目标并写清原因。 */
@@ -2639,11 +2739,11 @@ public final class GoalExecutor {
             case "iron_ingot" -> "raw_iron";
             case "gold_ingot" -> "raw_gold";
             case "copper_ingot" -> "raw_copper";
-            case "cooked_beef" -> "raw_beef";
-            case "cooked_porkchop" -> "raw_porkchop";
-            case "cooked_chicken" -> "raw_chicken";
-            case "cooked_mutton" -> "raw_mutton";
-            case "cooked_rabbit" -> "raw_rabbit";
+            case "cooked_beef" -> "beef";
+            case "cooked_porkchop" -> "porkchop";
+            case "cooked_chicken" -> "chicken";
+            case "cooked_mutton" -> "mutton";
+            case "cooked_rabbit" -> "rabbit";
             case "baked_potato" -> "potato";
             case "glass" -> "sand";
             case "stone" -> "cobblestone";
@@ -4770,8 +4870,8 @@ public final class GoalExecutor {
     /** 背包里的肉类总数（生熟都算）：狩猎进度按"本轮新打到多少"统计。 */
     private int countHuntLoot() {
         int total = 0;
-        for (String meat : List.of("raw_beef", "raw_porkchop", "raw_chicken", "raw_mutton",
-                "raw_rabbit", "cooked_beef", "cooked_porkchop", "cooked_chicken",
+        for (String meat : List.of("beef", "porkchop", "chicken", "mutton",
+                "rabbit", "cooked_beef", "cooked_porkchop", "cooked_chicken",
                 "cooked_mutton", "cooked_rabbit")) {
             total += countItem(meat);
         }
@@ -5325,6 +5425,10 @@ public final class GoalExecutor {
                 LOG.info("[AIV][GOAL] " + npc.npcName()
                         + " obsidian-route | route=mining→casting reason=挖矿路线连败3次，降级浇铸兜底");
             } else if (obsidianRouteCasting && obsidianRouteFails >= 3) {
+                // 【fix212】两路连败收场前补销账：本目标真抵达过账本点且
+                // 零产出，即该点已找遍无可用岩浆（旧版只有 attempts≥10
+                // 一处调用本函数，此收场路径漏记，坏点永不销账）。
+                strikeLavaLedgerIfArrivedEmpty();
                 finish("黑曜石失败：挖矿与浇铸两路连败，交回规划层 outcome=" + outcome);
             }
             return;
@@ -5334,6 +5438,19 @@ public final class GoalExecutor {
         }
         if (outcome.contains("到达")) {
             obsidianDescendFails = 0;
+            return;
+        }
+        // 【fix196】礼让收场不计数：分级守卫拒挖是偏好事件、非挖掘失败，
+        // 规划层下一 decide 即补造石镐续挖；计入连败会污染路线降级判定。
+        if (outcome.contains("礼让收场")) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 浇铸下挖礼让不计数 | outcome=" + outcome
+                    + "（fix196）");
+            // 【fix215】礼让不计数≠原地重派：守卫状态不变，重派 descend
+            // 必然同果（farm189 实证 ~1 秒节律空转 290+ 次、白烧目标
+            // 看门狗 300 秒）。置待交接标，本 tick 随即 finish 交规划层
+            // 补镐（fix109 对「缺少镐」的同款处置）；已挖深度不丢——
+            // 补镐后新目标在当前位置续挖。
+            obsidianPickYieldPending = true;
             return;
         }
         obsidianDescendFails++;
@@ -5350,6 +5467,58 @@ public final class GoalExecutor {
                     + " 浇铸下挖缺镐速断 | outcome=" + outcome
                     + "（fix109：不原地重派，直接交规划器补镐）");
         }
+    }
+
+    /**
+     * 【fix213】旅途下地的地面高度：本列 + 8 向 12 格列的高度图
+     * （MOTION_BLOCKING_NO_LEAVES）采样取最小。自家恢复栈是单列高柱，
+     * 本列高度图就是柱顶（223），看本列等于没下地；邻列才是真地面。
+     * 采样全高（真高原）时取最小也无妨——下到邻列地面再赶路同样成立。
+     */
+    private int tripGroundLevel() {
+        net.minecraft.world.level.levelgen.Heightmap.Types type =
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
+        BlockPos center = npc.blockPosition();
+        int min = Integer.MAX_VALUE;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                int y = npc.level().getHeight(type,
+                        center.getX() + dx * 12, center.getZ() + dz * 12);
+                if (y < min) {
+                    min = y;
+                }
+            }
+        }
+        return min == Integer.MAX_VALUE ? center.getY() : min;
+    }
+
+    /**
+     * 【fix195】账本点落空销账：本目标消费了账本点（抵近过）且整轮找遍
+     * 仍无岩浆时，给该点记一次失败（2 次销账，同 OreMemory 纪律）；
+     * 只记一次（obsidianLavaStruck 闩），去过点附近才有资格判它落空。
+     * 【fix212】抵达凭据改认 obsidianLavaArrived：旧口径在调用时复核
+     * 「结束位置距点 ≤32 格」，但抵达后本地搜湖必然漂移（farm182 第一轮
+     * 收场漂到 47 格外），且两路连败收场根本不调本函数——坏点 attempts
+     * 永远 0、永远最近、永远被选（六轮实证）。真抵达过则免除结束位置
+     * 复核；未抵达维持原复核（旅途放弃不销账，fix195d 不变）。
+     */
+    private void strikeLavaLedgerIfArrivedEmpty() {
+        if (obsidianLavaTarget == null || obsidianLavaStruck || !obsidianLavaTripDone) {
+            return;
+        }
+        if (!obsidianLavaArrived) {
+            double dx = obsidianLavaTarget.getX() + 0.5D - npc.getX();
+            double dz = obsidianLavaTarget.getZ() + 0.5D - npc.getZ();
+            if (dx * dx + dz * dz > 32.0D * 32.0D) {
+                return;
+            }
+        }
+        obsidianLavaStruck = true;
+        LavaMemory.bindWorld(npc.level());
+        boolean removed = LavaMemory.noteFailed(npc.npcName(), obsidianLavaTarget);
+        LOG.info("[AIV][GOAL] " + npc.npcName() + " 黑曜石岩浆账本点落空 | lava="
+                + obsidianLavaTarget.toShortString() + " removed=" + removed
+                + "（fix195：到点找遍无岩浆，记一次失败）");
     }
 
     /**
@@ -5372,6 +5541,18 @@ public final class GoalExecutor {
             finish("采集黑曜石需要钻石镐");
             return;
         }
+        // 【fix200】耐久预演：准入旧口径只查「没断」，第五十六棒 live 钻镐
+        // 仅剩 16/1561——挖满 20 块必然中途断镐（断后 finish→补钻链虽能
+        // 兜底，但整趟岩浆之旅+已挖存量全押在半路）。真人出发前先看镐
+        // 够不够挖完：全部钻镐剩余耐久合计 < 还需块数+4 损耗余量时，
+        // 出发前就收场交规划层补钻镐链，不等断在岩浆边。
+        int obsidianNeed = targetCount - have;
+        int pickLeft = diamondPickRemainingTotal();
+        if (pickLeft < obsidianNeed + 4) {
+            finish("钻石镐耐久不足（合计剩 " + pickLeft + "，需挖 "
+                    + obsidianNeed + " 块黑曜石），先补钻镐");
+            return;
+        }
         if (!obsidianRouteLogged) {
             obsidianRouteLogged = true;
             LOG.info("[AIV][GOAL] " + npc.npcName() + " obsidian-route | route="
@@ -5391,9 +5572,168 @@ public final class GoalExecutor {
         // 连续 3 次即收场交回规划器（补镐/换区自有既有步处置）；descend
         // 到达或黑曜石进账清零。
         noteObsidianOutcome();
+        // 【fix215】礼让待交接：优先于连败收场判定，直接交规划层补镐。
+        if (obsidianPickYieldPending) {
+            finish("浇铸黑曜石：下挖礼让（镐子分级守卫），交回规划器补镐");
+            return;
+        }
         if (obsidianDescendFails >= 3) {
             finish("浇铸黑曜石：下挖连续失败（多为石镐烧光待补镐），交回规划器");
             return;
+        }
+        // 【fix195】岩浆账本旅途段（PORTAL 案 A）：账本里有已知岩浆点且人
+        // 不在点位附近时，先分段 goto 到点位再走原流程（在旧湖上空 descend、
+        // nearbyLavaSource 命中即派 mineobsidian）；不再从当前位置盲凿竖井
+        // 撞全淹洞群（第五十三棒五轮实证）。账本为空/本目标已消费账本时
+        // 整段跳过，行为与 fix195 之前完全一致（首探语义不丢兜底）。
+        // 【fix195b】旅途段独占口径（staging 定因）：裸 goto 远跳会被截断到
+        // 48 格、截断点不可站立时在启动口径直接被拒（run 返回 false）——
+        // v1 在派发失败时 fall-through，盲 descend 抢走技能槽整段垄断、
+        // 案 A 当场作废。改：旅途未完一律 return 独占本 tick；沿射线 36 格
+        // 一跳、整跳被拒改 12 格短跳（trek-to-tree 既有口径）；每跳落地按
+        // 实际位移结算（≥8 格清零连败），6 跳无推进或旅途超 240 秒放弃
+        // 账本点（记一次失败）走原流程兜底。
+        if (!obsidianLavaTripDone) {
+            if (obsidianLavaTarget == null) {
+                // 【fix195e】启程前先看脚边：24 格内已有岩浆源（哪怕还没入账）
+                // 就交原流程就地开挖，绝不舍近求远（staging 实证：NPC 站在
+                // 新池边上却被旅途段拉去 500 格外的旧账点）。
+                if (nearbyLavaSource(24, 8) != null) {
+                    obsidianLavaTripDone = true;
+                } else {
+                    LavaMemory.bindWorld(npc.level());
+                    LavaMemory.Entry known = LavaMemory.nearest(
+                            npc.npcName(), npc.blockPosition());
+                    if (known == null) {
+                        obsidianLavaTripDone = true;
+                    } else {
+                        double dx = known.x() + 0.5D - npc.getX();
+                        double dz = known.z() + 0.5D - npc.getZ();
+                        obsidianLavaTarget = known.pos();
+                        if (dx * dx + dz * dz <= 20.0D * 20.0D) {
+                            obsidianLavaTripDone = true;
+                            obsidianLavaArrived = true; // 【fix212】选点即在点位附近，同抵达
+                        } else {
+                            obsidianLavaGotoTries = 0;
+                            obsidianLavaTripStartMillis = System.currentTimeMillis();
+                            obsidianLavaHopX = npc.getX();
+                            obsidianLavaHopZ = npc.getZ();
+                            obsidianLavaHopInFlight = false;
+                            LOG.info("[AIV][GOAL] " + npc.npcName()
+                                    + " 黑曜石直奔已知岩浆点 | lava="
+                                    + obsidianLavaTarget.toShortString()
+                                    + " dist=" + (int) Math.sqrt(dx * dx + dz * dz)
+                                    + "（fix195：案 A 账本优先，免盲凿竖井）");
+                        }
+                    }
+                }
+            }
+            if (obsidianLavaTarget != null && !obsidianLavaTripDone) {
+                double dx = obsidianLavaTarget.getX() + 0.5D - npc.getX();
+                double dz = obsidianLavaTarget.getZ() + 0.5D - npc.getZ();
+                double distSq = dx * dx + dz * dz;
+                if (distSq <= 16.0D * 16.0D) {
+                    obsidianLavaTripDone = true;
+                    obsidianLavaArrived = true; // 【fix212】真抵达，销账资格成立
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " 黑曜石抵达已知岩浆点附近 | lava="
+                            + obsidianLavaTarget.toShortString()
+                            + "（fix195：交回原流程下潜找湖面）");
+                } else if (!"idle".equals(skills.currentSkill())) {
+                    return;
+                } else if (obsidianLavaHopInFlight) {
+                    double mx = npc.getX() - obsidianLavaHopX;
+                    double mz = npc.getZ() - obsidianLavaHopZ;
+                    obsidianLavaHopInFlight = false;
+                    boolean progressed = mx * mx + mz * mz >= 64.0D;
+                    obsidianLavaGotoTries = progressed
+                            ? 0 : obsidianLavaGotoTries + 1;
+                    // 【fix214】无推进一跳即升一级绕行偏角（派跳时生效），
+                    // 有推进清零回正射线——沿障带滑动的位移也算真推进，
+                    // 绕行方向随级数走、净位移逐轮累积。
+                    obsidianLavaDetour = progressed
+                            ? 0 : Math.min(obsidianLavaDetour + 1, 4);
+                    return;
+                } else if (obsidianLavaGotoTries >= 6
+                        || System.currentTimeMillis() - obsidianLavaTripStartMillis
+                        > 480_000L) {
+                    // 【fix195d】旅途放弃不销账：远点走不到只说明本趟放弃，
+                    // 湖还在那儿（玩家同理）；销账只发生在到点找遍
+                    // （strikeLavaLedgerIfArrivedEmpty），别把真湖冤杀。
+                    obsidianLavaTripDone = true;
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " 黑曜石岩浆账本点旅途放弃 | lava="
+                            + obsidianLavaTarget.toShortString()
+                            + " tries=" + obsidianLavaGotoTries
+                            + "（fix195d：多跳无推进/超时，不记失败，走原流程兜底）");
+                } else if (!obsidianLavaGroundDone
+                        && npc.blockPosition().getY() - obsidianLavaTarget.getY() > 40
+                        && npc.blockPosition().getY() > tripGroundLevel() + 10) {
+                    // 【fix213】高处先下地：旅途跳点是水平射线，站在恢复
+                    // 栈顶（Y=223 一柱之巅）/高台上时射线全是空气——goto
+                    // 退到同高 12 格仍是半空，walk-stuck+超时一跳记一次
+                    // tries，6 跳全程离不开柱顶（farm187 实证；五/六轮
+                    // 栈顶派单同死）。玩家站在高处要去远方，先顺柱下到
+                    // 地面再走。一次性子段：descend 到地面高度（采样口径
+                    // 见 tripGroundLevel），派发成败都置标交回原派跳逻辑，
+                    // 6 跳放弃/480 秒兜底原样保留；descend 结局走既有
+                    // noteObsidianOutcome 消费（到达清零 descend 连败账）。
+                    obsidianLavaGroundDone = true;
+                    int groundY = tripGroundLevel();
+                    boolean started = skills.run(
+                            new Intent("", "descend", params("y", groundY)), "目标");
+                    LOG.info("[AIV][GOAL] " + npc.npcName()
+                            + " 黑曜石旅途先下地 | from="
+                            + npc.blockPosition().toShortString()
+                            + " groundY=" + groundY + " descend=" + started
+                            + "（fix213：高处水平射线全是空气，先下到地面再赶路）");
+                    return;
+                } else {
+                    double dist = Math.sqrt(distSq);
+                    double hopLen = Math.min(36.0D, dist - 8.0D);
+                    // 【fix214】绕行偏角：正射线连撞障带时（(350,-232) 河沟
+                    // 带 farm183/188 两度实证：A* 长路径身体走 0~2 格即
+                    // 路径中断、同点连环），按级数把跳向旋出正射线，沿带
+                    // 找渡口——fix111 找岩浆走廊的同款手法接到旅途跳上。
+                    double ux = dx / dist;
+                    double uz = dz / dist;
+                    if (obsidianLavaDetour > 0) {
+                        double[] detourAngles = {Math.PI / 4.0D, -Math.PI / 4.0D,
+                                Math.PI / 2.0D, -Math.PI / 2.0D};
+                        double ang = detourAngles[
+                                Math.min(obsidianLavaDetour - 1, 3)];
+                        double cos = Math.cos(ang);
+                        double sin = Math.sin(ang);
+                        double rx = ux * cos - uz * sin;
+                        uz = ux * sin + uz * cos;
+                        ux = rx;
+                        LOG.info("[AIV][GOAL] " + npc.npcName()
+                                + " 黑曜石旅途绕行跳 | detour=" + obsidianLavaDetour
+                                + "（fix214：正射线无推进，偏角沿障带找渡口）");
+                    }
+                    boolean started = false;
+                    if (hopLen > 4.0D) {
+                        JsonObject params = new JsonObject();
+                        params.addProperty("x", npc.getX() + ux * hopLen);
+                        params.addProperty("z", npc.getZ() + uz * hopLen);
+                        started = skills.run(new Intent("", "goto", params), "目标");
+                    }
+                    if (!started) {
+                        JsonObject hop = new JsonObject();
+                        hop.addProperty("x", npc.getX() + ux * 12.0D);
+                        hop.addProperty("z", npc.getZ() + uz * 12.0D);
+                        started = skills.run(new Intent("", "goto", hop), "目标");
+                    }
+                    if (started) {
+                        obsidianLavaHopX = npc.getX();
+                        obsidianLavaHopZ = npc.getZ();
+                        obsidianLavaHopInFlight = true;
+                    } else {
+                        obsidianLavaGotoTries++;
+                    }
+                    return;
+                }
+            }
         }
         // 【fix124】换区编排（回地表→地面换位→原流程 descend 自然接管）：
         // phase 1 等 ascend 把人带出地下（Y>-10 视为已回地表层）；phase 2
@@ -5447,8 +5787,19 @@ public final class GoalExecutor {
         // 先到地下层：地表附近常常找不到水（草原/沙漠/平原），
         // 但 Y=-50 附近既有岩浆湖（浇铸材料）也有地下水（装水），
         // 一次 descend 解决两个前置条件。
-        if (npc.blockPosition().getY() > -45) {
-            JsonObject params = params("y", -52);
+        // 【fix195c】脚边已有岩浆源就不下潜：地表岩浆池（天然的或账本
+        // 直奔抵达的）就在身边时玩家直接开挖，不会先挖口井下去再爬回来；
+        // 深湖场景 nearby 恒空、下潜口径不变。
+        // 【fix223】已抵达账本点（fix212 obsidianLavaArrived）时潜到点位
+        // 自身的 Y：浅点 (313,18,-215) 的湖在 Y=18，旧口径无条件潜 -52
+        // 整整潜过头 70 格、井底扫描恒空（farm197 实证 27 分钟零进展）。
+        // 门槛 Y > diveY+7 在默认支与旧值 -45 恒等，未抵达/旅途放弃/
+        // 就地开挖诸路径行为一字不改。
+        int diveY = (obsidianLavaArrived && obsidianLavaTarget != null)
+                ? obsidianLavaTarget.getY() : -52;
+        if (npc.blockPosition().getY() > diveY + 7
+                && nearbyLavaSource(24, 8) == null) {
+            JsonObject params = params("y", diveY);
             if (skills.run(new Intent("", "descend", params), "目标")) {
                 return;
             }
@@ -5472,6 +5823,16 @@ public final class GoalExecutor {
 
         BlockPos lava = nearbyLavaSource(24, 8);
         if (lava != null) {
+            // 【fix212】派单提示点优先露面源：nearbyLavaSource 取的是任意
+            // 源方块最近者——湖底覆盖块能以 0.2 格险胜湖面块（farm182
+            // 第一轮实证：提示点 (472,-60,-245)、湖面在其上方 6 格），而
+            // mineobsidian 绕提示点的露面扫描只有 ±6/±2，湖面结构性看
+            // 不见、当场判无露面。派单要对着湖面派：露面源（未被拉黑）
+            // 优先，nearbyLavaSource 的记账副作用已在上行发生、不受影响。
+            BlockPos exposed = scanExposedLava(24, 8);
+            if (exposed != null && !badLavaHints.contains(exposed)) {
+                lava = exposed;
+            }
             lastObsidianHint = lava; // 【fix112】记下派单点，失败时拉黑用
             JsonObject params = params("x", lava.getX(), "y", lava.getY(), "z", lava.getZ());
             boolean started;
@@ -5488,6 +5849,7 @@ public final class GoalExecutor {
         }
         attempts++;
         if (attempts >= 10) {
+            strikeLavaLedgerIfArrivedEmpty();
             // 【fix124】第一次找遍无岩浆不直接判败：井底若是封闭口袋，
             // 走廊 goto 目标全不可站立、原地磨到判败（farm87 实证）。先
             // 回地表换位再下井（玩家口径），换过一次仍找不到才诚实收场。
@@ -6057,6 +6419,34 @@ public final class GoalExecutor {
                 LOG.info("[AIV][GOAL] " + npc.npcName() + " 近终点竖向收尾（fix156） | 水平="
                         + Math.round(Math.sqrt(horizontalSq)) + " 高度差="
                         + Math.round(travelY - npc.getY()));
+                // 【fix208】宽带无下降记账：同站位（水平移 <4 格）连续派单间
+                // 高度差改善 <2 格累计，满 3 次诚实收场交规划层退避/换路——
+                // 玩家在山头下不去会换位或绕行，不在同点每 90 秒撞一轮看门
+                // 狗。真下降 ≥2 格或换了站位即清账，不误伤正常收尾；窄带
+                // （水平 ≤4 格）由 fix107 死线管辖、不走本账。
+                double absDelta = Math.abs(travelY - npc.getY());
+                int feetX = npc.blockPosition().getX();
+                int feetZ = npc.blockPosition().getZ();
+                boolean sameSite = wideAlignLastAbsDelta >= 0.0D
+                        && Math.abs(feetX - wideAlignLastX) < 4
+                        && Math.abs(feetZ - wideAlignLastZ) < 4;
+                if (sameSite && absDelta > wideAlignLastAbsDelta - 2.0D) {
+                    wideAlignFailCount++;
+                } else {
+                    wideAlignFailCount = 0;
+                }
+                wideAlignLastAbsDelta = absDelta;
+                wideAlignLastX = feetX;
+                wideAlignLastZ = feetZ;
+                if (wideAlignFailCount >= 3) {
+                    wideAlignFailCount = 0;
+                    wideAlignLastAbsDelta = -1.0D;
+                    LOG.info("[AIV][GOAL] " + npc.npcName() + " 竖向收尾宽带收场（fix208） | 水平="
+                            + Math.round(Math.sqrt(horizontalSq)) + " 高度差=" + Math.round(absDelta)
+                            + "（同站位连续 3 次派单高度差改善 <2 格，交规划层退避/换路）");
+                    finish("长途行进受阻：近终点竖向收尾多次无下降");
+                    return;
+                }
             }
             String action = npc.getY() > travelY ? "descend" : "ascend";
             JsonObject params = params("y", travelY, "max", 160);
@@ -6467,7 +6857,56 @@ public final class GoalExecutor {
                 best = pos.immutable();
             }
         }
+        if (best != null) {
+            // 【fix195】真实目击即落岩浆账本（同点 12 格内不重复写盘）。
+            if (lastLavaLedgerPos == null
+                    || lastLavaLedgerPos.distSqr(best) > 12.0D * 12.0D) {
+                lastLavaLedgerPos = best;
+                LavaMemory.bindWorld(npc.level());
+                LavaMemory.record(npc.npcName(), best);
+            }
+        }
         return best;
+    }
+
+    /** 【fix195】扫半径内最近的露面岩浆源（源方块∧上方空气，同 mineobsidian 可用口径）。 */
+    private BlockPos scanExposedLava(int radius, int vertical) {
+        BlockPos center = npc.blockPosition();
+        BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (BlockPos pos : BlockPos.betweenClosed(
+                center.offset(-radius, -vertical, -radius),
+                center.offset(radius, vertical, radius))) {
+            BlockState state = npc.level().getBlockState(pos);
+            if (!state.is(Blocks.LAVA) || !state.getFluidState().isSource()) {
+                continue;
+            }
+            if (!npc.level().getBlockState(pos.above()).isAir()) {
+                continue;
+            }
+            double distanceSq = center.distSqr(pos);
+            if (distanceSq < bestSq) {
+                bestSq = distanceSq;
+                best = pos.immutable();
+            }
+        }
+        return best;
+    }
+
+    /** 【fix200】全部钻石/下界合金镐的剩余耐久合计（黑曜石出发前预演用）。 */
+    private int diamondPickRemainingTotal() {
+        int total = 0;
+        for (int slot = 0; slot < MAIN_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty() || !stack.isDamageableItem()) {
+                continue;
+            }
+            String path = pathOf(stack);
+            if ("diamond_pickaxe".equals(path) || "netherite_pickaxe".equals(path)) {
+                total += stack.getMaxDamage() - stack.getDamageValue();
+            }
+        }
+        return total;
     }
 
     private boolean hasUsableDiamondPickaxe() {
@@ -6644,6 +7083,8 @@ public final class GoalExecutor {
         }
         BlockPos base = npc.blockPosition();
         int placed = 0;
+        int farmSkipped = 0;
+        FarmMemory.bindWorld(npc.level());
         outer:
         for (int dy = 0; dy <= 2; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
@@ -6663,6 +7104,16 @@ public final class GoalExecutor {
                     // 13 秒致死）。缺这一两块按「部分完成」既有口径接受。
                     if (npc.getBoundingBox().intersects(
                             new net.minecraft.world.phys.AABB(pos))) {
+                        continue;
+                    }
+                    // 【fix219】建屋永不覆盖自家田格（土与作物位）：放置条件只认
+                    // air/replaceable，而作物属 replaceable、会被墙块直接盖掉
+                    // （farm192 田注销前夜：小屋 base 距田锚点仅 2 格、3×3 壳压田
+                    // 缘作物层；fix198 只守 mine、放置面零校验）。跳过该格按
+                    // fix72 的「部分完成」既有口径接受——只堵插件自有覆盖向量，
+                    // 不动小屋选址与任何闸值；土变回普通土的踩踏/水源面不在此列。
+                    if (FarmMemory.isFarmCell(npc.npcName(), pos)) {
+                        farmSkipped++;
                         continue;
                     }
                     BlockState current = npc.level().getBlockState(pos);
@@ -6698,6 +7149,10 @@ public final class GoalExecutor {
         }
         LOG.info("[AIV][GOAL] " + npc.npcName() + " 建造小屋 | base=" + base.toShortString()
                 + " 材料=" + (mixed ? "混合" : materialPath) + " 放置=" + placed);
+        if (farmSkipped > 0) {
+            LOG.info("[AIV][GOAL] " + npc.npcName() + " 建屋避让田格（fix219） | 跳过=" + farmSkipped
+                    + " base=" + base.toShortString());
+        }
         return placed;
     }
 
