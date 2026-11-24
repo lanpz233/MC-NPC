@@ -10,6 +10,7 @@ import com.example.aivillager.snapshot.InventorySnapshot;
 import com.example.aivillager.survival.SurvivalController;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.core.HolderSet;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -22,12 +23,21 @@ import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.SpawnerBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.Structure;
+import net.minecraft.world.level.levelgen.structure.StructureStart;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.block.Biome;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.BiomeSearchResult;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.logging.Logger;
@@ -124,6 +134,12 @@ public final class ProgressionPlanner {
      * 主线（附近真没动物不能把整条科技树堵死），退避到期仍由它优先重试。 */
     private int foodFailStreak;
     private long foodBackoffUntil;
+    /** 【fix371】末影人猎杀专属连败与退避：与皮革/口粮同理——目标不可达
+     * （岩浆口袋/高台）时 120 秒超时原样重派成环（318 棒实验室实证：
+     * 29 次重派、零位移）；连败退避 60 秒起、随连败翻倍、上限 5 分钟，
+     * 退避期内 decideNether 改派下界探索换位，换个地方再猎。 */
+    private int slayFailStreak;
+    private long slayBackoffUntil;
     /** 【fix116】备用镐合成专属退避：第十八轮"常备 ≥2 把石镐"是软向导，
      * 却无退避——背包塞满做不出来时（farm80 实证：41 槽皆贵重/重复物、
      * dropJunk 无可扔、合成失败 26 次）它排在阶段链前部，把 PORTAL 等
@@ -153,10 +169,15 @@ public final class ProgressionPlanner {
     private long overnightHoldLoggedNight = -1L;
     /** 【fix146】保持门昨夜曾生效的 day 索引（天亮打一行解除用）；-1 表示未生效。 */
     private long overnightHoldActiveNight = -1L;
+    /** 【fix240】过夜保持心跳上次打印的墙钟毫秒：保持等待段约 30 秒一行，
+     * 防整夜零日志与冻死不可区分（81 棒实验场定量保持段 236 秒零日志）。 */
+    private long overnightHoldLastHeartbeatMs;
     /** 【fix146b】(c) 支「回小屋」当夜一次性闸：小屋站位距约 2.2 格时规划层
      * 判「未到」、travel 目标层到达容差约 2.5 格判「到达」——两口径错位带内
      * 1 Hz 连派（farm113 首夜实证）。派过一次即认 travel 口径、当夜落回等待。 */
     private long shelterReturnNight = -1L;
+    /** 【fix229】本夜已派过合木板兜底的日索引（防合成失败时整夜循环重派）。 */
+    private long plankCraftNight = -1L;
     /** 【fix146】本次 decide 调用中保持门是否已裁决「保持」（含原地等待的 null 情形，
      * 由 overnightHoldGate 置位、decide 读后决定是否直接返回待命）。 */
     private boolean overnightHoldEngaged;
@@ -164,6 +185,11 @@ public final class ProgressionPlanner {
      * 序号未变不许进 phase（phase 不得预进）；回读到「ascend 已回到地表」才放行。 */
     private boolean relocationAscendIssued;
     private int relocationAscendSeq;
+    /** 【fix252】换区 ascend 同点连败计数：只认 ascend 本人的非地表结局、且
+     * 位置未变才累加；≥3 说明上挖腿在此地形结构性无路（farm253 岩浆湖孤岛
+     * 连败 39+ 次实证），放弃上挖腿改走 phase 1 横移换位链消费。 */
+    private int relocationAscendFailStreak;
+    private net.minecraft.core.BlockPos relocationAscendFailPos;
     /** 【fix147】换区 explore 派单起点站位：结局按水平位移 ≥24 格验收，
      * 失败/未挪窝不许清标放行原地挖矿。 */
     private net.minecraft.core.BlockPos relocationExploreStartPos;
@@ -190,6 +216,11 @@ public final class ProgressionPlanner {
     /** 【fix69】存箱专属连败与退避（与安置床同口径）。 */
     private int storeFailStreak;
     private long storeBackoffUntil;
+    /** 【fix251】存箱接近被分级守卫堵死的待补镐标记：存箱目标以守卫礼让
+     * 结局收场时置位，6.77 派单点在重派存箱前先派「制作石镐」补镐闭环
+     * （守卫的「交规划层补造」委托此前在目标内落空——目标运行期规划层
+     * 拿不到控制权、存箱步又没有挖矿步那样的补镐保障步）。 */
+    private boolean storeTierYieldPending;
     /** 【fix70·D4】装水专属连败与退避：附近没水源时注定连败，不能让装水步
      * 在地表反复抢钻石主线；退避到期再试。 */
     private int bucketFillFailStreak;
@@ -216,12 +247,53 @@ public final class ProgressionPlanner {
     private long reserveBackoffUntil;
     /** 【fix160】13.1 让位专行节流时刻：让位生效且甲有缺件时最多 60 秒一行。 */
     private long portalYieldLogAt;
+    private long netherYieldLogAt;
+    /** 【fix274】铁甲让位专行节流时刻：与 fix160/266 同口径 60 秒一行。 */
+    private long ironYieldLogAt;
+    /** 【fix289】行军预算不足专行节流时刻：与 fix160/266/274 同口径 60 秒一行。 */
+    private long marchBudgetLogAt;
+    /** 【fix361·277 棒】走近门 travel 热循环专属记账：维度错位记录专行节流
+     * 时刻；无有效门位专行节流时刻；已在门位容差内专行节流时刻；上次派往
+     * 的门位／派单时站位／连续无进展次数／退避到期（与 fix103/250 口径同族：
+     * 同一目标连续 3 次派单间位移 <1 格即退避 10 分钟）。 */
+    private long portalDimMismatchLogAt;
+    private long portalNoTargetLogAt;
+    private long portalTravelNearLogAt;
+    private BlockPos portalTravelTarget;
+    private BlockPos portalTravelFrom;
+    private int portalTravelNoProgress;
+    private long portalTravelBackoffUntil;
+    /** 【fix336】存箱行军预算不足专行节流时刻：与 fix289 同口径 60 秒一行。 */
+    private long storeBudgetLogAt;
     /** 【fix103】专程回程补给专属连败与退避 + 在途标记：与 fix98 同款自己
      * 记账（travel 单趟以分钟计，退避 120 秒×连败、上限 600 秒）；在途标记
      * 只为到达专行日志（回到目标 48 格内打一行、清标记）。 */
     private int homeReturnFailStreak;
     private long homeReturnBackoffUntil;
     private boolean homeReturnActive;
+    /** 【fix306·156 棒】【fix365·289 棒】下界要塞 travel 停滞专属记账（照 fix103/250 口径）：
+     * decideNether 的要塞腿此前无任何收场记账——「长途行进受阻」不含失败
+     * 关键词、goalFailed=false、共享 failStreak 反被清零，decide 原样重派
+     * 同一长途成环（正式服 2026-11-14 入界实证：(21,46,-19) 封闭口袋里
+     * 36.5 秒一轮、连环 5 次零位移，其后漂移至 (-68,36,-14) 再钉死 ≥8 轮，
+     * 直到服务器被换机杀死才停）。同口袋（水平 <16 格）连停 ≥2 次置
+     * escapeArmed，decideNether 改派 ascend 挖楼梯上行出袋（梯次上限 3）；
+     * 非停滞收场/换口袋（≥16 格）/梯次用满退探索时清账。
+     * fix365：森林腿是第三条未入册的腿——正式服 288 新 boot 实证：森林腿
+     * 144 收场、约 37 秒一轮、水平 381 恒定、净位移 0；实验场同款 120 收场。
+     * 记账口径扩至「前往诡异森林」，出袋支提至 decideNether 顶部（要塞腿／
+     * 森林腿共用），梯次上限 3、梯次用满退探索换位不变。 */
+    private int netherTravelStallStreak;
+    private BlockPos netherTravelStallPos;
+    private int netherStallEscapesUsed;
+    private boolean netherStallEscapeArmed;
+    /** 【fix378·358 棒】v3 下行后抑 ascend：v3 下行换点后，下一轮出袋若再走
+     * 旧 ascend 支会把 NPC 爬回 Y≥100 岩台、v3 再次触发（357 实证：下行
+     * Y=120→72 后 ascend 目标 Y=100，爬回 Y=99，收官后 [00:02:59] 第二次触发；
+     * 358 第 1 轮已见第三次触发 [00:05:55]）。下行后第一次出袋改派下界探索
+     * 横向换位（24 格），从新位置重试要塞投影点 travel；一次即耗尽，
+     * 防口袋里真需 ascend 出袋时被长期抑制。只在 v3 分支内置位（眼已齐态）。 */
+    private boolean v3DescendSuppressAscend;
     /** 【fix117】饥饿求生专属记账：步 0 是 decide() 顶部绝对抢占（零食物
      * 时只派 hunt 半径 12），fix103 回程步（6.65）与 tend（6.7）都在它之下、
      * 永远轮不到——动物荒芜带里 hunt 连败没有任何出口（farm82 实证空转
@@ -253,6 +325,34 @@ public final class ProgressionPlanner {
     private long surfAscendSeq;
     private int surfAscendFailStreak;
     private net.minecraft.core.BlockPos surfAscendAnchorPos;
+    /** 【fix321】(B) ascend 无垫脚连败记账：技能层新结局含「没有垫脚方块」时 +1，
+     * 其他新技能结局清零；锚点用于判断人是否已挪开 ≥4 格（换了地面即重新计数）。
+     * 195 棒定谳环②：该结局不含 isFailureText 任一关键词，通用失败记账从不触发，
+     * 规划层才会无限原样重派 ascend。降级腿（横移 travel）成功到达也清零。 */
+    private int noFootingAscendStreak;
+    private net.minecraft.core.BlockPos noFootingAnchorPos;
+    /** 【fix321】(B) 降级腿方向轮换：0=+X、1=+Z、2=-X、3=-Z。 */
+    private int noFootingFallbackDir;
+    /** 【fix350】下矿口粮门 ascend 结局回读记账（照 fix149/fix154 范式）：261 棒定谳——
+     * 新图 NPC 在床边 (2,64,-109)，床列高度图 83（悬挑），underground() 恒判地下，
+     * 口粮门无条件重派 ascend，ascend 在床边每约 5 秒以「连续 6 级上不去」收场也无人
+     * 消费，hunt 支永不可达（boot-fresh177 本 boot 266 行、22 分钟+）。
+     * 改回读制：ascend 同点连败 ≥2 记放弃点、落回地表口径改派 hunt；位移 ≥16 格后重试。 */
+    private boolean miningFoodAscendIssued;
+    private long miningFoodAscendSeq;
+    private int miningFoodAscendFailStreak;
+    private net.minecraft.core.BlockPos miningFoodAscendGiveUpPos;
+    /** 【fix324】烈焰人刷怪笼锚点：扫已加载区块所得，按三维距离排序；下标轮换。 */
+    private List<BlockPos> blazeSpawners = new ArrayList<>();
+    private long blazeSpawnerScanAt;
+    private BlockPos blazeSpawnerScanCenter;
+    private int blazeSpawnerIndex;
+    /** 【fix324】无刷怪笼时下行要塞包围盒层只派一次（置标防重派成环）。 */
+    private boolean blazeFloorLegDone;
+    /** 【fix329】诡异森林锚点：末影人猎杀先赴森林（219 棒定谳：诡异森林末影人权重 1/1=100%，
+     * 下界荒地 1/168=0.6%。锚点在 NPC 512 格内有效；空结果 60 秒节流，防每派单重搜。 */
+    private BlockPos endermanForestAnchor;
+    private long endermanForestSearchAt;
     /** 0=ascend 腿、1=strip 横移腿。 */
     private int surfAscendPhase;
     private boolean surfStripIssued;
@@ -264,6 +364,12 @@ public final class ProgressionPlanner {
      * （不占 fix154 横移轮次）。锚点位移清账时一并重置。 */
     private int surfMaterialRounds;
     private boolean surfMaterialRound;
+    /** 【fix317】回地表腿补镐轮记账：横移 strip 被分级守卫礼让收场
+     * （「交规划层补造石镐」）时，本腿至多插入一次补镐合成步
+     * （surfAscendPhase=2）；补完回 ascend 腿，合成未产出可用石镐也
+     * 不再重插（横移/放弃等既有出口照常可达，不许只堵不疏）。随既有
+     * 清账点（换地形/已回地表/放弃本腿）一并重置。 */
+    private boolean surfPickCraftTried;
     /** 【fix182】hungerAscendStep 材料轮次记账（同上口径，本腿 ≤1 轮）。 */
     private boolean hungerMaterialIssued;
     private long hungerMaterialSeq;
@@ -299,6 +405,18 @@ public final class ProgressionPlanner {
     private long storeTripBackoffUntil;
     /** 【fix217】满包存箱夜间抵达保留标记的日志节流（同夜只记一次）。 */
     private long storeNightHoldLogAt;
+    /** 【fix342】无箱等退避期间的日志节流（60 秒记一次）。 */
+    private long fix342WaitLogAt;
+    /** 【fix364】满包做箱子无空槽轮次（288 棒定谳）：空槽=0 时箱子合成链的木板中间产物
+     * 无处放 → 合成恒败 → 失败只涨退避（封顶 600 秒）→ 每 10 分钟原样重试；fix210
+     * 30 分钟超时清标后，下一次合镐满包失败即重建标记，循环自愈、无自然终止。
+     * 修法：空槽=0 时不派必败合成，每 120 秒计一无进展轮次（fix342NoSlotRetryAt），
+     * 满 2 轮清标并压住重建（fix342BlockedEmptySlots=当时的空槽数）；空槽数一变
+     * （进食／放置腾出格子）方可再置标。NPC 落回常规（走动／进食腾格），不再钉在基地。
+     * 全程不丢东西（Fong 2026-11-09 腾格口子未批）。 */
+    private long fix342NoSlotRetryAt;
+    private int fix342NoSlotCycles;
+    private int fix342BlockedEmptySlots = -1;
     /** 连败换区状态：同资源连弃 2 次后置位，先回地表再远距离移动，换一片矿区再挖。 */
     private boolean relocationActive;
     private String relocationResource = "";
@@ -443,6 +561,29 @@ public final class ProgressionPlanner {
                 outcome = skillOutcomeText;
             }
         }
+        // 【fix321】(B) ascend 无垫脚连败记账：只认技能层新结局里的「没有垫脚方块」
+        // （ascend 由规划层直接派技能，无目标层包装；目标层结局不参与）。
+        // 其他新技能结局（回地表成功／别技能收场）清零；降级腿 travel 成功到达也清零
+        // （人已换到新地面，ascend 值得重派一次；否则守卫会无限派 travel 不重试 ascend）。
+        if (skillOutcomeText != null) {
+            if (skillOutcomeText.contains("没有垫脚方块")) {
+                if (noFootingAnchorPos == null) {
+                    noFootingAnchorPos = npc.blockPosition();
+                }
+                noFootingAscendStreak++;
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " ascend 无垫脚连败（fix321） | 连败="
+                        + noFootingAscendStreak + " outcome=" + skillOutcomeText
+                        + " 位置=" + npc.blockPosition().toShortString());
+            } else {
+                noFootingAscendStreak = 0;
+                noFootingAnchorPos = null;
+            }
+        }
+        if (goalNewOutcome && goalOutcomeText != null && goalOutcomeText.contains("到达目的地")) {
+            noFootingAscendStreak = 0;
+            noFootingAnchorPos = null;
+            noFootingFallbackDir = 0;
+        }
         // 【第十九轮附带修复】失败记账分开算（雪原复验实测逮到）：旧版技能层
         // 结果会覆盖目标层结果——目标刚"放弃"、同 tick 一个技能报"到达"，
         // 失败就被冲掉、连败清零，木料安全线放行/挖煤退避/皮靴退避这些靠
@@ -464,6 +605,21 @@ public final class ProgressionPlanner {
             // 目标成功完成，或（无新目标结果时）技能步骤有了结果且非失败：清零。
             failStreak = 0;
             lastFailedStage = "";
+        }
+        // 【fix324】(C) 空手猎杀即换刷怪笼（slay 版 rotateHuntHeading，205 棒定谳环⑤）：
+        // 「猎杀换层」或 fix106 空手放弃（target=blaze）时轮换到下一个刷怪笼，
+        // 不原样重派同一个空锚点；去刷怪笼的 travel 腿本身失败也轮换。
+        // 【fix329】(B) 只轮换烈焰人：末影人猎杀的「猎杀换层」不含 blaze（219 棒定谳环⑤，
+        // 末影人无刷怪笼、轮换序号毫无意义，之前已误涨到 4）。
+        if (goalNewOutcome && goalOutcomeText != null
+                && ((goalOutcomeText.contains("猎杀换层") && goalOutcomeText.contains("blaze"))
+                        || (goalOutcomeText.contains("追杀放弃") && goalOutcomeText.contains("target=blaze")))) {
+            blazeSpawnerIndex++;
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 猎杀换刷怪笼（fix324） | 下一个序号=" + blazeSpawnerIndex
+                    + " outcome=" + goalOutcomeText);
+        } else if (goalFailed && "前往刷怪笼".equals(lastStage)) {
+            blazeSpawnerIndex++;
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 赴刷怪笼失败换锚点（fix324） | 下一个序号=" + blazeSpawnerIndex);
         }
         // 【第二十四轮】皮革/口粮专属退避记账：只认目标层结果、只认各自阶段名，
         // 与共享 failStreak 分开（理由见字段注释）。退避时长随各自连败增长。
@@ -494,8 +650,15 @@ public final class ProgressionPlanner {
                     // 两轮 + farm173 田边一轮全卡空槽=2 实证）。阈值对齐合成
                     // 门槛后，凡合成因满包连败 ≥2 且空槽不足合成即置标自解。
                     if (pickCraftFailStreak >= 2 && craftFullStoreSince == 0L
-                            && countEmptyMainSlots() < 3 && hasStorableLoot()) {
+                            && countEmptyMainSlots() < 3 && hasStorableLoot()
+                            && (fix342BlockedEmptySlots < 0
+                                    || countEmptyMainSlots() != fix342BlockedEmptySlots)) {
                         craftFullStoreSince = now;
+                        // 【fix364】压制解除：袋态已变（空槽数变了），方可重建标记；
+                        // 无空槽轮次计数同步清零，防旧时间戳拖到新一轮。
+                        fix342BlockedEmptySlots = -1;
+                        fix342NoSlotCycles = 0;
+                        fix342NoSlotRetryAt = 0L;
                         // 【fix210】进展账同步开局：最佳距离待步 -0.5 首轮
                         // 以当前三维距离落基线，进展时刻先记置标时刻。
                         craftFullStoreBestDist = Double.MAX_VALUE;
@@ -528,6 +691,17 @@ public final class ProgressionPlanner {
                 } else {
                     foodFailStreak = 0;
                     foodBackoffUntil = 0L;
+                }
+            } else if ("猎杀末影人".equals(lastStage)) {
+                // 【fix371】末影人猎杀退避：见字段注释；成功清零。
+                if (goalFailed) {
+                    slayFailStreak++;
+                    slayBackoffUntil = now + Math.min(300_000L, 60_000L * slayFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 猎杀退避 | 连败=" + slayFailStreak
+                            + " 退避秒=" + (slayBackoffUntil - now) / 1000L);
+                } else {
+                    slayFailStreak = 0;
+                    slayBackoffUntil = 0L;
                 }
             } else if ("开垦农田".equals(lastStage) || "回旧田址".equals(lastStage)) {
                 // 【fix171】回旧田址腿与开田共用退避记账：同一立项的两段，
@@ -568,6 +742,31 @@ public final class ProgressionPlanner {
                     bedFailStreak++;
                     bedBackoffUntil = now + Math.min(300_000L, 60_000L * bedFailStreak);
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 安置床退避 | 连败=" + bedFailStreak
+                            + " 退避秒=" + (bedBackoffUntil - now) / 1000L);
+                } else {
+                    bedFailStreak = 0;
+                    bedBackoffUntil = 0L;
+                }
+            } else if ("找羊毛做床".equals(lastStage)) {
+                // 【fix247】找羊毛与安置床共用床退避字段（同一立项两段，同 fix171
+                // 开田/回旧田址共用口径）：失败同涨退避，防抢占与 6.76 两处在
+                // 无羊地形轮流热点火；成功/有获清零，次轮床料分支自然接做床。
+                if (goalFailed) {
+                    bedFailStreak++;
+                    bedBackoffUntil = now + Math.min(300_000L, 60_000L * bedFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 找羊毛退避 | 连败=" + bedFailStreak
+                            + " 退避秒=" + (bedBackoffUntil - now) / 1000L);
+                } else {
+                    bedFailStreak = 0;
+                    bedBackoffUntil = 0L;
+                }
+            } else if ("清理床边".equals(lastStage)) {
+                // 【fix227】清障与安置床共用床退避字段：挖不动/到不了位时
+                // 退避，不许每 decide 重派；成功则清零，下次抵基址复验。
+                if (goalFailed) {
+                    bedFailStreak++;
+                    bedBackoffUntil = now + Math.min(300_000L, 60_000L * bedFailStreak);
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 床边清障退避 | 连败=" + bedFailStreak
                             + " 退避秒=" + (bedBackoffUntil - now) / 1000L);
                 } else {
                     bedFailStreak = 0;
@@ -617,9 +816,17 @@ public final class ProgressionPlanner {
                     storeBackoffUntil = now + Math.min(300_000L, 60_000L * storeFailStreak);
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 存箱退避 | 连败=" + storeFailStreak
                             + " 退避秒=" + (storeBackoffUntil - now) / 1000L);
+                    // 【fix251】守卫礼让结局：置待补镐标记，6.77 重派存箱前
+                    // 先补造石镐（退避照旧涨，补镐是补给动作不被退避挡）。
+                    if (goalOutcomeText != null && goalOutcomeText.contains("分级守卫")) {
+                        storeTierYieldPending = true;
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 存箱接近被分级守卫堵死（fix251） | 待补镐：下轮先补造石镐再重派存箱");
+                    }
                 } else {
                     storeFailStreak = 0;
                     storeBackoffUntil = 0L;
+                    storeTierYieldPending = false;
                 }
             } else if ("装满水桶".equals(lastStage)) {
                 if (goalFailed) {
@@ -662,15 +869,71 @@ public final class ProgressionPlanner {
             // 立刻再派同一趟长途；成功清零。在途标记失败时一并清掉，防 NPC
             // 日后因别的原因漂进 48 格时误报到达。
             if ("回程补给".equals(lastStage)) {
-                if (goalFailed) {
+                // 【fix250】停滞收场补认：travel 腿被峡谷/基岩地形钉死时以
+                // 「长途行进受阻」收场、无失败关键词，旧版恒走清零分支、
+                // 退避永不点火（97 棒实验场复现：约 37 秒一轮原样再派、
+                // 退避 0 次）。专认口径见 isTravelStallText。
+                boolean homeStall = !goalFailed && isTravelStallText(goalOutcomeText);
+                if (goalFailed || homeStall) {
                     homeReturnFailStreak++;
                     homeReturnBackoffUntil = now + Math.min(600_000L, 120_000L * homeReturnFailStreak);
                     homeReturnActive = false;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 回程补给退避 | 连败=" + homeReturnFailStreak
-                            + " 退避秒=" + (homeReturnBackoffUntil - now) / 1000L);
+                            + " 退避秒=" + (homeReturnBackoffUntil - now) / 1000L
+                            + (homeStall ? "（fix250：长途停滞收场计入）" : ""));
                 } else {
                     homeReturnFailStreak = 0;
                     homeReturnBackoffUntil = 0L;
+                }
+            }
+            // 【fix306·156 棒】【fix365·289 棒】下界 travel 停滞专属记账（独立于 else-if
+            // 链，只认阶段名「前往下界要塞」或「前往诡异森林」）：fix250 只给四条主世界回家腿
+            // 补认了「长途行进受阻」收场，下界要塞腿从未入册——decideNether
+            // 绕过 decide() 全部前置步（镐保障/退避都在那边），停滞收场既不
+            // 计败也不改派，原样重派成环（正式服 11-14 实证，见字段注释）。
+            // fix365：森林腿是第三条未入册的腿——正式服 288 新 boot 实证：
+            // 森林腿 144 收场、约 37 秒一轮、水平 381 恒定、净位移 0，记账
+            // 从不触发；实验场同款 120 收场。记账口径扩至森林腿，出袋支
+            // 提至 decideNether 顶部（两腿共用）。同口袋连停 ≥2 置 armed，
+            // decideNether 派单侧改派上行出袋。
+            // 【fix372·320 棒】下界探索失败入册：fix306/fix365 的停滞记账只认
+            // 「前往下界要塞」/「前往诡异森林」两条 travel 腿，「下界探索」
+            // 从未入册——口袋里探索腿 0.5 秒一败（「连续 5 个方向都走不过去」，
+            // 319 新 boot 140 行）、slay fail-fast、退避再派探索的循环里，
+            // travel 腿根本不派（NPC 已在森林锚点 14 格内），armed 永不置位、
+            // 已验证的上行出袋（fix306/fix365）永不触发。探索失败是目标层失败
+            // （isFailureText 认「失败」关键词），成功探索走 else 清零——只扩
+            // 阶段名，不动任何阈值与派单侧；出袋本身仍走已验证的 ascend 梯次。
+            if ("前往下界要塞".equals(lastStage) || "前往诡异森林".equals(lastStage)
+                    || "下界探索".equals(lastStage)) {
+                boolean netherStall = goalFailed || isTravelStallText(goalOutcomeText);
+                if (netherStall) {
+                    BlockPos me = npc.blockPosition();
+                    if (netherTravelStallPos != null) {
+                        long pdx = me.getX() - netherTravelStallPos.getX();
+                        long pdz = me.getZ() - netherTravelStallPos.getZ();
+                        if (pdx * pdx + pdz * pdz >= 256L) {
+                            // 换了口袋（或上行/探索真挪了窝）：重新计数，
+                            // 不拿旧口袋的账误触发新地形的出袋。
+                            netherTravelStallStreak = 0;
+                            netherStallEscapesUsed = 0;
+                            netherStallEscapeArmed = false;
+                        }
+                    }
+                    netherTravelStallStreak++;
+                    netherTravelStallPos = me;
+                    if (netherTravelStallStreak >= 2 && netherStallEscapesUsed < 3) {
+                        netherStallEscapeArmed = true;
+                    }
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 下界 travel 停滞记账（fix306/fix365） | 阶段=" + lastStage + " 连停="
+                            + netherTravelStallStreak + " 停滞点=" + me.toShortString()
+                            + " 已用上行梯次=" + netherStallEscapesUsed
+                            + (netherStallEscapeArmed ? "（下一轮改派上行出袋）" : ""));
+                } else {
+                    netherTravelStallStreak = 0;
+                    netherTravelStallPos = null;
+                    netherStallEscapesUsed = 0;
+                    netherStallEscapeArmed = false;
                 }
             }
             // 【fix117】饥饿求生专属记账（独立于 else-if 链）：步 0 的 hunt
@@ -690,7 +953,7 @@ public final class ProgressionPlanner {
                 } else if (goalFailed) {
                     hungerHuntFailStreak++;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿狩猎连败=" + hungerHuntFailStreak
-                            + "（≥3 且未到家（水平>48 或高差>12）时改走回农场）");
+                            + "（≥3 时开饥饿出口：近家有粮改收田、无粮照样回程，fix245）");
                 } else {
                     hungerHuntFailStreak = 0;
                     // 【fix149】吃到东西了：ascend 回读记账一并清零。
@@ -700,11 +963,16 @@ public final class ProgressionPlanner {
                 }
             }
             if ("饥饿求生：回农场".equals(lastStage)) {
-                if (goalFailed) {
+                // 【fix250】停滞收场补认（同回程补给口径）：旧版停滞收场走
+                // 下方 else 把回程与 hunt 两条连败一并清零，与 fix224「腿没
+                // 走完≠成功」相悖；补认后涨回程退避、hunt 连败保留不断链。
+                boolean hungerStall = !goalFailed && isTravelStallText(goalOutcomeText);
+                if (goalFailed || hungerStall) {
                     hungerReturnFailStreak++;
                     hungerReturnBackoffUntil = now + Math.min(600_000L, 120_000L * hungerReturnFailStreak);
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 饥饿回程退避 | 连败=" + hungerReturnFailStreak
-                            + " 退避秒=" + (hungerReturnBackoffUntil - now) / 1000L);
+                            + " 退避秒=" + (hungerReturnBackoffUntil - now) / 1000L
+                            + (hungerStall ? "（fix250：长途停滞收场计入）" : ""));
                 } else if (goalOutcomeText != null && goalOutcomeText.contains("中途撤退")) {
                     // 【fix224】回农场腿被 fix134 中途撤退打断：腿没走完、饥饿
                     // 证据不变——不清零 hunt 连败。旧版此结局走下方 else 全清：
@@ -737,11 +1005,15 @@ public final class ProgressionPlanner {
                         + "（decide 步 -1 将送回安全点）");
             }
             if ("中途撤退：回安全点".equals(lastStage)) {
-                if (goalFailed) {
+                // 【fix250】停滞收场补认：本腿即 96 棒定谳的成环主角——峡谷
+                // 西缘带停滞收场 16 次、退避 0 次、每约 37 秒原样再派。
+                boolean retreatStall = !goalFailed && isTravelStallText(goalOutcomeText);
+                if (goalFailed || retreatStall) {
                     retreatTravelFailStreak++;
                     retreatTravelBackoffUntil = now + Math.min(600_000L, 120_000L * retreatTravelFailStreak);
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 中途撤退回程退避 | 连败=" + retreatTravelFailStreak
-                            + " 退避秒=" + (retreatTravelBackoffUntil - now) / 1000L);
+                            + " 退避秒=" + (retreatTravelBackoffUntil - now) / 1000L
+                            + (retreatStall ? "（fix250：长途停滞收场计入）" : ""));
                 } else {
                     retreatTravelFailStreak = 0;
                     retreatTravelBackoffUntil = 0L;
@@ -750,11 +1022,14 @@ public final class ProgressionPlanner {
             // 【fix136】满包存箱回程 travel 专属退避（镜像 fix134）：失败涨
             // 连败、成功清零（到达清标记在步 -0.5 按距离判定）。
             if ("满包存箱：回落脚点".equals(lastStage)) {
-                if (goalFailed) {
+                // 【fix250】停滞收场补认（同步 -1 撤退腿口径，fix136 镜像）。
+                boolean storeStall = !goalFailed && isTravelStallText(goalOutcomeText);
+                if (goalFailed || storeStall) {
                     storeTripFailStreak++;
                     storeTripBackoffUntil = now + Math.min(600_000L, 120_000L * storeTripFailStreak);
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱回程退避 | 连败=" + storeTripFailStreak
-                            + " 退避秒=" + (storeTripBackoffUntil - now) / 1000L);
+                            + " 退避秒=" + (storeTripBackoffUntil - now) / 1000L
+                            + (storeStall ? "（fix250：长途停滞收场计入）" : ""));
                 } else {
                     storeTripFailStreak = 0;
                     storeTripBackoffUntil = 0L;
@@ -781,6 +1056,8 @@ public final class ProgressionPlanner {
                     relocationExploreStartPos = null;
                     relocationOriginPos = null;
                     relocationExploreFailStreak = 0;
+                    relocationAscendFailStreak = 0;
+                    relocationAscendFailPos = null;
                     digAbandonStreak = 0;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 换区完成，重新尝试挖矿 | resource="
                             + relocationResource + " 位移=" + Math.round(relocDist)
@@ -815,6 +1092,8 @@ public final class ProgressionPlanner {
                     relocationExploreStartPos = null;
                     relocationOriginPos = null;
                     relocationExploreFailStreak = 0;
+                    relocationAscendFailStreak = 0;
+                    relocationAscendFailPos = null;
                     digAbandonStreak = 0;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 换区完成，重新尝试挖矿 | resource="
                             + relocationResource + " 位移=" + Math.round(travelDist)
@@ -830,6 +1109,25 @@ public final class ProgressionPlanner {
                             + " 无位移连败=" + relocationExploreFailStreak
                             + "（换下一方位重试）"
                             + " 位置=" + npc.blockPosition().toShortString());
+                    // 【fix252】整集兜底：explore 3 次＋travel 8 方位轮换仍零
+                    // 位移（连败计数两腿共用、攒至 11）说明此地形横移亦无路，
+                    // 整集放弃换区、放行原规划——防 ascend 循环换成 explore/
+                    // travel 慢循环（只堵不疏不许出厂，放弃也是出口）。
+                    if (relocationExploreFailStreak >= 11) {
+                        relocationActive = false;
+                        relocationPhase = 0;
+                        relocationExploreStartPos = null;
+                        relocationOriginPos = null;
+                        relocationExploreFailStreak = 0;
+                        digAbandonStreak = 0;
+                        relocationAscendFailStreak = 0;
+                        relocationAscendFailPos = null;
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 换区整集无位移放弃（fix252） | resource=" + relocationResource
+                                + "（explore/travel 全轮换仍零位移，放行挖矿）"
+                                + " 位置=" + npc.blockPosition().toShortString());
+                        relocationResource = "";
+                    }
                 }
             }
             // 【fix50】采集木头专属连败记账（独立于上面的 else-if 链：阶段名带
@@ -860,6 +1158,19 @@ public final class ProgressionPlanner {
                     digAbandonResource = issuedDigResource;
                     digAbandonStreak = 1;
                 }
+                // 【fix308·158 棒】descend 坏地形结局一次武装换区：目标层
+                // 收场前已在目标内连烧两轮约 90 秒 descend 无真降（fix142
+                // 连败 ≥2 才收场，结局原文即写「交规划层换位」），等同两
+                // 趟实证坏地形；旧口径还要规划层再连弃 1 次才换区——正式
+                // 服实证 02:23:04 结局后原样重派同坡、再磨一轮（277 秒）。
+                // 直接把连弃计数提到换区门槛，下一趟同资源 dig 先走既有
+                // 换区链（ascend→explore/travel）换起点，不新造机制。
+                if (goalOutcomeText.contains("无实际下降") && digAbandonStreak < 2) {
+                    digAbandonStreak = 2;
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " descend 坏地形结局直接武装换区（fix308） | resource="
+                            + issuedDigResource + " outcome=" + goalOutcomeText);
+                }
                 if (digAbandonStreak >= 2 && !relocationActive) {
                     relocationActive = true;
                     relocationResource = issuedDigResource;
@@ -871,6 +1182,9 @@ public final class ProgressionPlanner {
                     relocationExploreStartPos = null;
                     // 【fix150】换位连败与原点一并复位。
                     relocationExploreFailStreak = 0;
+                    // 【fix252】ascend 同点连败计数一并复位。
+                    relocationAscendFailStreak = 0;
+                    relocationAscendFailPos = null;
                     relocationOriginPos = null;
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 挖矿连败换区 | resource="
                             + relocationResource + " 连弃=" + digAbandonStreak
@@ -941,9 +1255,19 @@ public final class ProgressionPlanner {
         // decide 自然重派。全 craft 步一致口径、新派单位自动受闸。
         if (step.kind == Kind.GOAL && "craft".equals(step.intent.action())
                 && System.currentTimeMillis() < pickCraftBackoffUntil) {
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成退避中跳过派单 | 阶段=" + step.stage
-                    + " 剩余秒=" + (pickCraftBackoffUntil - System.currentTimeMillis()) / 1000L);
-            return;
+            // 【fix340】标记置位期间不整轮跳过：被锁合成退避期内 decide 仍会
+            // 首选它（-0.5 逃生腿被 !netherChainReady 门挡住时尤其如此），
+            // 整轮 return 等于把逃生腿也挡在门外、标记 30 分钟饿死。
+            // 改派存箱逃生腿（复用 -0.5 长途支口径，见 fix340StoreEscapeLeg）。
+            // 派不出时维持原行为（打退避行 return）。
+            Step escape = fix340StoreEscapeLeg();
+            if (escape != null) {
+                step = escape;
+            } else {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 合成退避中跳过派单 | 阶段=" + step.stage
+                        + " 剩余秒=" + (pickCraftBackoffUntil - System.currentTimeMillis()) / 1000L);
+                return;
+            }
         }
 
         lastStartAt = now;
@@ -1016,11 +1340,119 @@ public final class ProgressionPlanner {
         return total;
     }
 
+    /** 【fix229】原木/木板分项计数（与 GoalExecutor.SHELTER_MATERIALS 同表）。 */
+    private int countLogs() {
+        int total = 0;
+        for (String log : new String[]{"oak_log", "spruce_log", "birch_log",
+                "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log",
+                "cherry_log", "pale_oak_log"}) {
+            total += countItem(log);
+        }
+        return total;
+    }
+
+    private int countPlanksTotal() {
+        int total = 0;
+        for (String planks : new String[]{"oak_planks", "spruce_planks",
+                "birch_planks", "jungle_planks", "acacia_planks",
+                "dark_oak_planks", "mangrove_planks", "cherry_planks",
+                "bamboo_planks", "pale_oak_planks"}) {
+            total += countItem(planks);
+        }
+        return total;
+    }
+
+    /** 【fix361·277 棒】走近门 travel 进展检测：已在门位容差内（travel 到达
+     * 判据为三维平方距 ≤16，派了也首 tick“到达”）或同一目标连续无进展
+     * （3 次派单间 NPC 位移 <1 格）或退避期内时不派 travel，防每秒重派热
+     * 循环（新图 277 棒实证）。正常短距 travel 不受影响：它的“到达”后规划
+     * 层派下一步，不会同一目标连续重派。返回 true = 允许派单（并记账本次
+     * 派单位置）。 */
+    private boolean portalTravelAllowed(BlockPos target) {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs < portalTravelBackoffUntil) {
+            return false;
+        }
+        BlockPos here = npc.blockPosition();
+        if (here.distSqr(target) <= 16.0D) {
+            if (nowMs - portalTravelNearLogAt >= 60_000L) {
+                portalTravelNearLogAt = nowMs;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 已在门位容差内（fix361） | 目标=" + target.toShortString()
+                        + " 不派走近 travel，落重燃/建门支");
+            }
+            return false;
+        }
+        if (target.equals(portalTravelTarget) && portalTravelFrom != null
+                && here.distSqr(portalTravelFrom) < 1.0D) {
+            portalTravelNoProgress++;
+            if (portalTravelNoProgress >= 3) {
+                portalTravelBackoffUntil = nowMs + 600_000L;
+                portalTravelNoProgress = 0;
+                portalTravelTarget = null;
+                portalTravelFrom = null;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 走近门 travel 连续无进展退避（fix361） | 目标=" + target.toShortString()
+                        + " 退避 10 分钟");
+                return false;
+            }
+        } else {
+            portalTravelNoProgress = 0;
+            portalTravelTarget = target;
+        }
+        portalTravelFrom = here;
+        return true;
+    }
+
     /** 【fix160】门已建成的事实判定：PortalMemory 账本有记录，或当下身边
      * 实测到亮着的门（账本丢失/旧存档已有门时自愈落账）。 */
     private boolean portalBuiltKnown() {
         com.example.aivillager.goals.PortalMemory.bindWorld(npc.level());
         if (com.example.aivillager.goals.PortalMemory.isBuilt(npc.npcName())) {
+            // 【fix349】账本失活校验：记录的门位若已无门（被挖穿/自然熄灭），且 NPC
+            // 已走到记录点附近仍测不到门，记录即过期——清账本、判未建成，建门支
+            // 重派。新图 260 棒实证：账本记 (-3,66,-102) 是空气，fix333 循环派往
+            // 幻影点 2 小时以上。近点盒留边（|dx|≤20、|dy|≤12、|dz|≤20），使整扇
+            // 门必在 nearbyPortal 搜索盒（±24/±16）内，测不到即真无门；远离记录
+            // 点时 nearbyPortal()==null 是常态，不得清账。维度不符时 portal() 为
+            // null，不清账（下界侧不碰主世界账）。
+            com.example.aivillager.goals.PortalMemory.Portal rec =
+                    com.example.aivillager.goals.PortalMemory.portal(npc.npcName());
+            if (rec != null && goals.nearbyPortal() == null) {
+                BlockPos here = npc.blockPosition();
+                BlockPos rp = rec.pos();
+                if (Math.abs(here.getX() - rp.getX()) <= 20 && Math.abs(here.getY() - rp.getY()) <= 12
+                        && Math.abs(here.getZ() - rp.getZ()) <= 20) {
+                    com.example.aivillager.goals.PortalMemory.clear(npc.npcName());
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 传送门账本失活清账（fix349） | 记录=" + rp.toShortString()
+                            + " 附近无亮门，判未建成、建门支重派");
+                    return false;
+                }
+            }
+            // 【fix361·277 棒】维度错位记录：账本有记录且种子相同、但维度与当前
+            // 世界不符（如下界侧回程门记录），portal() 为 null——本维度的门事实
+            // 未知。NPC 已回落脚点锚点容差内（走近门 travel 到达判据平方距 ≤16，
+            // 再派 travel 只会首 tick“到达”）且附近无亮门时，判未建成、落重燃/
+            // 建门支；远离锚点时仍判已建成，保走近支回锚点验门（正式服远门重赴
+            // 路径，锚点回落是其回程手段，见走近门支注释）。不清账：回程门记录
+            // 回下界后维度相符即恢复；下界侧保持原行为（return true），回程门
+            // 靠 nearbyPortal() 实测。专行 60 秒节流。
+            if (rec == null && !inNether() && !inEnd() && goals.nearbyPortal() == null) {
+                com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.BaseMemory.Base dimBase =
+                        com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+                if (dimBase != null
+                        && npc.blockPosition().distSqr(dimBase.anchor()) <= 16.0D) {
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - portalDimMismatchLogAt >= 60_000L) {
+                        portalDimMismatchLogAt = nowMs;
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 传送门账本维度错位（fix361） | 本维度无有效门位，判未建成、落重燃/建门支");
+                    }
+                    return false;
+                }
+            }
             return true;
         }
         BlockPos near = goals.nearbyPortal();
@@ -1031,6 +1463,57 @@ public final class ProgressionPlanner {
             return true;
         }
         return false;
+    }
+
+    /** 【fix289·137 棒】入界行军预算（营养分）：派单读数与门口实读之间隔着
+     * 一整段回锚点/回门行军，生存层进食（战斗回血烧食为主）会把背包营养
+     * 计数抽掉一大截——fresh169 实证：190 格柱台夜路 nutrition 48→18、
+     * 门口差 2 分中止（出发余量不够付路上饭钱）。身边有亮门时行军≈0、
+     * 预算=0（门口实读闸说了算）；否则按到目标（PortalMemory 账本门位；
+     * 无账本时用落脚点锚点＝建门点）的水平距离估算：实测 ≈0.16 分/格，
+     * 取 0.2 留战斗方差余量。【fix333·221 棒】取消 36 封顶：正式图田→门
+     * 541 格，221 实证出发约 37、到门 0——封顶预算 36 小于实测烧耗，
+     * 派单需求先天不足；预算按距离线性伸展（541 格→109），派单需求
+     * 129。查不到目标返回 0（回落旧口径、不硬卡）。本预算只抬高规划层「派单/让位的需求读数」，fix96 门口
+     * 实读闸（food>=14 ∧ nutrition>=20）与闸口数值一字不动。 */
+    private int netherMarchMargin() {
+        if (goals.nearbyPortal() != null) {
+            return 0;
+        }
+        BlockPos target = null;
+        com.example.aivillager.goals.PortalMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.PortalMemory.Portal record =
+                com.example.aivillager.goals.PortalMemory.portal(npc.npcName());
+        if (record != null) {
+            target = record.pos();
+        } else {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base base =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (base != null) {
+                target = base.anchor();
+            }
+        }
+        if (target == null) {
+            return 0;
+        }
+        double dx = npc.getX() - (target.getX() + 0.5D);
+        double dz = npc.getZ() - (target.getZ() + 0.5D);
+        double dist = Math.sqrt(dx * dx + dz * dz);
+        // 【fix299·147 棒】门边归零：水平距 ≤5 格是走近门 travel 的到达容差
+        // （生产 16:43:39 停在 3.5 格外），5 格散步不耗食、预算无意义；否则
+        // margin=1 把派单需求抬到 21，浇铸/建门链（在 nutrition>=dispatchNut
+        // 支内）永不可达。fresh169 的教训是 190 格夜路，不是 4 格散步。
+        if (dist <= 5.0D) {
+            return 0;
+        }
+        // 【fix333·221 棒】取消 36 封顶：预算按距离线性伸展（见方法注释）。
+        return (int) Math.ceil(dist * 0.2D);
+    }
+
+    /** 【fix289】下界链派单需求营养＝fix96 闸口 20＋行军预算（见上）。 */
+    private int netherDispatchNutrition() {
+        return 20 + netherMarchMargin();
     }
 
     /** 【fix160】13.1 让位是否生效（Fong 拍板「先建门」）：计划含
@@ -1085,6 +1568,22 @@ public final class ProgressionPlanner {
     }
 
     /**
+     * 【fix250】travel 停滞收场专认：GoalExecutor tickTravel 的两条诚实收场
+     * （fix186「长途行进受阻：多次推进无进展」、fix208「长途行进受阻：近终点
+     * 竖向收尾多次无下降」）不含 isFailureText 任一关键词，旧版在各 travel
+     * 回家腿的专属记账里恒走清零分支——退避机器（fix103 回程补给/fix117
+     * 饥饿回程/fix134 撤退腿/fix136 存箱腿）从不点火，同目标约 37 秒原样
+     * 再派成环（96 棒定谳：单 boot 停滞收场 16 次、四腿退避 0 次）。不扩
+     * isFailureText 全局关键词：技能层同名收场（SkillRunner「长途行进受阻」）
+     * 会经 skillFailed 喂共享 failStreak，且传送门落账（fix160）、换区位移
+     * 验收（fix147/150）等 !goalFailed 消费点会被误伤。照 fix158 专认先例，
+     * 只在四条 travel 回家腿的专属记账块内以本判定补认失败。
+     */
+    private static boolean isTravelStallText(String text) {
+        return text != null && text.contains("长途行进受阻");
+    }
+
+    /**
      * 【fix188】农场走廊：农场向长腿先绕西侧下坡入口，再直进锚点。
      *
      * <p>定因（farm155/156 三败 + 第五十一棒 staging 复现/选案）：旧田址是
@@ -1112,6 +1611,58 @@ public final class ProgressionPlanner {
             return null;
         }
         return new BlockPos(anchor.getX() - 16, anchor.getY(), anchor.getZ() - 2);
+    }
+
+    /**
+     * 【fix340】合成退避期内的满包存箱逃生腿：标记置位（craftFullStoreSince > 0）
+     * 且 decide 仍首选被锁合成时，派单总闸（fix127）不再整轮 return，改派
+     * 「满包存箱：回落脚点」travel，把 NPC 送回落脚点存箱腾格。
+     * 口径复用 -0.5 长途支：白天、存箱腿退避已过、fix335 饿线（food==0 &&
+     * foodLevel<=8）不派、须有可存物、距锚点 >48 格；不挂 netherChainReady
+     * 门、不挂 fix336 预算门（预算门在被锁合成占位时永无满足之日）。
+     * 地下时返回 null（ascend 由 -0.5 在 decide 内处理）；≤48 格时返回
+     * null（到达支在 decide 内接管）。返回 null=维持 fix127 原行为。
+     */
+    private Step fix340StoreEscapeLeg() {
+        if (craftFullStoreSince <= 0L) {
+            return null;
+        }
+        if (isNight()) {
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        if (now < storeTripBackoffUntil) {
+            return null;
+        }
+        int food = countFood();
+        int foodLevel = npc.getFoodData().getFoodLevel();
+        if (food == 0 && foodLevel <= 8) {
+            return null;
+        }
+        com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.BaseMemory.Base storeBase =
+                com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+        if (storeBase == null) {
+            return null;
+        }
+        BlockPos storeAnchor = storeBase.anchor();
+        double storeDx = storeAnchor.getX() + 0.5D - npc.getX();
+        double storeDz = storeAnchor.getZ() + 0.5D - npc.getZ();
+        double storeDist = Math.sqrt(storeDx * storeDx + storeDz * storeDz);
+        if (storeDist <= 48.0D) {
+            return null;
+        }
+        if (!hasStorableLoot()) {
+            return null;
+        }
+        if (underground()) {
+            return null;
+        }
+        LOG.info("[AIV][PLAN] " + npc.npcName() + " fix340 逃生派单 | 满包存箱：回落脚点 "
+                + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist)
+                + "（合成退避期内改派存箱腿，不整轮跳过）");
+        return goal("满包存箱：回落脚点", "travel",
+                params("x", storeAnchor.getX(), "y", storeAnchor.getY(), "z", storeAnchor.getZ()));
     }
 
     private Step goal(String stage, String action, JsonObject params) {
@@ -1197,6 +1748,19 @@ public final class ProgressionPlanner {
         // 只有竹子的情况 stickMaterial = false，所以所有木棍需求的合成都会走 gatherLogs
         // 强制砍树。crafting_table 只需木板（无木棍），直接用 wood >= 4 判断不受影响。
         int foodLevel = npc.getFoodData().getFoodLevel();
+
+        // 【fix328·214 棒】下界链就绪口径上提至 decide 顶部：fix274/266/
+        // 299/193/288 各自的让位只拦自己那一块，decide 随后按固定顺序扫
+        // 描其余步、先匹配者先派单——209（6.78 死后回程）、211（6.77
+        // 存箱→步 9 煤）三现同族，断点是「让位行只打日志、不派单的本地
+        // 跳过」。本口径与 fix274 同一组数值、不新设门槛（入境闸 20 与
+        // fix298 预算闸 40 一字不动）；廉价条件在前、portalBuiltKnown()
+        // 垫后（短路：饿肚子/眼未齐时不读门账本）。下方 6.65–13.35 间
+        // 全部未设门的派单步挂上 && !netherChainReady；8/10/11/12 已有
+        // 门不动，13.1/13 储备自带让位不动，13.3/13.35 在 13.5 之后
+        // （fix190 提序）够不着链、不加门。
+        boolean netherChainReady = planHas(StagePlan.PORTAL_PREP) && eyes < 12
+                && foodLevel >= 14 && foodNutrition() >= 20 && portalBuiltKnown();
 
         // 【fix218】死后回程到点销账（纯记账、无派单）：原判定在步 6.78 块
         // 内，但回程补给块在 decide 顺序中排在 6.78 之前——farm191 实证
@@ -1385,8 +1949,14 @@ public final class ProgressionPlanner {
                         // store_loot 并清标；夜里到达不清标不派单（落回保持门，
                         // 天亮再入本步派单，标记靠 fix210 记账存续）；无可存物
                         // 维持清标交接（链已无事可做）。
-                        boolean storeChestReady = storeBase.chestPos() != null
+                        // 【fix249】箱可用改实地复核（recordedChestExists）：
+                        // 旧版只信账本，箱子被挖毁后到达恒判 ready、当场派
+                        // store_loot 恒 0.5 秒「包里没箱子」败、连败退避又
+                        // 连带挡住 6.77 做箱子，专程往返成环（94 棒定谳）。
+                        boolean storeChestReady = recordedChestExists(storeBase)
                                 || countItem("chest") > 0;
+                        // 【fix340】去掉 !netherChainReady 门：否则到达后标记被清进
+                        // 6.77 空头交接（6.77 本身亦挂该门），存箱永不发生、成环。
                         if (!isNight() && storeChestReady && hasStorableLoot()) {
                             craftFullStoreSince = 0L;
                             craftFullStoreBestDist = Double.MAX_VALUE;
@@ -1401,21 +1971,124 @@ public final class ProgressionPlanner {
                                         + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist)
                                         + "（fix217：夜里不存箱，标记保留待天亮）");
                             }
+                        } else if (!isNight() && hasStorableLoot() && !storeChestReady
+                                && wood >= 8) {
+                            // 【fix342】无箱时当场做箱子，不再清标记交 6.77：
+                            // 6.77 在 decide 链中排在合成步/死后回程之后，
+                            // 到达轮即被抢占、人一走出 48 格连 6.77 的距离
+                            // 口径都不满足，交接永不兑现（246 生产实证：
+                            // 03:41:00 交接后 0 次做箱子、0 次存箱，当场改
+                            // 派死后回程、石镐再败两轮；247 实验场 G0 复现：
+                            // 到达连记两次 fix249、做箱子 0 行、存箱 0 行）。
+                            // 退避未过时不清标（v1 在此清标是错的：标记由
+                            // 失败置位、失败同时置退避，退避未过时清标等于
+                            // 把逃生链拆了，下一轮又从合成失败重走一遍，
+                            // fix342 永无点火之时——G2 新 boot 04:46:18 实
+                            // 证：退避剩 231 秒时清标＋记 fix249，之后全是
+                            // fix127 空转）。标记保留、落回常规等退避过；
+                            // 退避过后下一轮当场派「制作箱子」，箱子到手后
+                            // storeChestReady 即真、当场派存箱。退避期 NPC
+                            // 在锚点空转至多一个退避窗（≤600 秒），fix210
+                            // 30 分钟无进展超时仍是最终兜底。
+                            if (storeNow >= pickCraftBackoffUntil) {
+                                // 【fix364】空槽预检：箱子合成链需 1 格放木板中间产物，
+                                // 空槽=0 时派单必败（288 棒定谳：4 次失败皆「4 个 oak_planks
+                                // 放不下」，退避封顶后每 600 秒原样重试、fix210 超时后又重建）。
+                                // 不派必败合成：每 120 秒计一无进展轮次，满 2 轮清标并压住
+                                // 重建，NPC 落回常规（走动／进食腾格），不再钉在基地空转。
+                                if (countEmptyMainSlots() < 1) {
+                                    if (storeNow >= fix342NoSlotRetryAt) {
+                                        fix342NoSlotCycles++;
+                                        fix342NoSlotRetryAt = storeNow + 120_000L;
+                                    }
+                                    if (fix342NoSlotCycles >= 2) {
+                                        fix342BlockedEmptySlots = countEmptyMainSlots();
+                                        fix342NoSlotCycles = 0;
+                                        craftFullStoreSince = 0L;
+                                        craftFullStoreBestDist = Double.MAX_VALUE;
+                                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                                + " 满包存箱放弃做箱子（fix364） | 空槽=0 无进展轮次=2"
+                                                + "（不派必败合成，标记清除＋压住重建，落回常规）");
+                                    } else if (storeNow - fix342WaitLogAt >= 60_000L) {
+                                        fix342WaitLogAt = storeNow;
+                                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                                + " 满包存箱无空槽等腾格（fix364） | 空槽=0 无进展轮次="
+                                                + fix342NoSlotCycles
+                                                + "（箱子合成需 1 格放木板，不派必败合成）");
+                                    }
+                                } else {
+                                    fix342NoSlotCycles = 0;
+                                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                                            + " 满包存箱无箱做箱子（fix342） | 木材当量="
+                                            + wood + "（账本箱位实地已无箱，不交 6.77，"
+                                            + "当场做箱子再存）");
+                                    return goal("制作箱子", "craft",
+                                            params("item", "chest", "count", 1));
+                                }
+                            } else if (storeNow - fix342WaitLogAt >= 60_000L) {
+                                fix342WaitLogAt = storeNow;
+                                LOG.info("[AIV][PLAN] " + npc.npcName()
+                                        + " 满包存箱等退避（fix342） | 剩余秒="
+                                        + (pickCraftBackoffUntil - storeNow) / 1000L
+                                        + "（账本箱位实地已无箱，标记保留，"
+                                        + "退避过后当场做箱子）");
+                            }
                         } else {
                             craftFullStoreSince = 0L;
                             craftFullStoreBestDist = Double.MAX_VALUE;
                             LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱到达 | 落脚点 "
                                     + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist)
-                                    + "（交存箱步 6.77 顺路存箱腾格）");
+                                    + (storeChestReady
+                                            ? "（交存箱步 6.77 顺路存箱腾格）"
+                                            : "（fix249：账本箱位实地已无箱，不派必败存箱，"
+                                                    + "交存箱步 6.77 先做箱子）"));
                         }
                     } else if (storeAscendStep != null) {
                         return storeAscendStep;
                     } else if (!isNight() && storeNow >= storeTripBackoffUntil) {
-                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱回程 | 落脚点 "
-                                + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist));
-                        return goal("满包存箱：回落脚点", "travel",
-                                params("x", storeAnchor.getX(), "y", storeAnchor.getY(),
-                                        "z", storeAnchor.getZ()));
+                        // 【fix340】去掉 !netherChainReady 门：标记置位即证明下界链已被满包堵死，
+                        // 存箱回程是链的前置条件而非分心；fix328 的门为常规步设，不应压过死锁逃生。
+                        // 【fix335】饥饿让位：饿着肚子不派长途存箱（224 棒定谳：
+                        // farm329 10:09:57 实证——foodLevel=3、food=0 时仍重派
+                        // 452 格存箱回程，步 0 饥饿求生被抢占，NPC 饿死途中
+                        // #167）。饿时只记日志落步 0，标记不清除（fix210 超时
+                        // /到达自清照旧），吃饱后回本步存箱。只拦长途派单支；
+                        // 到达支（≤48 格）数秒即到存箱，不拦。
+                        if (food == 0 && foodLevel <= 8) {
+                            LOG.info("[AIV][PLAN] " + npc.npcName()
+                                    + " 满包存箱让位饥饿求生（fix335） | food=0 foodLevel="
+                                    + foodLevel + " 距离=" + Math.round(storeDist)
+                                    + "（饿着肚子不派长途存箱，落步 0 先找吃的）");
+                        } else {
+                            // 【fix336】初派口粮预算门：不饿也可能口粮不够走长途
+                            // （225 棒定谳：farm329 09:24:40 初派实证——foodLevel=20
+                            // 不饿、foodNutrition≈10、距离 463 格，按 fix333 尺度需
+                            // 约 110 点，初派即口粮不足；fix335 只拦饿时，拦不住
+                            // 初派）。预算 = 入境闸 20 ＋ 距离×0.2 上取整（复用
+                            // fix333 行军尺度；抵达后须留足 20 进门）。不够时只记
+                            // 日志落后续步（6.65 回程补给／步 13 储备 hunt 攒粮），
+                            // 标记不清除（fix210 超时／到达自清照旧）；够时原样派单。
+                            // 60 秒节流：让位态可持续数十分钟，防 decide 空转刷屏。
+                            int storeMarch = (int) Math.ceil(storeDist * 0.2D);
+                            int storeNeed = 20 + storeMarch;
+                            if (foodNutrition() < storeNeed) {
+                                if (storeNow - storeBudgetLogAt >= 60_000L) {
+                                    storeBudgetLogAt = storeNow;
+                                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                                            + " 满包存箱让位攒粮（fix336） | foodNutrition="
+                                            + foodNutrition() + " 需>=" + storeNeed
+                                            + "（闸口 20＋行军预算 " + storeMarch + "） 距离="
+                                            + Math.round(storeDist)
+                                            + "（口粮不够走长途存箱，落回攒粮／返田）");
+                                }
+                            } else {
+                                LOG.info("[AIV][PLAN] " + npc.npcName() + " 满包存箱回程 | 落脚点 "
+                                        + storeAnchor.toShortString() + " 距离=" + Math.round(storeDist));
+                                return goal("满包存箱：回落脚点", "travel",
+                                        params("x", storeAnchor.getX(), "y", storeAnchor.getY(),
+                                                "z", storeAnchor.getZ()));
+                            }
+                        }
                     }
                 }
             }
@@ -1454,18 +2127,39 @@ public final class ProgressionPlanner {
                     + "（落后续步就地休整，天亮/到家后恢复）");
         }
 
+        // -0.05) 【fix255】装水常备抢占：13.05 的装水分支排在阶段链深处，
+        // 主线步不断档时永不轮到——farm258/259/260 三个 boot「装水常备
+        // 触发」均为 0 次、桶常年空着，生存层倒水自救（fix70）无水可用，
+        // #106/#107 落浆上岸后烧死同根。装水是保命维护、耗时一趟
+        // fillbucket 的事，前置到步 0 之前：有空桶∧无水桶∧地表∧过退避
+        // 才派；食物危线（fix134 口径）让步 0 先行找食，不饿着肚子装水。
+        // 做桶仍留 13.05（合成抢占面大；生产里桶恒存在，问题只在装水）。
+        // 退避由目标层按 stage 名「装满水桶」既有记账接续，不另设。
+        if (hasAny("bucket") && !hasAny("water_bucket") && !underground()
+                && System.currentTimeMillis() >= bucketFillBackoffUntil
+                && !(foodLevel <= 3 && food == 0)) {
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 装水常备触发（fix255 前置） | 有空桶、地表、先装满再走主线");
+            return goal("装满水桶", "fillbucket", params());
+        }
+
         // -0.1) 【fix179】床账修复抢占：床账本失效（bedPos==null）时步 6.76
         // 排在步 0/6.6/6.65 之后，在家被饥饿链/回程链恒占 decide、永无
         // 轮次——#37/#38/#39 三死同根（床不复→复活点错位+失眠永不重置
         // →幻翼连环）。玩家回家第一件事是确认床/重生点。人已在落脚点
         // 近傍（≤48 格、6.77 口径）、白天地表时，把床务派单抢占到步 0
         // 之前：place_bed 一次派单即闭合（fix174 现成床扫描登记/安置
-        // 包里床/做床三分支与 6.76 同口径；三分支皆无时仍派 place_bed
-        // 触发扫描，扫不到由执行层诚实失败、走床退避让位）。兜底防反
+        // 包里床/做床三分支与 6.76 同口径；三分支皆无时【fix247 两段化】
+        // 尚无失败记录先派 place_bed 触发扫描，扫不到由执行层诚实失败、
+        // 走床退避让位；已有失败记录＝扫描已证锚点旁无床，改派找羊毛
+        // 做床攒料，不再空派——旧形在无床锚点（新图安全点登记）上退避
+        // 到期必再败，7/7 确定性全败实证）。兜底防反
         // 过来饿死：food 危线（foodLevel≤3∧food==0，fix134 口径）且床
         // 务已有失败记录（bedFailStreak≥1）时不抢占——危线下只许一把
         // 过，失败过就先让步 0 找吃的；成功即账本恢复、抢占条件永久
         // 消失。远离家（>48 格）不抢占、维持 6.76 原顺位（长途先保命）。
+        // 【fix328】本步（-0.1 床账修复抢占）不加门：床是重生点安全项，
+        // 只在床账本失效时点火，链就绪也不压过床务（与 6.76 的门分开）。
         if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
                 && System.currentTimeMillis() >= bedBackoffUntil) {
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
@@ -1496,7 +2190,108 @@ public final class ProgressionPlanner {
                         return goal("线合成白羊毛", "craft",
                                 params("item", "white_wool", "count", repairCraftWool));
                     }
-                    return goal("安置床", "place_bed", params());
+                    if (bedFailStreak <= 0) {
+                        return goal("安置床", "place_bed", params());
+                    }
+                    // 【fix247】扫描已证无床（失败记录在档）且无床无料：改派
+                    // 找羊毛做床——杀羊攒羊毛（Wiki：未剪毛成年羊死亡掉 1 个
+                    // 同色羊毛），存量驱动 need=wool、靶=床料等价量 3（执行层
+                    // 口径与做床分支同源）。危线防饿死 guard 在抢占门上：危线
+                    // ＋失败过本抢占整体不点火、步 0 先找吃的，本分支不会在
+                    // 危线下派出。失败记账与安置床共用床退避（见记账段）。
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 找羊毛做床触发（fix247·抢占） | 床账失效、安置扫描已败="
+                            + bedFailStreak + " 且无床无料，改走杀羊攒羊毛 need=wool stock=3");
+                    return goal("找羊毛做床", "hunt",
+                            params("need", "wool", "stock", 3, "radius", 12));
+                }
+            }
+        }
+
+        // -0.05) 【fix227】床边清障抢占：床账本在、床本体在，但复活站位
+        // 6 格全堵（66 棒实证：自家 travel 搭桥把床边站位格逐格铺死 +
+        // 床坐北侧坡边、北向两格脚下悬空；#59/#60 连续两验回落世界
+        // 出生点）。玩家回家见床被自家桥块堵了，第一件事就是亲手
+        // 挖掉堵块，不会等下次死了再回落。人在落脚点近傍（≤48 格、
+        // 6.77 口径）、白天地表时，把清障派单抢占到步 0 之前；清障
+        // 失败走床退避（与安置床共用 bedFailStreak/bedBackoffUntil），
+        // 危线下失败过则先让步 0 找吃的（与 fix179 同 guard）。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
+                && System.currentTimeMillis() >= bedBackoffUntil) {
+            com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.BaseMemory.Base bedClearBase =
+                    com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+            if (bedClearBase != null && bedClearBase.bedPos() != null) {
+                double bedClearDx = bedClearBase.anchor().getX() + 0.5D - npc.getX();
+                double bedClearDz = bedClearBase.anchor().getZ() + 0.5D - npc.getZ();
+                double bedClearDist = Math.sqrt(bedClearDx * bedClearDx + bedClearDz * bedClearDz);
+                boolean bedClearFoodCritical = foodLevel <= 3 && food == 0;
+                if (bedClearDist <= 48.0D && !(bedClearFoodCritical && bedFailStreak >= 1)
+                        && bedRespawnBlocked(bedClearBase.bedPos())) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 床边清障抢占（fix227） | 距锚点="
+                            + Math.round(bedClearDist) + "（床在但复活站位全堵，先挖掉床边堵块再走常规链）");
+                    return goal("清理床边", "clear_bed", params());
+                }
+            }
+        }
+
+        // -0.04) 【fix258】加工前置：步 12.5 烤肉 / 12.6 做面包·烤土豆排在
+        // decide 深处，被饥饿链恒抢占——108 棒定谳：正式 decide 时刻
+        // nutrition=0 占 92%、加工整窗零点火；两度活样本 NPC 站在基址
+        // 床边、包里 wheat x8、food=0，decide 不做面包、直接派 543 格
+        // 饥饿回农场腿（farm266 10:07、farm267 12:30）。根因：wheat 不是
+        // 食物（countFood 只数 FOOD 组件），包里只有麦子时 food==0、步 0
+        // 恒点火，12.6 永无轮次；生肉则被生存层即时生吃，12.5 的空窗同
+        // 样稀少。玩家的做法是先转化手头存货再出门找食。照 fix255 装水
+        // 前置范式，把三个加工分支以原口径抢占到步 0 之前：stage 名/参数
+        // 与 12.5/12.6 完全一致（失败记账与通用 stage 冷却自动接续），原
+        // 位置保留作非饥饿时刻的常规顺位（新图实证可达，不动）。
+        // 门控：地表限定（地下照旧步 0 ascend 先回地表，上来后本步自然
+        // 接手）；做面包原只在 food==0 时点火——与步 0 触发面同域，真没
+        // 别的吃时才轮到麦子说话。【fix275】127 棒定谳 B2：「food>0 时
+        // 原顺位（12.6）够用」的前提在缺铁件态不成立——12.6 在铁甲阻塞
+        // 块下游，任一铁件缺失 decide 恒在上游 return、永远走不到（126
+        // 棒丁同墙、不同受害者；fix274 让位只在 nutrition≥20 时开墙，
+        // 对「先有面包才有营养」的转化支是循环锁）。故做面包支放宽为
+        // food==0 ∨ foodNutrition<MINING_FOOD_NUTRITION（与下方烤制两
+        // 支同一营养门常数）：麦子本身不能吃、攒着不搓只有坏处，营养
+        // 未达下矿口粮线时先转化手头存货本就是玩家做法。烤制两支须
+        // foodNutrition<24（下矿口粮线）∧ foodLevel>3（危线不排队等烤，
+        // 生存层生吃是既有保命疏道）。无燃料（canFuel=false：煤/木炭/
+        // 木板/原木/木棍全无）时烤制不点火、做面包不受影响（合成不耗
+        // 燃料）；皆不点火时落回原链（步 0 hunt/生吃即降级路径本身）——
+        // 只堵不疏不许出厂，本步的「疏」就是不拦截原链。
+        // 【fix328】链就绪时不转化存货：口粮已够入境，烤肉/做面包是
+        // 80 秒级绕路（fix258 前置抢占面在步 0 之前）；food==0 时本口径
+        // 本就为假、面包支照常点火，不堵保命疏道。
+        if (!underground() && !netherChainReady) {
+            int preWheat = countItem("wheat");
+            if (planHas(StagePlan.FARMING) && preWheat >= 3
+                    && (food == 0 || foodNutrition() < MINING_FOOD_NUTRITION)) {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 加工前置触发（fix258） | 做面包 wheat=" + preWheat
+                        + " food=" + food + " foodNutrition=" + foodNutrition()
+                        + "（先转化手头存货，再走饥饿链）");
+                return goal("做面包", "craft",
+                        params("item", "bread", "count", countItem("bread") + preWheat / 3));
+            }
+            if (foodLevel > 3 && foodNutrition() < MINING_FOOD_NUTRITION) {
+                String preRawMeat = firstRawMeat();
+                if (planHas(StagePlan.FOOD) && preRawMeat != null && hasFurnace && canFuel()) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 加工前置触发（fix258） | 烤肉 raw=" + preRawMeat
+                            + " foodNutrition=" + foodNutrition()
+                            + "（先烤再走主线，熟肉营养是生肉两倍以上）");
+                    return goal("烤肉", "smelt",
+                            params("item", cookedOf(preRawMeat), "count", 8));
+                }
+                int prePotato = countItem("potato");
+                if (planHas(StagePlan.FARMING) && prePotato > 8 && hasFurnace && canFuel()) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 加工前置触发（fix258） | 烤土豆 potato=" + prePotato
+                            + " foodNutrition=" + foodNutrition()
+                            + "（留苗线 8 以上的富余先烤熟再吃）");
+                    return goal("烤土豆", "smelt",
+                            params("item", "baked_potato", "count", prePotato - 8));
                 }
             }
         }
@@ -1515,6 +2310,41 @@ public final class ProgressionPlanner {
                 Step hungerAscend = hungerAscendStep();
                 if (hungerAscend != null) {
                     return hungerAscend;
+                }
+            }
+            // 【fix293】田边有粮先收田（140 棒）：饿了、田就在边上（水平
+            // ≤48 格、|dy|≤12）且有可收作物时，先收田不打猎。fix245 的收田
+            // 支被连败≥3 的门挡住——新图实证（04:16/04:18/05:04）每次饿了
+            // 先白烧 3 次打猎（约 6 分钟、约 6 点 foodLevel ≈ 1.2 个面包）
+            // 才轮到收田；而新图基址 64 格无猎物（118 棒定谳），打猎是零
+            // 收益。真人玩家饿了、田在边上还熟了，先收田。远家/无粮时连败
+            // 门照旧（下方 fix117 分支一字不动）；夜里不派（tend 会被
+            // fix121 截）；回程已败过时不重派（与 fix245 同口径）。
+            if (!isNight() && hungerReturnFailStreak == 0
+                    && System.currentTimeMillis() >= hungerReturnBackoffUntil) {
+                com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.FarmMemory.Farm harvestFarm =
+                        com.example.aivillager.goals.FarmMemory.farm(npc.npcName());
+                if (harvestFarm != null) {
+                    BlockPos harvestAnchor = harvestFarm.anchor();
+                    double harvestDx = harvestAnchor.getX() + 0.5D - npc.getX();
+                    double harvestDz = harvestAnchor.getZ() + 0.5D - npc.getZ();
+                    double harvestDy = npc.getY() - harvestAnchor.getY();
+                    boolean harvestNear = harvestDx * harvestDx + harvestDz * harvestDz
+                            <= 48.0D * 48.0D && Math.abs(harvestDy) <= 12.0D;
+                    int harvestMature = -1;
+                    com.example.aivillager.goals.FarmMemory.Scan harvestScan =
+                            com.example.aivillager.goals.FarmMemory.scan(
+                                    npc.level(), npc.npcName());
+                    if (harvestScan != null) {
+                        harvestMature = harvestScan.mature();
+                    }
+                    if (harvestNear && harvestMature > 0) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 饥饿先收田（fix293） | 已在农场边且有可收作物=" + harvestMature
+                                + "，不再打猎、先收田进食 饥饿狩猎连败=" + hungerHuntFailStreak);
+                        return goal("饥饿求生：回农场", "farm", params("mode", "tend"));
+                    }
                 }
             }
             // 【fix117】hunt 连败 ≥3 次的回家出口：本地猎物已被实证打不着、
@@ -1541,12 +2371,41 @@ public final class ProgressionPlanner {
                     // 37 格，退避到期后回头高原空猎、hp 钉在 1.7）。高差
                     // >12（与 fix114 柱顶分档同量级）同样派 travel，让目标层
                     // 竖向对齐（fix107）把它带下崖。
-                    if (hDx * hDx + hDz * hDz > 48.0D * 48.0D || Math.abs(hDy) > 12.0D) {
+                    boolean nearHome = hDx * hDx + hDz * hDz <= 48.0D * 48.0D
+                            && Math.abs(hDy) <= 12.0D;
+                    // 【fix245】「到家」改判：近家 ≠ 有饭。旧版只要水平 ≤48
+                    // 且高差 ≤12 就判已到家、出口永不触发——86 棒新图实证：
+                    // 假人困在农田约 9 格外的崖壁凹位里，hunt 连败 21 次仍
+                    // 判"到家"，白天连败、夜里过夜，昼夜循环无自解。改判：
+                    // 农场有可收作物（FarmMemory.scan 的 mature 口径）才算
+                    // "到家有饭"：近家有粮且回程未败过 → 不再打猎，直接派
+                    // 收田（借「饥饿求生：回农场」名记账：成功清连败、失败
+                    // 进回程退避）；近家无粮/收田已败过 → 照样派回程腿
+                    // （到家换猎场、翻存粮、到达后 fix230 接 tend），不许
+                    // 再同点无限重派 hunt。
+                    int farmMature = -1;
+                    if (hungerFarm != null) {
+                        com.example.aivillager.goals.FarmMemory.Scan farmScan =
+                                com.example.aivillager.goals.FarmMemory.scan(
+                                        npc.level(), npc.npcName());
+                        if (farmScan != null) {
+                            farmMature = farmScan.mature();
+                        }
+                    }
+                    boolean farmHasFood = farmMature > 0;
+                    if (nearHome && farmHasFood && hungerReturnFailStreak == 0) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 饥饿改收田（fix245） | 已在农场边且有可收作物=" + farmMature
+                                + "，不再打猎、先收田进食 饥饿狩猎连败=" + hungerHuntFailStreak);
+                        return goal("饥饿求生：回农场", "farm", params("mode", "tend"));
+                    }
+                    if (!nearHome || !farmHasFood || hungerReturnFailStreak >= 1) {
                         LOG.info("[AIV][PLAN] " + npc.npcName()
                                 + " 饥饿回程触发 | 目标=" + (hungerFarm != null ? "农场" : "落脚点")
                                 + " " + hungerHome.toShortString()
                                 + " 距离=" + Math.round(Math.sqrt(hDx * hDx + hDz * hDz))
                                 + " 高差=" + Math.round(hDy)
+                                + " 近家=" + nearHome + " 可收作物=" + farmMature
                                 + " 饥饿狩猎连败=" + hungerHuntFailStreak);
                         // 【fix188】农场走廊：目标是农场时同 fix171 腿口径，
                         // 先绕西侧下坡入口（落脚点目标不走走廊）。
@@ -1632,6 +2491,36 @@ public final class ProgressionPlanner {
             // ascend 现在会素手挖开土/石（无掉落）脱困；真被基岩封死挖不动，
             // 它会失败收场，规划器按失败退避换活/待命并打日志，不许自杀逃逸。
             if (underground()) {
+                // 【fix321】(B) ascend 无垫脚连败守卫：同型收场 ≥2 次不再原样重派 ascend。
+                // 锚点位移 ≥4 格算换了地面，连败重新计数（照 fix154 口径）。
+                net.minecraft.core.BlockPos me = npc.blockPosition();
+                if (noFootingAnchorPos != null) {
+                    long adx = me.getX() - noFootingAnchorPos.getX();
+                    long adz = me.getZ() - noFootingAnchorPos.getZ();
+                    if (adx * adx + adz * adz >= 16L) {
+                        noFootingAscendStreak = 0;
+                        noFootingAnchorPos = null;
+                        noFootingFallbackDir = 0;
+                    }
+                }
+                if (noFootingAscendStreak >= 2) {
+                    // 降级腿：横移到实地——朝一个方向平移 6 格、落 1 格（travel 到达判定
+                    // 是水平 ≤4 格，目标取 6 格才真动身；取 3 格会在原地判到达）。
+                    // 从 1 格宽石墩／悬空缘下来到实地，再由 ascend 从实地贴墙爬出。
+                    // 方向按连败轮次轮换；四向都走不通时 travel 诚实失败收场，不再空转重派 ascend。
+                    // (A) 生效时本环不触发（羊毛已可垫脚）；本环只在无羊毛也无垫块时兜底。
+                    int[][] dirs = {{6, 0}, {0, 6}, {-6, 0}, {0, -6}};
+                    int dir = noFootingFallbackDir % dirs.length;
+                    noFootingFallbackDir++;
+                    net.minecraft.core.BlockPos target = new net.minecraft.core.BlockPos(
+                            me.getX() + dirs[dir][0], me.getY() - 1, me.getZ() + dirs[dir][1]);
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " ascend 无垫脚连败改派横移（fix321） | 连败=" + noFootingAscendStreak
+                            + " 方向=" + dir + " 目标=" + target.toShortString()
+                            + " 位置=" + me.toShortString());
+                    return goal("无垫脚连败：横移到实地", "travel",
+                            params("x", target.getX(), "y", target.getY(), "z", target.getZ()));
+                }
                 return skill("工具耗尽被困地下，用手挖阶梯返回地表", "ascend");
             }
             // 地下没有树，这里 gatherLogs 会自动改判成"挖阶梯回地表"。
@@ -1843,7 +2732,7 @@ public final class ProgressionPlanner {
                 && !isNight() && !underground()
                 && foodNutrition() < MINING_FOOD_NUTRITION
                 && hasAny("wooden_hoe", "stone_hoe", "iron_hoe", "golden_hoe",
-                        "diamond_hoe", "netherite_hoe")) {
+                        "diamond_hoe", "netherite_hoe") && !netherChainReady) {
             com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
             if (com.example.aivillager.goals.FarmMemory.farm(npc.npcName()) == null) {
                 BlockPos lastFarmAnchor220 =
@@ -1971,7 +2860,7 @@ public final class ProgressionPlanner {
                     // 骨头磨成骨粉（原版无序合成 1 骨=3 粉，不需工作台），
                     // 下一轮 decide 的维护步才带得动催熟。
                     if (scan.growing() > 0 && countItem("bone_meal") <= 0 && countItem("bone") > 0
-                            && foodNutrition() < MINING_FOOD_NUTRITION) {
+                            && foodNutrition() < MINING_FOOD_NUTRITION && !netherChainReady) {
                         return goal("磨骨粉", "craft", params("item", "bone_meal",
                                 "count", countItem("bone") * 3));
                     }
@@ -1979,18 +2868,55 @@ public final class ProgressionPlanner {
                             || countItem("carrot") > 0 || countItem("potato") > 0;
                     boolean bonemealCase = scan.growing() > 0 && countItem("bone_meal") > 0
                             && foodNutrition() < MINING_FOOD_NUTRITION;
-                    if ((scan.mature() > 0 || (canPlant && (scan.emptyFarmland() > 0
-                            || scan.lost() > 0)) || bonemealCase)
+                    // 【fix270】缺格路（121 棒定谳）：触发式旧版只问熟/空/坏/
+                    // 骨粉，注册格掉到 1–2 格后四路概率枯竭——1 格未熟期数个
+                    // 游戏日零派单，执行层补格段（fix262）再好也轮不到，形成
+                    // 「田越小越不派、越不派越补不上」的只减棘轮。玩家到田边
+                    // 看田缺格、包里有种，本身就会开工补满。故并入一路：注册
+                    // <FARM_TARGET_CELLS（与 GoalExecutor.FARM_TARGET_CELLS
+                    // 同步，fix290 由 8 改 24）∧ 有播种存量即可触发 tend，
+                    // 补不补得动由执行层构建队列时按候选/材料实算；排不到队
+                    // 时 tend 按 fix246 无净进展失败收场、fix60 退避压住
+                    // 频率，不成热循环。
+                    boolean missingCase = farm.cells().size()
+                            < com.example.aivillager.goals.GoalExecutor.FARM_TARGET_CELLS
+                            && canPlant;
+                    // 【fix246】派单前置口径：scan.emptyFarmland 自 fix246 起只
+                    // 数上方为空气、能立刻下种的耕地（被非作物方块压住的格另
+                    // 记 blocked、不点火）——与 fix245 逃生口「可收才算有事干」
+                    // 同口径：没真活就不派 tend，规划层落到下方步干正事，
+                    // 不再 2.7 秒一轮空转（88 棒新图 169 轮实证）。
+                    // 【fix299·147 棒】农田维护让位下界链（门边）：门在田边约 15 格、
+                    // tend 触发半径 48 格——NPC 一到门边 decide 就在 6.7 被 tend
+                    // 抢占，永远到不了 13/13.5（生产 16:43:39 抵达后改派 tend、
+                    // 16:53:55 营养到 20 仍派 tend，两样本）；fix298 只能在田
+                    // 48 格外点火，走回来的 319 秒又把营养烧穿闸口（33→19）。
+                    // 与 fix274/266/288 同型让位：闸已过（food≥14 ∧ nutrition
+                    // ≥20）且门已建成、末影之眼未齐时，本轮不派 tend、落下方
+                    // 13.5 续链；闸不满时本支不点火、tend 照常（田边补给仍是
+                    // 回血路）。不新设门槛。
+                    if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && portalBuiltKnown()
+                            && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 农田维护让位下界链（fix299） | 门已建成、入境口粮闸已过 food="
+                                + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
+                                + "（先回下界续链，种田随后）");
+                    } else if ((scan.mature() > 0 || (canPlant && (scan.emptyFarmland() > 0
+                            || scan.lost() > 0)) || bonemealCase || missingCase)
                             && System.currentTimeMillis() >= farmBackoffUntil) {
                         LOG.info("[AIV][PLAN] " + npc.npcName() + " 农田维护触发 | 熟=" + scan.mature()
                                 + " 空=" + scan.emptyFarmland() + " 坏=" + scan.lost()
-                                + " 长=" + scan.growing());
+                                + " 压=" + scan.blocked()
+                                + " 长=" + scan.growing()
+                                + " 注册=" + farm.cells().size()
+                                + " 缺=" + Math.max(0, com.example.aivillager.goals.GoalExecutor.FARM_TARGET_CELLS
+                                        - farm.cells().size()));
                         return goal("农田维护", "farm", params("mode", "tend"));
                     }
                     }
                 }
             } else if (!isNight() && foodNutrition() < MINING_FOOD_NUTRITION
-                    && System.currentTimeMillis() >= farmBackoffUntil) {
+                    && System.currentTimeMillis() >= farmBackoffUntil && !netherChainReady) {
                 // 先有锄头再开田（玩家常识）：石锄优先、木锄兜底；
                 // 材料不够就落空本步，主线砍树/挖石自然会把材料补上。
                 if (!hasAny("wooden_hoe", "stone_hoe", "iron_hoe", "golden_hoe",
@@ -2048,7 +2974,7 @@ public final class ProgressionPlanner {
         // 建没意义：触发 =（有田 || 铁锭≥8）+ 建材富余 ≥80 + 白天 + 地表。
         // 已有落脚点（本世界账本）就永不再派。
         if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
-                && System.currentTimeMillis() >= baseBackoffUntil) {
+                && System.currentTimeMillis() >= baseBackoffUntil && !netherChainReady) {
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
             if (!com.example.aivillager.goals.BaseMemory.hasBase(npc.npcName())) {
                 // 【fix57】cobbled_deepslate 已并入 cobble 口径，这里不再单加防双算。
@@ -2070,7 +2996,7 @@ public final class ProgressionPlanner {
         // 与重生点。包里有床先安置；没床时同色羊毛 ≥3 才合床（原版各色床
         // 独立配方、必须同色）。白天进行（夜里优先 5.55 睡觉/5.6 小屋）。
         if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
-                && System.currentTimeMillis() >= bedBackoffUntil) {
+                && System.currentTimeMillis() >= bedBackoffUntil && !netherChainReady) {
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
             com.example.aivillager.goals.BaseMemory.Base baseForBed =
                     com.example.aivillager.goals.BaseMemory.base(npc.npcName());
@@ -2101,6 +3027,16 @@ public final class ProgressionPlanner {
                     return goal("线合成白羊毛", "craft",
                             params("item", "white_wool", "count", craftWool));
                 }
+                // 【fix247】第四分支·攒料：有落脚点账本、床未安置、包里无床
+                // 无料时，旧版三分支皆空、整步静默落空——规划层没有任何一步
+                // 会去获取羊毛，床环永堵（91 棒新图 7/7 实证的另一半根因）。
+                // 玩家缺床料就去打羊：派存量驱动 hunt（need=wool，靶=床料等
+                // 价量 3），与皮革链（6.8）同型；本步入口已挂床退避门，失败
+                // 记账与安置床共用床退避（见记账段），不许热循环。
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 找羊毛做床触发（fix247·6.76） | 无床无料"
+                        + "（白羊毛=" + whiteWool + " 线=" + stringCount + "），派杀羊攒羊毛 need=wool stock=3");
+                return goal("找羊毛做床", "hunt",
+                        params("need", "wool", "stock", 3, "radius", 12));
             }
         }
 
@@ -2109,25 +3045,71 @@ public final class ProgressionPlanner {
         // 距锚点 ≤48 格、白天地表时触发。没箱先做箱（8 木板）；有箱（已安置
         // 或包里有）且包里有存入名单物才派存箱目标。名单与执行层 STORE_LOOT
         // 同步（贵重物 + 第二档杂物 + 铁锭超 32 的部分）。
-        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight()
-                && System.currentTimeMillis() >= storeBackoffUntil) {
+        // 【fix249】存箱退避只挡存箱触发本身、不再连带挡做箱子：做箱子是
+        // 补给动作，旧版退避 300 秒内整步被挡，账本残留时「到达→派必败
+        // 存箱→退避→连做箱子都被挡」成死结。箱可用判定一律改实地复核
+        // （recordedChestExists），不再只信账本 hasChest/chestPos。
+        // 【fix328】链就绪时不存箱：211 实证存箱剥走金锭、永无金靴机会。
+        if (planHas(StagePlan.BASE) && hasSword && !underground() && !isNight() && !netherChainReady) {
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
             com.example.aivillager.goals.BaseMemory.Base baseForStore =
                     com.example.aivillager.goals.BaseMemory.base(npc.npcName());
             if (baseForStore != null
                     && npc.blockPosition().distSqr(baseForStore.anchor()) <= 48.0D * 48.0D) {
-                if (baseForStore.chestPos() == null && countItem("chest") == 0
+                if (!recordedChestExists(baseForStore) && countItem("chest") == 0
                         && wood >= 8) {
-                    // 【fix128】触发量改木材当量：旧版只数现成木板，NPC 常年
-                    // 只带原木（36 原木/0 木板）→ 箱子永远不做、存箱从未触发、
-                    // 贵重物只进不出把包结构性塞满。玩家做箱子看的是木头
-                    // 够不够（2 原木=8 木板），与全篇 wood 当量口径对齐。
-                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 做箱子触发 | 木材当量="
-                            + wood + "（木板=" + countSuffix("_planks") + "）");
-                    return goal("制作箱子", "craft", params("item", "chest", "count", 1));
+                    // 【fix367】空槽预检（与 fix364 同款）：箱子合成需 1 格放木板中间产物，
+                    // 空槽=0 时派单必败（294 棒定谳：6.77 支 5 次失败皆「另有 1 个 chest
+                    // 放不下」，fix364 压制不覆盖该支）。不派必败合成，落回常规
+                    // （走动／进食腾格），待空槽≥1 再派。日志 60 秒节流，防每秒刷屏。
+                    if (countEmptyMainSlots() < 1) {
+                        long fix367Now = System.currentTimeMillis();
+                        if (fix367Now - fix342WaitLogAt >= 60_000L) {
+                            fix342WaitLogAt = fix367Now;
+                            LOG.info("[AIV][PLAN] " + npc.npcName()
+                                    + " 做箱子空槽不足跳过（fix367） | 空槽=0"
+                                    + "（箱子合成需 1 格放木板，不派必败合成）");
+                        }
+                    } else {
+                        // 【fix128】触发量改木材当量：旧版只数现成木板，NPC 常年
+                        // 只带原木（36 原木/0 木板）→ 箱子永远不做、存箱从未触发、
+                        // 贵重物只进不出把包结构性塞满。玩家做箱子看的是木头
+                        // 够不够（2 原木=8 木板），与全篇 wood 当量口径对齐。
+                        // 【fix249】触发条件由「账本无箱位」改实地复核：账本箱位
+                        // 还在但实地箱子已被挖毁时同样补做（旧版被残留账本堵死）。
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 做箱子触发 | 木材当量="
+                                + wood + "（木板=" + countSuffix("_planks") + "）"
+                                + (baseForStore.chestPos() != null
+                                        ? "（fix249：账本箱位 "
+                                                + baseForStore.chestPos().toShortString()
+                                                + " 实地已无箱，补做）"
+                                        : ""));
+                        return goal("制作箱子", "craft", params("item", "chest", "count", 1));
+                    }
                 }
-                if ((baseForStore.chestPos() != null || countItem("chest") > 0)
-                        && hasStorableLoot()) {
+                // 【fix251】存箱补镐保障：上次存箱接近被分级守卫堵死时，
+                // 重派存箱前先补造石镐——与挖矿步的补镐保障同构（此前存箱
+                // 步独缺此保障，守卫委托落空、接近腿 480 秒钉死）。补镐是
+                // 补给动作、不受存箱退避挡（与 fix249 做箱子同口径）；材料
+                // 已不够合时清标记落回常规——守卫合不出本走 pick-fallback
+                // 放行铁镐、死锁自解。
+                if (storeTierYieldPending) {
+                    StringBuilder storePickMissing = new StringBuilder();
+                    boolean storePickCraftable = npc.stonePickCraftableNow(storePickMissing);
+                    storeTierYieldPending = false;
+                    if (!hasUsable("wooden_pickaxe", "stone_pickaxe") && storePickCraftable) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 存箱前补造石镐（fix251） | 上次存箱接近被分级守卫堵死，先补镐再存箱");
+                        return goal("制作石镐", "craft",
+                                params("item", "stone_pickaxe", "count", 1));
+                    }
+                    LOG.info("[AIV][PLAN] " + npc.npcName()
+                            + " 存箱补镐保障落空（fix251） | 已有可用低阶镐或合不出（"
+                            + storePickMissing.toString().trim() + "），照常派存箱");
+                }
+                if ((recordedChestExists(baseForStore) || countItem("chest") > 0)
+                        && hasStorableLoot()
+                        && System.currentTimeMillis() >= storeBackoffUntil) {
                     LOG.info("[AIV][PLAN] " + npc.npcName() + " 存箱触发 | 钻石="
                             + countItem("diamond") + " 珍珠=" + countItem("ender_pearl")
                             + " 骨头=" + countItem("bone") + " 线=" + countItem("string")
@@ -2150,12 +3132,21 @@ public final class ProgressionPlanner {
                 com.example.aivillager.goals.DeathMemory.death(npc.npcName());
         if (deathReturn != null) {
             BlockPos deathPos = deathReturn.pos();
-            double deathDx = deathPos.getX() + 0.5D - npc.getX();
-            double deathDz = deathPos.getZ() + 0.5D - npc.getZ();
-            double deathDist = Math.sqrt(deathDx * deathDx + deathDz * deathDz);
-            if (!isNight() && foodNutrition() >= 12
+            // 【fix248】死亡点岩浆过滤：死亡格本身/正下方/四邻任一是岩浆，
+            // 说明人就死在浆里或浆边一步之内——回程终点本身不成立，径直
+            // travel 过去就是再死一次（#94 定谳：回程把人送回池中死亡点）。
+            // 死亡不掉落、回池心零收益（没有尸体可捡），直接销账作废、
+            // 落回常规规划从安全地面续干；正常死亡点（矿底等）不受影响。
+            if (deathPointInLava(deathPos)) {
+                com.example.aivillager.goals.DeathMemory.clear(npc.npcName());
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 死后回程作废 | 死亡点="
+                        + deathPos.toShortString() + " 在岩浆里/浆边，回去必死，销账不回");
+            } else if (!isNight() && foodNutrition() >= 12
                     && (stonePickaxes > 0 || countItem("iron_pickaxe") > 0
-                    || countItem("diamond_pickaxe") > 0)) {
+                    || countItem("diamond_pickaxe") > 0) && !netherChainReady) {
+                double deathDx = deathPos.getX() + 0.5D - npc.getX();
+                double deathDz = deathPos.getZ() + 0.5D - npc.getZ();
+                double deathDist = Math.sqrt(deathDx * deathDx + deathDz * deathDz);
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 死后回程触发 | 死亡点="
                         + deathPos.toShortString() + " 距离=" + Math.round(deathDist)
                         + " foodNutrition=" + foodNutrition());
@@ -2170,7 +3161,8 @@ public final class ProgressionPlanner {
         // （status-round21 D12 定案）：规划层扫方块只作"瞥见"，执行层必须
         // 真走到箱边（寻路门）——隔墙封死的箱子到不了就放弃记账。自家存箱
         // （BaseMemory chestPos）显式排除，防它搜自己刚存的东西。
-        if (!underground() && !isNight()) {
+        // 【fix328】链就绪时不搜箱（世界箱子不会跑，下界链先行）。
+        if (!underground() && !isNight() && !netherChainReady) {
             com.example.aivillager.goals.LootMemory.bindWorld(npc.level());
             com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
             com.example.aivillager.goals.BaseMemory.Base baseForLoot =
@@ -2221,7 +3213,7 @@ public final class ProgressionPlanner {
         // 不到 2，旧门形同虚设、皮革与挖铁 ping-pong 到长跑收尾。
         if (planHas(StagePlan.LEATHER_BOOTS) && npc.inPowderSnowCountry()
                 && !hasAny("leather_boots") && leather < 4 && hasSword
-                && System.currentTimeMillis() >= leatherBackoffUntil) {
+                && System.currentTimeMillis() >= leatherBackoffUntil && !netherChainReady) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 细雪地带优先皮靴 | biome="
                     + npc.biomePath() + " leather=" + leather);
             return goal("找皮革做皮靴", "hunt",
@@ -2239,7 +3231,7 @@ public final class ProgressionPlanner {
         // 【fix38·Fong 04:13】触发改双路径并分别记账：需求触发（急用先烧、有几块烧
         // 几块）与补仓触发（无急用时生铁攒到 RAW_IRON_BATCH 批量烧、铁锭补回常备线；
         // 另设低位维持小批量）。批量是习惯不是门槛，见 smelt 触发= 日志行对账。
-        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && hasFurnace && canFuel()) {
+        if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && hasFurnace && canFuel() && !netherChainReady) {
             if (ingots < 4) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand | ingots=" + ingots
                         + " rawIron=" + rawIron);
@@ -2271,6 +3263,10 @@ public final class ProgressionPlanner {
         com.example.aivillager.goals.OreMemory.bindWorld(npc.level());
         for (com.example.aivillager.goals.OreMemory.Entry oreEntry
                 : com.example.aivillager.goals.OreMemory.entries(npc.npcName())) {
+            // 【fix328】链就绪时不回访记账矿（矿在原地不会跑，下界链先行）。
+            if (netherChainReady) {
+                break;
+            }
             int ironTierPicks = countUsableItem(
                     "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
             boolean tierOk = switch (oreEntry.needTier()) {
@@ -2317,12 +3313,34 @@ public final class ProgressionPlanner {
             }
             return goal("制作铁镐", "craft", params("item", "iron_pickaxe", "count", 1));
         }
+        // 【fix274·126 棒】下界链让位（fix266 的上游对称半）：下方四件铁甲
+        // 阻塞块排在步 13.1 之前、无退避无让位——任一铁件缺失，decide 就
+        // 永远在本块 return、到不了 13.1，netherYield 成死码（fresh143–145
+        // 实证：护腿缺失后正门链整窗零评估、[NETHER]/让位行恒 0，上次入
+        // 界是打猎途中误入的门）。与 fix266 同理：门已建成、末影之眼未齐、
+        // fix96 入境口粮闸同刻满足时，铁甲维护整块让位，decide 自然落到
+        // 步 13/13.5 先回下界续链，铁甲随后补。条件与 fix96/266a 同一组数
+        // 值、不新设门槛；闸不满足时本块一字不变。步 10/11/12 同族铁补仓
+        // 步共用此让位（见彼处条件），防退避软墙在闸口窗口里再迟滞入界。
+        // 【fix328·214 棒】口径已上提至 decide 顶部（fix328 注释处），
+        // 覆盖补全至 6.65–13.35 全部未设门步；此处只用、不再重声明。
+        if (netherChainReady && (!hasAny("iron_chestplate", "diamond_chestplate", "netherite_chestplate")
+                || !hasAny("iron_helmet", "diamond_helmet", "netherite_helmet")
+                || !hasAny("iron_leggings", "diamond_leggings", "netherite_leggings")
+                || !hasAny("iron_boots", "diamond_boots", "netherite_boots"))) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - ironYieldLogAt >= 60_000L) {
+                ironYieldLogAt = nowMs;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 铁甲维护让位下界链（fix274） | 门已建成、入境口粮已够，先回下界续链（末影之眼未齐），铁甲随后");
+            }
+        }
         // 【第十六轮】四件铁甲改"缺锭就挖、够锭就造"的阻塞式（照 13.1 钻石甲的
         // 现成写法）：旧版每件都带 ingots>=门槛才合成、不够就穿堂而过——便宜的
         // 靴子(4)/备用镐(3) 总是先把锭花掉，胸甲(8) 永远攒不出来，长跑#6 实测
         // 只穿头盔+靴子（armor=4）就下钻石层，胸甲/护腿整轮没造。缺锭时先炼掉
         // 手里的生铁，再按差额挖铁，把这一件钉死造出来再走下一件。
-        if (planHas(StagePlan.IRON_GEAR)
+        if (planHas(StagePlan.IRON_GEAR) && !netherChainReady
                 && !hasAny("iron_chestplate", "diamond_chestplate", "netherite_chestplate")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁胸甲 | ingots=" + ingots
@@ -2333,10 +3351,16 @@ public final class ProgressionPlanner {
             if (ingots >= 8) {
                 return goal("制作铁胸甲", "craft", params("item", "iron_chestplate", "count", 1));
             }
+            // 【fix290·138 棒】挖铁下矿先过口粮门（与挖钻三步同口径）：营养<24
+            // 时白天留守地表补给、地下先升井，夜里暂缓（fix143）。下同。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("挖铁（铁胸甲）", "dig",
                     params("resource", "iron", "count", Math.max(1, 8 - ingots - rawIron)));
         }
-        if (planHas(StagePlan.IRON_GEAR)
+        if (planHas(StagePlan.IRON_GEAR) && !netherChainReady
                 && !hasAny("iron_helmet", "diamond_helmet", "netherite_helmet")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁头盔 | ingots=" + ingots
@@ -2347,10 +3371,15 @@ public final class ProgressionPlanner {
             if (ingots >= 5) {
                 return goal("制作铁头盔", "craft", params("item", "iron_helmet", "count", 1));
             }
+            // 【fix290】挖铁下矿先过口粮门（见铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("挖铁（铁头盔）", "dig",
                     params("resource", "iron", "count", Math.max(1, 5 - ingots - rawIron)));
         }
-        if (planHas(StagePlan.IRON_GEAR)
+        if (planHas(StagePlan.IRON_GEAR) && !netherChainReady
                 && !hasAny("iron_leggings", "diamond_leggings", "netherite_leggings")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁护腿 | ingots=" + ingots
@@ -2361,10 +3390,15 @@ public final class ProgressionPlanner {
             if (ingots >= 7) {
                 return goal("制作铁护腿", "craft", params("item", "iron_leggings", "count", 1));
             }
+            // 【fix290】挖铁下矿先过口粮门（见铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("挖铁（铁护腿）", "dig",
                     params("resource", "iron", "count", Math.max(1, 7 - ingots - rawIron)));
         }
-        if (planHas(StagePlan.IRON_GEAR)
+        if (planHas(StagePlan.IRON_GEAR) && !netherChainReady
                 && !hasAny("iron_boots", "diamond_boots", "netherite_boots")) {
             if (rawIron > 0 && hasFurnace && canFuel()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " smelt 触发=demand need=铁靴 | ingots=" + ingots
@@ -2374,6 +3408,11 @@ public final class ProgressionPlanner {
             }
             if (ingots >= 4) {
                 return goal("制作铁靴", "craft", params("item", "iron_boots", "count", 1));
+            }
+            // 【fix290】挖铁下矿先过口粮门（见铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
             }
             return goal("挖铁（铁靴）", "dig",
                     params("resource", "iron", "count", Math.max(1, 4 - ingots - rawIron)));
@@ -2388,7 +3427,7 @@ public final class ProgressionPlanner {
         // （玩家这时会改烧木炭，而不是永远卡在"煤不足"上）。
         boolean coalStarved = failStreak >= 2 && lastFailedStage != null
                 && (lastFailedStage.equals("挖煤") || lastFailedStage.startsWith("燃料告急"));
-        if (planHas(StagePlan.COAL) && coal == 0 && wood < 16 && hasStonePickaxe && !coalStarved) {
+        if (planHas(StagePlan.COAL) && coal == 0 && wood < 16 && hasStonePickaxe && !coalStarved && !netherChainReady) {
             return goal("燃料告急挖煤", "dig",
                     params("resource", "coal", "count", 16));
         }
@@ -2415,7 +3454,13 @@ public final class ProgressionPlanner {
         // 期挡住——违 Fong「常备数软向导、不许硬指标卡进度」。退避让位主
         // 线（补仓另有步 13.3 在主线后兜底），退避到期照常重试。
         if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < 8 && hasStonePickaxe
+                && !netherChainReady
                 && System.currentTimeMillis() >= ironStepBackoffUntil) {
+            // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("挖铁", "dig",
                     params("resource", "iron", "count", 8 - rawIron - ingots));
         }
@@ -2432,6 +3477,7 @@ public final class ProgressionPlanner {
         int ironPickDurability = totalRemainingDurability(
                 "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe");
         if (planHas(StagePlan.SPARE_PICKS) && (usableIronPickaxes < 2 || ironPickDurability < 250)
+                && !netherChainReady
                 && System.currentTimeMillis() >= pickCraftBackoffUntil) {
             if (!stickMaterial) {
                 return gatherLogs("备用铁镐缺木棍");
@@ -2440,11 +3486,22 @@ public final class ProgressionPlanner {
                 return goal("补一把备用铁镐", "craft",
                         params("item", "iron_pickaxe", "count", usableIronPickaxes + 1));
             }
+            // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("补铁做备用铁镐", "dig", params("resource", "iron", "count", 4));
         }
         // 12) 钻石阶段的工具够了，但装备还缺锭（造剑/护甲/下界传送门的铁桶+打火石）：
         // 这时才回头挖铁，别在钻矿前浪费时间。
-        if (planHas(StagePlan.IRON_ORE) && ingots < 8 && hasStonePickaxe && rawIron == 0 && diamonds >= 3) {
+        if (planHas(StagePlan.IRON_ORE) && ingots < 8 && hasStonePickaxe && rawIron == 0 && diamonds >= 3
+                && !netherChainReady) {
+            // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("继续挖铁", "dig", params("resource", "iron", "count", 4));
         }
         if (planHas(StagePlan.SMELT_IRON) && rawIron > 0 && ingots < INGOT_RESERVE_TARGET
@@ -2461,8 +3518,10 @@ public final class ProgressionPlanner {
         // 就先烤——熟肉营养是生肉两倍以上，能把口粮需求砍半的加工步骤不能被它
         // 服务的下矿口粮门挡在后面（#12 实证卡点）。转化手头存货不算追储备，
         // 与冶炼补仓同理，位置放在钻石段之前、补给区之首。
+        // 【fix258】饥饿链抢占面已由步 -0.04 的同口径前置副本接管，本处保留
+        // 作非饥饿时刻（nutrition≥24/危线让位/地下）的常规顺位，勿删。
         String rawMeatEarly = firstRawMeat();
-        if (planHas(StagePlan.FOOD) && rawMeatEarly != null && hasFurnace && canFuel()) {
+        if (planHas(StagePlan.FOOD) && rawMeatEarly != null && hasFurnace && canFuel() && !netherChainReady) {
             return goal("烤肉", "smelt",
                     params("item", cookedOf(rawMeatEarly), "count", 8));
         }
@@ -2470,19 +3529,25 @@ public final class ProgressionPlanner {
         // 12.6) 农产品加工（fix49·D11）：只有富余才进口粮——小麦做面包
         // （3 小麦=1 面包，Wiki；小麦本身不能直接吃），土豆烤熟再吃且只烤
         // 留苗线（8）以上的富余。都排在钻石段之前，口径同烤肉前置。
+        // 【fix258】同 12.5 注：步 -0.04 有同口径前置副本，本处保留勿删。
         int wheatCount = countItem("wheat");
-        if (planHas(StagePlan.FARMING) && wheatCount >= 3) {
+        if (planHas(StagePlan.FARMING) && wheatCount >= 3 && !netherChainReady) {
             return goal("做面包", "craft",
                     params("item", "bread", "count", countItem("bread") + wheatCount / 3));
         }
         int potatoCount = countItem("potato");
-        if (planHas(StagePlan.FARMING) && potatoCount > 8 && hasFurnace && canFuel()) {
+        if (planHas(StagePlan.FARMING) && potatoCount > 8 && hasFurnace && canFuel() && !netherChainReady) {
             return goal("烤土豆", "smelt",
                     params("item", "baked_potato", "count", potatoCount - 8));
         }
 
         // 13) 钻石：铁镐才能挖，Y=-54 附近最多。
-        if (planHas(StagePlan.IRON_ORE) && !hasIronPickaxe) {
+        if (planHas(StagePlan.IRON_ORE) && !hasIronPickaxe && !netherChainReady) {
+            // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             // 铁锭不够但铁也挖完了：继续挖铁，别在原地空等。
             return goal("积攒铁锭", "dig", params("resource", "iron", "count", 4));
         }
@@ -2491,7 +3556,7 @@ public final class ProgressionPlanner {
         // 明约不用的废镐算作「有镐」，挖钻分支与下方制作步双双永不触发，
         // PORTAL_PREP「无钻镐交规划层补钻镐」正好交回死步成闭环（farm111
         // 钻镐 1/1561 盘面实证）。与铁镐步（1677）的 hasUsable 口径对齐。
-        if (planHas(StagePlan.DIAMOND) && diamonds < 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe")) {
+        if (planHas(StagePlan.DIAMOND) && diamonds < 3 && !hasUsable("diamond_pickaxe", "netherite_pickaxe") && !netherChainReady) {
             // 【第十七轮】钻石阶段内的保镐：下钻石层前和每轮重下挖钻目标前都复核——
             // 没有铁镐以上、或铁镐总耐久不足 60（挖一簇矿+容错都不够）时，先原地补镐
             // 再下，别再出现长跑#6d 那种"矿在眼前（58,-50,23）、手里只剩石镐、
@@ -2511,6 +3576,12 @@ public final class ProgressionPlanner {
                     return goal("挖钻石前炼铁补镐", "smelt",
                             params("item", "iron_ingot", "count", Math.min(8, rawIron)));
                 }
+                // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处；本处在下方
+                // 挖钻口粮门上游，现行未被门住）。
+                Step ironFoodGate = miningFoodGate(hasSword);
+                if (ironFoodGate != null) {
+                    return ironFoodGate;
+                }
                 return goal("挖钻石前挖铁补镐", "dig", params("resource", "iron", "count", 4));
             }
             Step foodGate = miningFoodGate(hasSword);
@@ -2527,7 +3598,7 @@ public final class ProgressionPlanner {
             return goal("挖钻石", "dig", params("resource", "diamond", "count", 3));
         }
         // （制作钻石镐已由 fix157 前置到步 10 之前，见彼处；此处原分支删除防口径漂移。）
-        if (planHas(StagePlan.DIAMOND_SWORD) && diamonds >= 2 && !hasUsable("diamond_sword", "netherite_sword")) {
+        if (planHas(StagePlan.DIAMOND_SWORD) && diamonds >= 2 && !hasUsable("diamond_sword", "netherite_sword") && !netherChainReady) {
             if (!stickMaterial) {
                 return gatherLogs("钻石剑缺木棍");
             }
@@ -2541,24 +3612,23 @@ public final class ProgressionPlanner {
         // 地表派（下矿前装满），地下不派（fillbucket 的挖路模式会打断矿线）。
         // 不挂 StagePlan 门控：安稳模式同样要防岩浆。生存层的倒水自救见
         // SurvivalController.douseWithWaterBucket（fix70 同版）。
-        if (!hasAny("bucket", "water_bucket")) {
+        if (!hasAny("bucket", "water_bucket") && !netherChainReady) {
             if (ingots >= 6) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 水桶常备触发 | 铁锭=" + ingots
                         + "（做桶 3 锭、留保底）");
                 return goal("制作铁桶", "craft", params("item", "bucket", "count", 1));
             }
-        } else if (!hasAny("water_bucket") && !underground()
-                && System.currentTimeMillis() >= bucketFillBackoffUntil) {
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 装水常备触发 | 有空桶、地表、先装满再下矿");
-            return goal("装满水桶", "fillbucket", params());
         }
+        // 【fix255】原 else-if 装水分支已前置为步 -0.05（见 decide 顶部）：
+        // 此处排在阶段链深处、主线不断档时永不轮到，桶常年空着。此处只留
+        // 做桶，装水由步 -0.05 抢占派发（退避记账同 stage 名自动接续）。
 
         // 13.06) 【fix71·D5】火把常备：矿道照明的消耗品（执行层 maybePlaceTorch
         // 只在真黑且 8 格内无火把时插）。存量 <8 且有煤/木炭+木棍（或木板，
         // 合成系统自链）就补 8 支（2 次配方）；没料跳过、不新开采集目标。
         if (countItem("torch") < 8
                 && (countItem("coal") > 0 || countItem("charcoal") > 0)
-                && (countItem("stick") > 0 || countSuffix("_planks") > 0)) {
+                && (countItem("stick") > 0 || countSuffix("_planks") > 0) && !netherChainReady) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 火把常备触发 | 火把="
                     + countItem("torch") + " 煤=" + countItem("coal"));
             return goal("制作火把", "craft", params("item", "torch", "count", 8));
@@ -2571,7 +3641,7 @@ public final class ProgressionPlanner {
         if (!hasAny("shield")
                 && hasAny("wooden_sword", "stone_sword", "iron_sword", "golden_sword",
                         "diamond_sword", "netherite_sword")
-                && ingots >= 6) {
+                && ingots >= 6 && !netherChainReady) {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 盾常备触发 | 铁锭=" + ingots
                     + "（有武器、材料富余，做盾）");
             return goal("制作盾牌", "craft", params("item", "shield", "count", 1));
@@ -2598,7 +3668,30 @@ public final class ProgressionPlanner {
                         + " 钻石甲维护让位（fix160） | PORTAL 未建成，先建门（Fong 拍板），铁套+钻镐先行");
             }
         }
-        if (diaArmorReady && !portalYield) {
+        // 【fix266·117 棒】下界链让位（与 fix160 对称的另一半）：门已建成、
+        // 下界链仍待推进（末影之眼 <12，即烈焰棒/珍珠未齐）且 fix96 入境
+        // 口粮闸同刻满足时，本步让位——decide 落到步 13（fix193 同条件
+        // 让位）再到 13.5 回下界续链，钻甲随后。117 棒定谳：门建成后
+        // portalYield 恒假、13.1 无让位地整段占满 decide，13/13.5 在
+        // fresh124–134 约 19 小时内零评估（[NETHER] 行 0、储备派单 0），
+        // 而闸口值在 why 行 42% 时刻本已同刻成立——现码把 fix160 口径
+        // 「钻甲补齐挪到建门之后」做成了「补齐前不许再进门」的硬前置，
+        // 口径从未如此要求（首入本就是铁套）。让位条件与 fix96 入境闸
+        // 同一组数值（food>=14 ∧ nutrition>=20），不新设门槛；闸不满
+        // 足时 13.1 一字不变（钻甲＋下矿口粮门链照常驱动产粮/挖钻）；
+        // eyes>=12 后让位自动失效、甲维护恢复原序。
+        boolean netherYield = diaArmorReady && planHas(StagePlan.PORTAL_PREP)
+                && portalBuiltKnown() && eyes < 12
+                && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20;
+        if (netherYield && diamondArmorMissing()) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - netherYieldLogAt >= 60_000L) {
+                netherYieldLogAt = nowMs;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 钻石甲维护让位下界链（fix266） | 门已建成、入境口粮已够，先回下界续链（末影之眼未齐），钻甲随后");
+            }
+        }
+        if (diaArmorReady && !portalYield && !netherYield) {
             String[][] diaArmor = {
                     {"diamond_helmet", "netherite_helmet", "制作钻石头盔"},
                     {"diamond_chestplate", "netherite_chestplate", "制作钻石胸甲"},
@@ -2635,8 +3728,18 @@ public final class ProgressionPlanner {
         // 两者分工不混。生肉已由 12.5 烤肉前置转化，这里 hunt 补的是总量缺口。
         // 【第二十四轮】去掉旧版 foodLevel<16 的饥饿条门槛：储备看背包存量，
         // 饥饿条满格时包里照样可能一口吃的都没有（长跑#8 F 段实证）。
+        // 【fix289】下界链待入界时先算派单需求营养（闸口 20＋行军预算，
+        // 每轮 decide 只算一次、步 13 与 13.5 共用）；储备有效靶在远门
+        // 语境抬到 max(40, 派单需求)——攒到软靶 40 就在远处猎场被让位
+        // 派回、行军抽水后门口必然差口（169 实证）。非下界链语境
+        // netherDispatchNut 恒 20、reserveTarget 恒 40，本步一字不变。
+        int netherDispatchNut = 20;
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12) {
+            netherDispatchNut = netherDispatchNutrition();
+        }
+        int reserveTarget = Math.max(FOOD_RESERVE_NUTRITION, netherDispatchNut);
         if (planHas(StagePlan.FOOD) && hasSword
-                && (foodNutrition() < FOOD_RESERVE_NUTRITION
+                && (foodNutrition() < reserveTarget
                     || countFood() < FOOD_RESERVE_PORTIONS)) {
             // 【fix97】地下不派 hunt：农场动物只在地表，地下 hunt 的 relocate
             // 只会在洞网里挖石空转（farm57 实证：地表派单被 relocate 带进出生
@@ -2674,7 +3777,7 @@ public final class ProgressionPlanner {
                         + " 退避余秒=" + (reserveBackoffUntil - System.currentTimeMillis()) / 1000L
                         + " foodNutrition=" + foodNutrition());
             } else if (planHas(StagePlan.PORTAL_PREP) && eyes < 12
-                    && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= 20
+                    && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= netherDispatchNut
                     && (!portalBuiltKnown() || goals.nearbyPortal() != null)) {
                 // 【fix193】储备软向导让位下界链：fix96 入境闸已满足且门未
                 // 建成（或亮门在侧待入）时，本轮不派储备 hunt，落 13.3/13.5
@@ -2684,13 +3787,60 @@ public final class ProgressionPlanner {
                 // 建门链等不到 decide）。储备是软向导（Fong 口径：软数不许
                 // 硬卡主线），闸已过即算够用；门成之后本让位自动失效（亮门
                 // 在侧的待入情形除外），储备照常补到 40。
+                // 【fix289 补注】本支 nutrition 条件已改为派单需求（fix96
+                // 闸口 20＋行军预算，见 netherMarchMargin）：亮门在侧时
+                // 预算=0、与原口径逐字一致；门未建成且人离锚点远时，
+                // 先攒够路上饭钱再让位，防派单后行军抽水门口中止。
                 LOG.info("[AIV][PLAN] " + npc.npcName()
                         + " 储备食物让位下界链（fix193） | 入境口粮闸已过 food="
                         + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
                         + "（储备未满 40，先建门）");
+            } else if (planHas(StagePlan.PORTAL_PREP) && eyes < 12
+                    && portalBuiltKnown()
+                    && npc.getFoodData().getFoodLevel() >= 14 && foodNutrition() >= netherDispatchNut) {
+                // 【fix288】门已建成后的让位补口：fix193 的让位以「门未建成
+                // ∨亮门在侧」为界——该设计写于「建门即入界」姿态（110 棒）；
+                // 126 棒后世界姿态已变为「门早已建成、人常在远处、下界链靠
+                // 让位续进」，其余维护步（铁甲块/步 10/11/12/13.1）已由
+                // fix274/266 在闸满时让位，唯独步 13 本身的软目标 40 仍硬卡：
+                // fresh155–167 实证 nutrition 6 次过闸（峰值 23–28）全被本步
+                // hunt 截回、首次过闸至攒满 40 间隔约 7.4 小时（136 棒定谳，
+                // 与 117/126 同病、位置再下一站）。与 fix193 同组数值
+                // （food>=14 ∧ nutrition>=20，不新设门槛）：闸已过即不派
+                // hunt、落 13.5 续链；闸不满时本支不点火、步 13 一字不变，
+                // 储备照常补到 40。入界后回主世界、闸跌破时本支自动失效。
+                // 【fix289 补注】nutrition 条件同 fix193 补注改为派单需求
+                // （闸口＋行军预算）：门在远处时攒满预算才让位。
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 储备食物让位下界链（fix288） | 门已建成、入境口粮闸已过 food="
+                        + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
+                        + "（储备未满 40，不再挡入界）");
+            }
+            // 【fix333·221 棒】fix298b 支已删（原让位：预算不足时不派 hunt、落 13.5 走近门）。
+            // 走近门支翻转后只在预算已过时派单；本支若保留，预算不足时 NPC 既不 hunt
+            // 又不走近（死锁）。删支后预算不足时步 13 正常派 hunt、储备靶 max(40,
+            // dispatchNut) 已含预算，攒够后 fix193/fix288 让位、13.5 派单入界。
+            else if (planHas(StagePlan.PORTAL_PREP) && eyes < 12
+                    && foodNutrition() >= 20
+                    && npc.getFoodData().getFoodLevel() < 14
+                    && hasNonRottenFood()) {
+                // 【fix259】只差饱食条让位：入境闸的营养半边（≥20）已够、
+                // 只差 foodLevel<14 时不再整轮派 stock=40 的 hunt——打猎
+                // 继续烧饱食条、入账又是细水，合取窗口（food≥14 ∧
+                // nutrition≥20 同刻）被自家派单亲手错开（108 棒定谳：
+                // 闸口 10 次读数 17→1 递减、盘点峰值 29 并存）。本轮不派
+                // 单：生存层独立 tick 数秒内即把饱食条顶到阈值（14/19），
+                // 配合 fix259 累积期选食（吃低计账食物、nutrition 不被
+                // 打穿），下一轮 decide 时 fix193 同刻成立、让位 13.5。
+                // 兜底：包里只有腐肉凑数（非危险线不吃腐肉，fix91）时
+                // 不进本支、照旧 hunt，防无食可顶的永等死锁。
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 储备让位：营养已够、等进食顶饱食条（fix259） | food="
+                        + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition());
+                return null;
             } else {
                 return goal("储备食物", "hunt",
-                        params("need", "food", "stock", FOOD_RESERVE_NUTRITION, "radius", 12));
+                        params("need", "food", "stock", reserveTarget, "radius", 12));
             }
         }
 
@@ -2713,7 +3863,67 @@ public final class ProgressionPlanner {
                     + npc.getFoodData().getFoodLevel() + " foodNutrition=" + foodNutrition()
                     + "（需 food>=14 且 nutrition>=20）");
         }
-        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && netherFoodOk) {
+        // 【fix333·221 棒】走近门支翻转：原 fix298 口径「预算只拦进门、不拦走近」
+        // （只差预算时派 travel 走近门）已证伪——221 实证：田→门 541 格，出发约 37、
+        // 到门 0、541 格返田空转；其设计假设「走近路约 50 格、田就在门边 15 格」
+        // 在正式图不成立（田 199,62,-40、门 733,65,-129）。改为：门已建成且人远时，
+        // 仅当带够行军预算（nutrition>=dispatchNut，无封顶）才派 travel 走回既有门；
+        // 预算不足时不派、落下方 fix289 支（步 13 正常 hunt 攒够预算再走）。
+        // 数学上：到门仍过闸要求 nutrition−burn≥20，按 0.2/格保守率即 nutrition≥
+        // dispatchNut——与旧派单条件互斥，旧支无合法窗口。另：本支在主入界块之前，
+        // 预算已过且人远时先派走近、到门边后主块进门；若本支不点火而主块直接接手，
+        // nearbyPortal()==null 会落建门支造新门（214 缺口），故本支不可删、只能翻转。
+        // 金靴检查在主块内（远门语境下金靴多已在包；执行层进门闸为末道防线）。
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && netherFoodOk
+                && foodNutrition() >= netherDispatchNut
+                && portalBuiltKnown() && goals.nearbyPortal() == null) {
+            com.example.aivillager.goals.PortalMemory.bindWorld(npc.level());
+            com.example.aivillager.goals.PortalMemory.Portal portalRecord =
+                    com.example.aivillager.goals.PortalMemory.portal(npc.npcName());
+            BlockPos portalTarget = portalRecord != null ? portalRecord.pos() : null;
+            if (portalTarget == null) {
+                // 【fix361·277 棒】门位缺失（维度错位记录）时锚点只作远处行军目标：
+                // NPC 远离锚点时回锚点验门是正式服远门重赴的既有路径，保留；NPC
+                // 已在锚点容差内时再派 travel 只会首 tick“到达”热循环（新图 277
+                // 棒实证：1988 次接受／1995 行 0.5 秒到达），由下方进展检测拦住、
+                // 落主块（重燃/建门支）。锚点不是门位，只是验门集合点。
+                com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+                com.example.aivillager.goals.BaseMemory.Base base =
+                        com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+                if (base != null) {
+                    portalTarget = base.anchor();
+                }
+            }
+            if (portalTarget != null && portalTravelAllowed(portalTarget)) {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 下界链：走近门（fix333） | foodNutrition=" + foodNutrition()
+                        + " 需>=" + netherDispatchNut + "（闸口 20＋行军预算 "
+                        + (netherDispatchNut - 20) + "） 门位=" + portalTarget.toShortString());
+                return goal("走近传送门", "travel",
+                        params("x", portalTarget.getX(), "y", portalTarget.getY(),
+                                "z", portalTarget.getZ()));
+            }
+            // 【fix361】无有效门位或进展检测未过时不 return，落下方主块
+            // （重燃/建门支）。
+        }
+        // 【fix289】原始闸已过、行军预算未满：本轮同样不派下界链——按
+        // 出发地读数放行，只会把人送到门口再被实读闸中止（fresh169
+        // 实证：48 出发、190 格夜路抽掉 30、门口剩 18）。步 13 已按
+        // 同一有效靶（max(40, 闸口＋预算)）在前序续攒，达标后本段
+        // 自然点火；本支只打节流专行，把「还差多少路上饭钱」说清。
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && netherFoodOk
+                && foodNutrition() < netherDispatchNut) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - marchBudgetLogAt >= 60_000L) {
+                marchBudgetLogAt = nowMs;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " [NETHER] 入境口粮已过闸、行军预算不足（fix289） | foodNutrition="
+                        + foodNutrition() + " 需>=" + netherDispatchNut
+                        + "（闸口 20＋行军预算 " + (netherDispatchNut - 20) + "，先补给再出发）");
+            }
+        }
+        if (planHas(StagePlan.PORTAL_PREP) && eyes < 12 && netherFoodOk
+                && foodNutrition() >= netherDispatchNut) {
             // 【fix93·D8】下界金装闸：Fong 定下界必穿一件金装（猪灵只认
             // 身上的金子，没穿的当入侵者围殴）。金靴最便宜（4 锭），定为
             // 指定件：脚上/包里都没有金靴时，先烧金、做金靴、缺料挖金，
@@ -2745,9 +3955,24 @@ public final class ProgressionPlanner {
                 // 附近已经有亮着的门：玩家不会浪费材料再造一座，直接走进去。
                 return goal("进入下界传送门", "enterportal", params());
             }
+            // 【fix361·277 棒】重燃旧框优先于重建：附近有已灭的完整黑曜石框
+            // （内腔空气、框体仍在）且包里有打火石时，直接派 portal 目标重燃，
+            // 不走浇铸黑曜石链（新图 277 棒实证：框在、门灭，打火石点火即玩家
+            // 最简路线；重燃 0 黑曜石消耗）。无框或无打火石时落下方常规链。
+            // 【fix362·280 棒】单格缺损补框重燃亦走重燃支（包里须有黑曜石补格；
+            // 无黑曜石时落下方浇铸链，得料后下次再判）。
+            if (hasAny("flint_and_steel") && (goals.hasUnlitPortalFrame()
+                    || (countItem("obsidian") >= 1 && goals.hasRepairablePortalFrame()))) {
+                return goal("重燃传送门", "portal", params());
+            }
             if (!hasAny("bucket", "water_bucket")) {
                 if (ingots >= 3) {
                     return goal("制作铁桶", "craft", params("item", "bucket", "count", 1));
+                }
+                // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+                Step ironFoodGate = miningFoodGate(hasSword);
+                if (ironFoodGate != null) {
+                    return ironFoodGate;
                 }
                 return goal("补铁做铁桶", "dig", params("resource", "iron", "count", 4));
             }
@@ -2758,6 +3983,11 @@ public final class ProgressionPlanner {
                 if (ingots >= 1) {
                     return goal("制作打火石", "craft",
                             params("item", "flint_and_steel", "count", 1));
+                }
+                // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+                Step ironFoodGate = miningFoodGate(hasSword);
+                if (ironFoodGate != null) {
+                    return ironFoodGate;
                 }
                 return goal("补铁做打火石", "dig", params("resource", "iron", "count", 4));
             }
@@ -2797,6 +4027,12 @@ public final class ProgressionPlanner {
                                 params("item", "iron_ingot", "count",
                                         Math.min(8, rawIron)));
                     }
+                    // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处；本处在
+                    // 下方入境口粮门上游，现行未被门住）。
+                    Step ironFoodGate = miningFoodGate(hasSword);
+                    if (ironFoodGate != null) {
+                        return ironFoodGate;
+                    }
                     return goal("下界挖钻前挖铁补镐", "dig",
                             params("resource", "iron", "count", 4));
                 }
@@ -2827,6 +4063,11 @@ public final class ProgressionPlanner {
         }
         if (planHas(StagePlan.IRON_ORE) && rawIron + ingots < INGOT_RESERVE_TARGET
                 && hasStonePickaxe) {
+            // 【fix290】挖铁下矿先过口粮门（见步骤 8 铁胸甲处）。
+            Step ironFoodGate = miningFoodGate(hasSword);
+            if (ironFoodGate != null) {
+                return ironFoodGate;
+            }
             return goal("铁储备补仓", "dig",
                     params("resource", "iron", "count",
                             Math.min(16, INGOT_RESERVE_TARGET - rawIron - ingots)));
@@ -3107,7 +4348,40 @@ public final class ProgressionPlanner {
                 && !shelterCoolingDown() && !nearShelterTonight) {
             return goal("夜间小屋", "build", params("structure", "shelter"));
         }
+        // 【fix229】(d) 支材料不足时先合木板：#61 定谳——救援腿把圆石烧到 1 块，
+        // (d) 支 buildBlocks=13<25 无法建屋、(e) 支原地等待整夜暴露被杀。
+        // 玩家做法是先把原木合成木板（1 原木 = 4 木板，净 +3/根），合完即够
+        // 25 块建屋门槛。本夜只派一次，合后下一 tick (d) 支自然接手建屋；
+        // 合后仍不足或无原木时落回 (e)，与现况一致（不硬造兜底缺口）。
+        if (!underRoof() && planHas(StagePlan.SHELTER) && buildBlocks < 25
+                && !shelterCoolingDown() && !nearShelterTonight
+                && plankCraftNight != today) {
+            int logs = countLogs();
+            int logsNeeded = (25 - buildBlocks + 2) / 3;
+            if (logs > 0 && logsNeeded > 0 && buildBlocks + logs * 3 >= 25) {
+                int craftLogs = Math.min(logsNeeded, logs);
+                plankCraftNight = today;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 夜间小屋先合木板（fix229） | 建材=" + buildBlocks
+                        + " 原木=" + logs + " 合=" + craftLogs + "根→"
+                        + (countPlanksTotal() + craftLogs * 4) + "木板");
+                return goal("夜间小屋：先合木板", "craft",
+                        params("item", "planks",
+                                "count", countPlanksTotal() + craftLogs * 4));
+            }
+        }
         // e) 原地等待至天亮（decide 返回 null 待命，生存层照常护身）。
+        // 【fix240】保持心跳：等待段约 30 秒一行（hp/food/pos/dayTime），
+        // 让「活着过夜」与「冻死」在日志上可区分（81 棒定量 236 秒零日志）。
+        long holdNowMs = System.currentTimeMillis();
+        if (holdNowMs - overnightHoldLastHeartbeatMs >= 30_000L) {
+            overnightHoldLastHeartbeatMs = holdNowMs;
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 过夜保持心跳（fix240） | hp="
+                    + String.format(java.util.Locale.ROOT, "%.1f", npc.getHealth())
+                    + " foodLevel=" + foodLevel
+                    + " pos=" + npc.blockPosition().toShortString()
+                    + " dayTime=" + (npc.level().getDayTime() % 24000L));
+        }
         return null;
     }
 
@@ -3166,7 +4440,27 @@ public final class ProgressionPlanner {
                 surfStripIssued = false;
                 surfMaterialRounds = 0;
                 surfMaterialRound = false;
+                surfPickCraftTried = false;
             }
+        }
+        if (surfAscendPhase == 2) {
+            // 【fix317】补镐轮回读：decide 再次落到本腿，说明插入的补镐
+            // 合成步已经收场（目标层已放行）。补出可用石镐→回 ascend
+            // 腿续爬，横移 strip 这次能真掘进换列；仍无可用石镐（合成
+            // 未成/材料中途耗尽）→同样回 ascend 腿，但 surfPickCraftTried
+            // 保持已插标记、本腿不再重插，横移两轮放弃的既有出口照常
+            // 可达（只堵不疏不许出厂）。
+            int usableAfterCraft = countUsableItem("stone_pickaxe");
+            surfAscendPhase = 0;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 回地表补镐轮回读（fix317） | 阶段=" + stage
+                    + " 可用石镐=" + usableAfterCraft
+                    + (usableAfterCraft > 0
+                            ? "（补镐已生效，回 ascend 腿续爬）"
+                            : "（补镐未产出可用石镐，本腿不再重插，回 ascend 腿走既有出口）"));
+            surfAscendIssued = true;
+            surfAscendSeq = skills.outcomeSeq();
+            return skill(stage, "ascend");
         }
         if (surfAscendPhase == 1) {
             return surfaceLateralStep(stage, me);
@@ -3190,6 +4484,7 @@ public final class ProgressionPlanner {
             surfAscendFailStreak = 0;
             surfAscendAnchorPos = null;
             surfLateralRounds = 0;
+            surfPickCraftTried = false;
             LOG.info("[AIV][PLAN] " + npc.npcName()
                     + " 回地表 ascend 结局回读（fix154） | outcome=" + outcome
                     + "（已回地表，落回地表口径处置）");
@@ -3232,6 +4527,7 @@ public final class ProgressionPlanner {
                     surfAscendFailStreak = 0;
                     surfLateralRounds = 0;
                     surfAscendAnchorPos = null;
+                    surfPickCraftTried = false;
                     LOG.info("[AIV][PLAN] " + npc.npcName()
                             + " 回地表横移两轮仍未脱困，放弃回地表腿（fix154） | pos="
                             + me.toShortString()
@@ -3271,6 +4567,33 @@ public final class ProgressionPlanner {
         }
         String stripOutcome = skills.lastOutcome();
         surfStripSeq = skills.outcomeSeq();
+        if (stripOutcome != null && stripOutcome.startsWith("strip ")
+                && stripOutcome.contains("礼让收场") && stripOutcome.contains("分级守卫")
+                && !surfPickCraftTried) {
+            int usablePicks317 = countUsableItem("stone_pickaxe");
+            int cobble317 = countItem("cobblestone") + countItem("cobbled_deepslate");
+            boolean stickMat317 = countItem("stick") >= 2
+                    || countPlanksTotal() >= 2 || countLogs() >= 1;
+            if (usablePicks317 < 1 && cobble317 >= 3 && stickMat317) {
+                // 【fix317】守卫把活推回规划层（「交规划层补造石镐」），
+                // 而回地表腿是规划层内部状态机：旧版在下方把让位结局按
+                // 横移完成吞掉、decide 永不落穿到工具保障步，补镐请求无
+                // 人接棒（179 棒定谳：正式服同签名滞留逾 25 分钟；实验场
+                // G0 同签名复现）。就地接棒：本腿插入一次与保障步同款的
+                // 补镐合成步（phase=2），补完由 surfaceAscendStep 回读。
+                surfPickCraftTried = true;
+                surfStripIssued = false;
+                surfMaterialRound = false;
+                surfAscendPhase = 2;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 横移被分级守卫让位，就地补镐（fix317） | 阶段=" + stage
+                        + " outcome=" + stripOutcome
+                        + " 可用石镐=" + usablePicks317 + " 圆石=" + cobble317
+                        + "（插入补镐步，补完回 ascend 腿；本腿只插一次）");
+                return goal("补一把备用石镐", "craft",
+                        params("item", "stone_pickaxe", "count", usablePicks317 + 1));
+            }
+        }
         if (stripOutcome != null && stripOutcome.startsWith("strip ")) {
             // 横移收场（成败不论）：锚点跟到新列、连败清零，回 ascend 腿。
             surfStripIssued = false;
@@ -3427,6 +4750,8 @@ public final class ProgressionPlanner {
                 if (ascendOutcome != null && ascendOutcome.startsWith("ascend 已回到地表")) {
                     relocationPhase = 1;
                     relocationAscendIssued = false;
+                    relocationAscendFailStreak = 0;
+                    relocationAscendFailPos = null;
                     // 【fix150】记换区原点：后续 explore/travel 位移验收统一按此算。
                     if (relocationOriginPos == null) {
                         relocationOriginPos = npc.blockPosition();
@@ -3436,11 +4761,51 @@ public final class ProgressionPlanner {
                             + " 位置=" + npc.blockPosition().toShortString()
                             + "（已回地表，进 explore 腿）");
                 } else {
-                    LOG.info("[AIV][PLAN] " + npc.npcName()
-                            + " 换区 ascend 结局回读（fix147） | outcome=" + ascendOutcome
-                            + " 位置=" + npc.blockPosition().toShortString()
-                            + "（未回地表，继续 ascend，不派 explore）");
-                    return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
+                    // 【fix252】同点连败消费：旧版对 ascend 失败结局无条件同点
+                    // 重派，farm253 实证岩浆湖孤岛上连败 39+ 次、零位移、主线
+                    // 时间被无限吞食（失败入了 stage 账却没人消费，与 fix250
+                    // 「不入账」恰成对照）。只认 ascend 本人的非地表结局、位置
+                    // 未变才累加（位移换点清零）；≥3 放弃上挖腿、落进 phase 1
+                    // 既有 explore/travel 换位链（位移验收口径不变）。
+                    boolean sameSpotFail = false;
+                    if (ascendOutcome != null && ascendOutcome.startsWith("ascend ")) {
+                        // 同点口径：以首败位置为锚，切比雪夫距离 ≤1 仍算同点
+                        // （悬停/贴边挪动 1 格不算脱困）；锚不随连败移动，真正
+                        // 爬升/横移 ≥2 格即断链重新计锚（部分进展不误杀）。
+                        net.minecraft.core.BlockPos nowPos = npc.blockPosition();
+                        if (relocationAscendFailPos != null
+                                && Math.max(Math.max(Math.abs(nowPos.getX() - relocationAscendFailPos.getX()),
+                                        Math.abs(nowPos.getY() - relocationAscendFailPos.getY())),
+                                        Math.abs(nowPos.getZ() - relocationAscendFailPos.getZ())) <= 1) {
+                            relocationAscendFailStreak++;
+                        } else {
+                            relocationAscendFailPos = nowPos;
+                            relocationAscendFailStreak = 1;
+                        }
+                        sameSpotFail = true;
+                    }
+                    if (sameSpotFail && relocationAscendFailStreak >= 3) {
+                        relocationPhase = 1;
+                        relocationAscendIssued = false;
+                        relocationAscendFailStreak = 0;
+                        relocationAscendFailPos = null;
+                        relocationExploreStartPos = null;
+                        if (relocationOriginPos == null) {
+                            relocationOriginPos = npc.blockPosition();
+                        }
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 换区 ascend 同点连败改走横移（fix252） | outcome=" + ascendOutcome
+                                + " 位置=" + npc.blockPosition().toShortString()
+                                + "（同点连败≥3，放弃上挖腿，进 explore/travel 换位链）");
+                        // 不 return：落进下方 phase 1 派单（与回地表成功同路）。
+                    } else {
+                        LOG.info("[AIV][PLAN] " + npc.npcName()
+                                + " 换区 ascend 结局回读（fix147） | outcome=" + ascendOutcome
+                                + " 位置=" + npc.blockPosition().toShortString()
+                                + "（未回地表，继续 ascend，不派 explore）"
+                                + (sameSpotFail ? " 同点连败=" + relocationAscendFailStreak + "（fix252）" : ""));
+                        return skill("挖矿连败换区：先挖阶梯回地表", "ascend");
+                    }
                 }
             } else {
                 relocationAscendIssued = true;
@@ -3514,11 +4879,84 @@ public final class ProgressionPlanner {
     }
 
     /** 当前是否明显在地表以下（比该列高度图的站立 Y 低 3 格以上）。 */
+    /** 【fix249】账本箱位实地复核：账本记有箱位、且该格实地仍是箱子方块
+     * 才算「有箱可用」。账本箱子被挖毁后 hasChest/chestPos 残留不清（正式
+     * 世界贵重箱 2026-11-05 被自救挖毁、账本仍记有箱），规划层只看账本的
+     * 判定随之恒真/恒假：存箱反复派到实地无箱处 0.5 秒放弃、做箱子分支
+     * 永不点火，满包专程往返成环（93/94 棒定谳）。调用点都在锚点 48 格
+     * 内（NPC 本人近傍、区块已加载，同 fix227 口径，不踩未加载误读）。 */
+    private boolean recordedChestExists(
+            com.example.aivillager.goals.BaseMemory.Base base) {
+        BlockPos cp = base.chestPos();
+        return cp != null && npc.level().getBlockState(cp)
+                .is(net.minecraft.world.level.block.Blocks.CHEST);
+    }
+
+    /** 【fix248】死亡点岩浆判定：死亡格本身、正下方、四邻任一为岩浆即危险。 */
+    private boolean deathPointInLava(BlockPos pos) {
+        net.minecraft.world.level.Level level = npc.level();
+        if (level.getBlockState(pos).is(net.minecraft.world.level.block.Blocks.LAVA)
+                || level.getBlockState(pos.below())
+                        .is(net.minecraft.world.level.block.Blocks.LAVA)) {
+            return true;
+        }
+        for (net.minecraft.core.Direction dir
+                : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+            if (level.getBlockState(pos.relative(dir))
+                    .is(net.minecraft.world.level.block.Blocks.LAVA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean underground() {
         BlockPos pos = npc.blockPosition();
         int surface = npc.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
                 pos.getX(), pos.getZ());
         return pos.getY() < surface - 3;
+    }
+
+    /**
+     * 【fix227】床边复活站位是否全堵：与 SurvivalController 复活扫描、
+     * GoalExecutor fix130 找床边站位格同规则——床占两格（账本脚格 +
+     * 朝向头格），两格的四邻逐个验 PathFinder.isStandable，任一格
+     * 可站即不堵；床本体不在返回 false（那是 fix99/6.76 的账本
+     * 失效面，不归清障管）。调用时 NPC 已在落脚点近傍，床区块
+     * 已加载，不会踩 fix82 的未加载误读。
+     *
+     * <p>【fix266·117 棒】站位扫描同列竖直放宽 dy{0,-1,+1,-2,+2,-3,+3,
+     * -4,+4}，与 fix265 已放宽的另两处读者（SurvivalController
+     * findBedRespawnStand、GoalExecutor findBedStandCell）逐项一致——
+     * 本处是 fix265 漏掉的第三处读者：新图基址同层站位支撑被掏空、
+     * 只有 dy=-1 可站时，本处恒判全堵抢占 clear_bed、执行层恒判
+     * 「已有可站立格」0.5 秒成功且不喂退避，fresh135 白天每秒一轮
+     * 空转冻死 NPC（06:16–06:26 已 326 次）。三处读者自此同口径。
+     */
+    private boolean bedRespawnBlocked(BlockPos foot) {
+        net.minecraft.world.level.block.state.BlockState state = npc.level().getBlockState(foot);
+        if (!(state.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+            return false;
+        }
+        net.minecraft.core.Direction facing = state.getValue(
+                net.minecraft.world.level.block.BedBlock.FACING);
+        BlockPos other = state.getValue(net.minecraft.world.level.block.BedBlock.PART)
+                == net.minecraft.world.level.block.state.properties.BedPart.FOOT
+                ? foot.relative(facing) : foot.relative(facing.getOpposite());
+        for (int dy : new int[]{0, -1, 1, -2, 2, -3, 3, -4, 4}) {
+            for (BlockPos cell : new BlockPos[]{foot, other}) {
+                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                    BlockPos stand = cell.relative(dir).offset(0, dy, 0);
+                    if (stand.equals(foot) || stand.equals(other)) {
+                        continue;
+                    }
+                    if (PathFinder.isStandable(npc.level(), stand)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------- 维度分支
@@ -3547,6 +4985,180 @@ public final class ProgressionPlanner {
         // 一只眼睛 = 1 珍珠 + 1 烈焰粉；1 根烈焰棒能合成 2 份粉，所以 6 根棒刚好够 12 只眼。
         int powderUnits = powder + rods * 2;
 
+        // 【fix306·156 棒】下界链镐保障：decideNether 绕过 decide() 的镐子
+        // 保障步，石镐在下界掘进中烧断后无人补造——分级守卫（fix44/101）
+        // 在「石镐可立即合」时拒用高级镐、travel 技能以礼让收场交规划层，
+        // 下界派单侧不消费、原样重派 travel，技能 1 秒一轮空转（实验场
+        // 156 棒实证）。判定与守卫同源：身体层 stonePickCraftableNow（与
+        // 守卫拒挖时问的是同一个函数），合不出时不拦——守卫自会降级用
+        // 铁镐（fix101 兜底链），不堵不疏。阶段名与主线补镐步同名，满包
+        // 退避记账（fix116/126）照常生效。
+        if (!hasUsable("stone_pickaxe")
+                && npc.stonePickCraftableNow(new StringBuilder())
+                && System.currentTimeMillis() >= pickCraftBackoffUntil) {
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 下界链镐保障（fix306） | 无可用石镐且可立即合，先补石镐再续链");
+            return goal("补一把备用石镐", "craft",
+                    params("item", "stone_pickaxe", "count", 1));
+        }
+        // 【fix369·310 棒】下界木镐过渡：fix306 只补“石镐合得出”的情形；
+        // 石料全无（圆石／深板岩圆石／黑石皆 <3）时 decideNether 从无木镐支，
+        // NPC 揣着原木在下界猎杀／行进全程不合镐（309 正式服 68 分钟实证）。
+        // 最简路线：玩家做法就是就地合木镐、挖黑石、再合石镐。无任何可用镐
+        // （木／石／铁／钻／下界）且石镐合不出时：没工作台且木料够做台
+        // （木板＋原木×4 ≥4，菌柄计原木）先做台；有工作台且木棍料够
+        // （棍≥2／板≥2／原木≥1，菌柄计原木）做木镐。木镐能挖黑石（Wiki：
+        // 木镐或更好），挖到 3 块黑石后 fix306 接棒补石镐。受
+        // pickCraftBackoffUntil 同款退避闸。石镐合得出时本支不抢——fix306 在上，先行。
+        if (!hasUsable("wooden_pickaxe", "stone_pickaxe", "iron_pickaxe",
+                "diamond_pickaxe", "netherite_pickaxe")
+                && !npc.stonePickCraftableNow(new StringBuilder())
+                && System.currentTimeMillis() >= pickCraftBackoffUntil) {
+            int netherSticks = countItem("stick");
+            int netherPlanks = countSuffix("_planks");
+            int netherLogs = countSuffix("_log")
+                    + countItem("crimson_stem") + countItem("warped_stem");
+            if (!hasAny("crafting_table") && netherPlanks + netherLogs * 4 >= 4) {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 下界无镐先做工作台（fix369） | 无可用镐且石镐合不出，木料够做台");
+                return goal("制作工作台", "craft",
+                        params("item", "crafting_table", "count", 1));
+            }
+            boolean netherStickMaterial = netherSticks >= 2 || netherPlanks >= 2
+                    || netherLogs >= 1;
+            if (hasAny("crafting_table") && netherStickMaterial) {
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 下界木镐过渡（fix369） | 无可用镐且石镐合不出，先做木镐挖黑石");
+                return goal("制作木镐", "craft",
+                        params("item", "wooden_pickaxe", "count", 1));
+            }
+        }
+        // 【fix306】停滞账陈旧清理：人已离停滞点 >64 格（被传送/复活/自行
+        // 脱出），旧账作废，防日后在新地形误触发出袋。
+        if (netherTravelStallPos != null) {
+            long sdx = (long) npc.getX() - netherTravelStallPos.getX();
+            long sdz = (long) npc.getZ() - netherTravelStallPos.getZ();
+            if (sdx * sdx + sdz * sdz > 4096L) {
+                netherTravelStallStreak = 0;
+                netherTravelStallPos = null;
+                netherStallEscapesUsed = 0;
+                netherStallEscapeArmed = false;
+            }
+        }
+
+        // 【fix365·289 棒】下界长途停滞出袋（要塞腿／森林腿共用）：fix306 的
+        // 出袋支原只嵌在要塞腿内（powderUnits < 12 分支），森林腿
+        // （pearlUnits < 12 分支）无出袋检查——正式服 288 新 boot 实证：
+        // 森林腿 144 收场、约 37 秒一轮、水平 381 恒定、净位移 0；实验场
+        // 同款 120 收场。记账侧（fix306/fix365）已认两腿，派单侧在此顶部
+        // 共用出袋：armed 时改派 ascend 挖楼梯上行出袋（梯次上限 3）；梯次
+        // 用满仍停滞则清账改派下界探索换位。放在镐保障与陈旧清理之后、
+        // eyes 分支之前——出袋优先于重派任何一条长途，但不抢镐保障。
+        // ascend 认 y 参数只爬到该层（无 y 会奔基岩顶，不可用）；+32 对
+        // 正式服实证口袋（y46 → 高带 73+）足够，封顶 120 防撞下界基岩层。
+        if (netherStallEscapeArmed) {
+            netherStallEscapeArmed = false;
+            netherStallEscapesUsed++;
+            int targetY = Math.min(120, npc.blockPosition().getY() + 32);
+            // 【fix375·339 棒】岩台猎杀：出袋支触发时 NPC 已站在森林锚点 14 格内
+            // （重搜只返回自身位置，距离=0，335–338 四棒实证：清缓存 50→141→
+            // 242→345，slay 皆不可达，珍珠 x7 冻结）且仍在珍珠腿（pearlUnits < 12）
+            // 且已在高带岩台（Y≥100，旧 boot 钉死点 Y=110–120）时，上行已无增益——
+            // 末影人在岩台下 15–50 格（slay 目标不可达 approach Y=71–99，NPC
+            // Y=110–120），再爬也是原地空转。改派 descend 下行 32 格换点再猎
+            // （现行 descend 技能，挖楼梯下行，带流体转向／边缘复位／竖井模式）；
+            // 仍清森林锚点缓存（fix374 行为不变），下次派单从新位置重搜。
+            // Y<100 时走旧 ascend 支：中低带（Y=67–99）正在末影人活动带内，
+            // 上行是向其靠近的已验证逃生，不动它。NPC 已低（Y≤64）或不在珍珠腿
+            // 时亦走旧支，不动 fix374 的口袋出袋。下行底限 Y=56：高于岩浆海
+            // （约 Y=31）与口袋底（Y=34），防下行过头。
+            BlockPos oldForestAnchor375 = endermanForestAnchor;
+            boolean selfAnchor375 = oldForestAnchor375 != null
+                    && npc.blockPosition().distSqr(oldForestAnchor375) <= 14.0D * 14.0D;
+            int npcY375 = npc.blockPosition().getY();
+            if (selfAnchor375 && pearls + eyes < 12 && npcY375 >= 100) {
+                int descendY375 = Math.max(56, npcY375 - 32);
+                endermanForestAnchor = null;
+                endermanForestSearchAt = 0L;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 森林锚点清缓存（fix374） | 出袋上行后重搜，旧锚点="
+                        + oldForestAnchor375.toShortString());
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 岩台下行换点猎末影人（fix375） | 已在森林锚点旁 距离="
+                        + (int) Math.sqrt(npc.blockPosition().distSqr(oldForestAnchor375))
+                        + " 旧锚点=" + oldForestAnchor375.toShortString()
+                        + " 当前Y=" + npcY375 + " 下行目标Y=" + descendY375
+                        + "（上行无增益，末影人在岩台下方，下行换点再猎）");
+                return new Step("下行出岩台猎末影人", Kind.SKILL,
+                        new Intent("", "descend", params("y", descendY375)));
+            }
+            // 【fix375 v3·341 棒】眼已齐脱出：珍珠腿已完成（pearls+eyes>=12，
+            // 340 实证：珍珠 x7→x12 后合出 ender_eye x12），森林腿不再跑、
+            // 森林锚点恒为 null（340 实证：清缓存行旧锚点=无、「找到诡异森林」
+            // 停在 2 行）——v2 的 selfAnchor 前置与珍珠腿前置在此态下皆死锁，
+            // v2 下行支永不触发；NPC 有 12 颗眼却钉在 Y=120 岩台（-98,120,297），
+            // 逃生支 1:1 空转 46+ 次，ascend 目标即自身高度 Y=120，无上升。
+            // 眼已齐且 NPC 在高带岩台（Y≥100）停滞时亦允许下行换点脱出：
+            // 下行 32 格（底限 Y=56，与 v2 同），仍清森林锚点缓存（恒为空，
+            // 仅保 fix374“逃生清缓存”不变量），下次派单走要塞投影点 travel。
+            // Y<100 时走旧 ascend 支。v3 不动 v2 珍珠腿分支（在前优先）、
+            // 不动阈值 Y≥100／下行 32／底限 Y=56。
+            if (pearls + eyes >= 12 && npcY375 >= 100) {
+                int descendY375v3 = Math.max(56, npcY375 - 32);
+                endermanForestAnchor = null;
+                endermanForestSearchAt = 0L;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 森林锚点清缓存（fix374） | 出袋上行后重搜，旧锚点="
+                        + (oldForestAnchor375 == null ? "无" : oldForestAnchor375.toShortString()));
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 岩台下行换点脱出（fix375 v3） | 眼已齐 pearls+eyes=" + (pearls + eyes)
+                        + " 旧锚点=" + (oldForestAnchor375 == null ? "无" : oldForestAnchor375.toShortString())
+                        + " 当前Y=" + npcY375 + " 下行目标Y=" + descendY375v3
+                        + "（眼已齐，岩台上行无增益，下行换点脱出）");
+                // 【fix378·358 棒】置位下行后抑 ascend：下次出袋不爬回岩台。
+                v3DescendSuppressAscend = true;
+                return new Step("下行出岩台脱出", Kind.SKILL,
+                        new Intent("", "descend", params("y", descendY375v3)));
+            }
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 下界口袋脱困上行（fix306/fix365） | 停滞点=" + netherTravelStallPos
+                    + " 梯次=" + netherStallEscapesUsed + "/3 目标Y=" + targetY
+                    + "（挖楼梯出袋，回高带再续下界链）");
+            // 【fix374·328 棒】出袋后不再回袋底：森林锚点是 NPC 进下界时从传送门
+            // （约 200 格外）搜来的旧点（本 boot (-180,34,262)，口袋底 Y=34），
+            // 缓存在 512 格内永不刷新——出袋爬上高带后森林腿仍把它拉回袋底，
+            // 324–327 循环实证（失败 33→48、珍珠 0 增长）。逃生上行消耗时清掉
+            // 缓存锚点＋搜索节流，下次派单从当前位置（高带）重搜：NPC 已在森林
+            // 内时最近点就在附近高处，不再下潜回袋底。重搜失败（null／同点）时
+            // 现行行为不变——天然兜底。不动扫描半径、不动 slay 逻辑、不动退避／出袋。
+            BlockPos oldForestAnchor = endermanForestAnchor;
+            endermanForestAnchor = null;
+            endermanForestSearchAt = 0L;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 森林锚点清缓存（fix374） | 出袋上行后重搜，旧锚点="
+                    + (oldForestAnchor == null ? "无" : oldForestAnchor.toShortString()));
+            // 【fix378·358 棒】v3 下行后抑 ascend（见字段注释）：下行后第一次
+            // 出袋不爬回岩台，改派下界探索横向换位，从新位置重试要塞投影点。
+            // 一次即耗尽——口袋里真需 ascend 出袋时，下一次出袋恢复旧支。
+            if (pearls + eyes >= 12 && v3DescendSuppressAscend) {
+                v3DescendSuppressAscend = false;
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 下行后抑 ascend 改探索（fix378） | 眼已齐，下行后第一次出袋不爬回岩台，横向换位再试要塞投影点");
+                return goal("下界探索", "explore", params("distance", 24));
+            }
+            return new Step("下界脱困上行", Kind.SKILL,
+                    new Intent("", "ascend", params("y", targetY, "max", 200)));
+        }
+        if (netherTravelStallStreak >= 2 && netherStallEscapesUsed >= 3) {
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 下界 travel 上行梯次用满仍停滞（fix306/fix365） | 停滞点="
+                    + netherTravelStallPos + "，清账改派下界探索换位");
+            netherTravelStallStreak = 0;
+            netherTravelStallPos = null;
+            netherStallEscapesUsed = 0;
+            return goal("下界探索", "explore", params("distance", 24));
+        }
+
         if (eyes < 12) {
             if (powderUnits < 12) {
                 BlockPos fortress = locateFortress();
@@ -3554,15 +5166,68 @@ public final class ProgressionPlanner {
                     double dx = fortress.getX() - npc.getX();
                     double dz = fortress.getZ() - npc.getZ();
                     if (dx * dx + dz * dz > 32.0D * 32.0D) {
+                        // 【fix365】出袋支已提至 decideNether 顶部（要塞腿／
+                        // 森林腿共用），此处只派长途——armed／梯次用满时
+                        // 根本到不了这一行。
                         return goal("前往下界要塞", "travel", params("x", fortress.getX() + 0.5D,
                                 "y", npc.getY(), "z", fortress.getZ() + 0.5D));
                     }
                 }
                 int needed = Math.max(1, (12 - powderUnits + 1) / 2);
+                if (fortress == null) {
+                    // 【fix263】没定位到要塞就没有烈焰人可打：先按下界探索
+                    // 换位（与环 4 eyes≥12 的 explore 兜底同款），等
+                    // locateFortress 的 60 秒重试在新位置再找——玩家找
+                    // 要塞也是边走边找。旧行为：fortress==null 也落进下方
+                    // 硬派 slay，附近根本没有烈焰人，120 秒无战利品收场
+                    // （fix106）后被原样重派成环（fresh121 实证：33 轮、
+                    // 94 分钟、零位移进展、 failStreak 只涨数不改行为）。
+                    return goal("下界探索", "explore", params("distance", 24));
+                }
+                // 【fix324】(A) 先到刷怪笼层再猎杀（205 棒定谳）：屋顶 Y=120 时刷怪笼
+                // 永不激活、slay 半径 16 也够不到，硬派 slay 即 120 秒空转成环。
+                List<BlockPos> spawners = blazeSpawners();
+                if (!spawners.isEmpty()) {
+                    BlockPos anchor = spawners.get(blazeSpawnerIndex % spawners.size());
+                    if (npc.blockPosition().distSqr(anchor) > 14.0D * 14.0D) {
+                        LOG.info("[AIV][PLAN] " + npc.npcName() + " 先赴烈焰人刷怪笼（fix324） | 锚点="
+                                + anchor.toShortString() + " 序号=" + blazeSpawnerIndex);
+                        return goal("前往刷怪笼", "travel", params("x", anchor.getX() + 0.5D,
+                                "y", anchor.getY(), "z", anchor.getZ() + 0.5D));
+                    }
+                    return goal("猎杀烈焰人", "slay", params("entity", "blaze", "count", needed));
+                }
+                // 附近已加载区块里没有刷怪笼：先下行到要塞包围盒层（自然生成兜底），
+                // 只派一次，落地后再扫再派，不原地硬派 slay 空转。
+                Integer floorY = fortressFloorY();
+                if (floorY != null && !blazeFloorLegDone
+                        && npc.blockPosition().getY() > floorY + 2) {
+                    blazeFloorLegDone = true;
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 附近无刷怪笼，先下行要塞层（fix324） | 层 Y="
+                            + (floorY + 1));
+                    return goal("下行要塞层", "travel", params("x", fortress.getX() + 0.5D,
+                            "y", floorY + 1, "z", fortress.getZ() + 0.5D));
+                }
                 return goal("猎杀烈焰人", "slay", params("entity", "blaze", "count", needed));
             }
             int pearlUnits = pearls + eyes;
             if (pearlUnits < 12) {
+                // 【fix329】(A) 先到诡异森林再猎杀（219 棒定谳：要塞区是下界荒地，末影人权重
+                // 1/168=0.6%，16 格检测盒内几乎永远无怪，slay 原地空转成环；诡异森林权重 1/1=100%，
+                // 且是唯一生成怪——类 fix324 (A) 的高密度区先行。1024 格内无森林则原地猎杀兜底，不堵链。
+                BlockPos forest = endermanForestAnchor();
+                if (forest != null && npc.blockPosition().distSqr(forest) > 14.0D * 14.0D) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 先赴诡异森林（fix329） | 锚点="
+                            + forest.toShortString());
+                    return goal("前往诡异森林", "travel", params("x", forest.getX() + 0.5D,
+                            "y", forest.getY(), "z", forest.getZ() + 0.5D));
+                }
+                // 【fix371】猎杀退避期内不原样重派：改下界探索换位，换个地方再猎。
+                if (System.currentTimeMillis() < slayBackoffUntil) {
+                    LOG.info("[AIV][PLAN] " + npc.npcName() + " 猎杀退避中，改下界探索换位（fix371） | 剩余秒="
+                            + (slayBackoffUntil - System.currentTimeMillis()) / 1000L);
+                    return goal("下界探索", "explore", params("distance", 24));
+                }
                 return goal("猎杀末影人", "slay",
                         params("entity", "enderman", "count", Math.max(1, 12 - pearlUnits)));
             }
@@ -3621,9 +5286,131 @@ public final class ProgressionPlanner {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 定位下界要塞 | "
                     + fortressPos.toShortString());
         } else {
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 1024 格内没有找到下界要塞，稍后重试");
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 1600 格内没有找到下界要塞，稍后重试（fix263 正名：实参 100 区块）");
         }
         return fortressPos;
+    }
+
+    /**
+     * 【fix324】扫 NPC 周围已加载区块找烈焰人刷怪笼（205 棒定谳环③：刷怪笼
+     * 只在玩家 16 格内才工作，NPC 必须先站到刷怪笼旁）。只读已加载区块，
+     * 不强制加载；结果按三维距离排序，缓存 60 秒／移位 >64 格重扫
+     * （空结果也缓存，防每秒重扫 81 个区块）。
+     */
+    private List<BlockPos> blazeSpawners() {
+        BlockPos me = npc.blockPosition();
+        long now = System.currentTimeMillis();
+        if (now - blazeSpawnerScanAt < 60_000L && blazeSpawnerScanCenter != null
+                && blazeSpawnerScanCenter.distSqr(me) <= 64.0D * 64.0D) {
+            return blazeSpawners;
+        }
+        List<BlockPos> found = new ArrayList<>();
+        ServerLevel level = npc.level();
+        int pcx = me.getX() >> 4;
+        int pcz = me.getZ() >> 4;
+        for (int cx = pcx - 4; cx <= pcx + 4; cx++) {
+            for (int cz = pcz - 4; cz <= pcz + 4; cz++) {
+                LevelChunk chunk = level.getChunkIfLoaded(cx, cz);
+                if (chunk == null) {
+                    continue;
+                }
+                for (BlockEntity be : chunk.getBlockEntities().values()) {
+                    if (!(be instanceof SpawnerBlockEntity spawner)) {
+                        continue;
+                    }
+                    // 1.21.11 的 BaseSpawner 没有 getSpawnData()：生成数据是公开字段
+                    // nextSpawnData（自然生成／setblock 写 NBT 后均有值）。
+                    net.minecraft.world.level.SpawnData data = spawner.getSpawner().nextSpawnData;
+                    if (data == null) {
+                        continue;
+                    }
+                    String id = data.getEntityToSpawn().getString("id").orElse("");
+                    if ("minecraft:blaze".equals(id)) {
+                        found.add(be.getBlockPos());
+                    }
+                }
+            }
+        }
+        found.sort((a, b) -> Double.compare(me.distSqr(a), me.distSqr(b)));
+        blazeSpawners = found;
+        blazeSpawnerScanAt = now;
+        blazeSpawnerScanCenter = me;
+        if (!found.isEmpty()) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 找到烈焰人刷怪笼（fix324） | 数量=" + found.size()
+                    + " 最近=" + found.get(0).toShortString());
+        }
+        return found;
+    }
+
+    /**
+     * 【fix329】找最近诡异森林（末影人猎杀高密度区先行，219 棒定谳环①④）：
+     * Bukkit World.locateNearestBiome，半径 1024 格。锚点在 NPC 512 格内有效；
+     * 空结果 60 秒节流（防每派单重搜）；查不到返回 null，调用方原地猎杀兜底。
+     */
+    private BlockPos endermanForestAnchor() {
+        BlockPos me = npc.blockPosition();
+        long now = System.currentTimeMillis();
+        if (endermanForestAnchor != null && me.distSqr(endermanForestAnchor) <= 512.0D * 512.0D) {
+            return endermanForestAnchor;
+        }
+        if (endermanForestSearchAt != 0L && now - endermanForestSearchAt < 60_000L) {
+            return endermanForestAnchor;
+        }
+        BlockPos found = null;
+        try {
+            org.bukkit.World world = npc.bukkitPlayer().getWorld();
+            Location origin = new Location(world, me.getX() + 0.5D, me.getY(), me.getZ() + 0.5D);
+            BiomeSearchResult result = world.locateNearestBiome(origin, 1024, Biome.WARPED_FOREST);
+            if (result != null && result.getLocation() != null) {
+                Location loc = result.getLocation();
+                found = new BlockPos(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+            }
+        } catch (Exception e) {
+            LOG.warning("[AIV][PLAN] " + npc.npcName() + " 找诡异森林失败（fix329） | " + e);
+        }
+        endermanForestAnchor = found;
+        endermanForestSearchAt = now;
+        if (found != null) {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 找到诡异森林（fix329） | 锚点="
+                    + found.toShortString() + " 距离=" + (int) Math.sqrt(me.distSqr(found)));
+        } else {
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 1024 格内没有找到诡异森林（fix329），原地猎杀兜底");
+        }
+        return found;
+    }
+
+    /**
+     * 【fix324】要塞结构包围盒最低 Y（无刷怪笼时的回落层：自然生成只在要塞
+     * 房间／走廊／桥梁包围盒内发生）。复用 fix263 安全口径取结构注册项、
+     * GoalExecutor 末地传送门房间的 structureManager().getStructureAt 写法。
+     */
+    private Integer fortressFloorY() {
+        try {
+            BlockPos fortress = locateFortress();
+            if (fortress == null) {
+                return null;
+            }
+            HolderLookup.RegistryLookup<Structure> registry = npc.level().registryAccess()
+                    .lookup(Registries.STRUCTURE).orElse(null);
+            if (registry == null) {
+                return null;
+            }
+            var holder = registry.get(ResourceKey.create(Registries.STRUCTURE,
+                    Identifier.withDefaultNamespace("fortress")));
+            if (holder.isEmpty()) {
+                return null;
+            }
+            npc.level().getChunk(fortress.getX() >> 4, fortress.getZ() >> 4);
+            StructureStart start = npc.level().structureManager().getStructureAt(fortress, holder.get().value());
+            if (start == null) {
+                return null;
+            }
+            return start.getBoundingBox().minY();
+        } catch (Throwable throwable) {
+            LOG.log(java.util.logging.Level.WARNING,
+                    "[AIV][PLAN] " + npc.npcName() + " 解析要塞结构包围盒失败（fix324）", throwable);
+            return null;
+        }
     }
 
     /** 定位最近的要塞（只存在于主世界）。 */
@@ -3645,7 +5432,7 @@ public final class ProgressionPlanner {
             LOG.info("[AIV][PLAN] " + npc.npcName() + " 定位要塞 | "
                     + strongholdPos.toShortString());
         } else {
-            LOG.info("[AIV][PLAN] " + npc.npcName() + " 1024 格内没有找到要塞，稍后重试");
+            LOG.info("[AIV][PLAN] " + npc.npcName() + " 1600 格内没有找到要塞，稍后重试（fix263 正名：实参 100 区块）");
         }
         return strongholdPos;
     }
@@ -3658,15 +5445,37 @@ public final class ProgressionPlanner {
      */
     private BlockPos locateStructure(String path, int radiusChunks, ServerLevel level) {
         try {
-            Registry<Structure> registry = level.registryAccess().lookupOrThrow(Registries.STRUCTURE);
-            Structure structure = registry.getValue(ResourceKey.create(Registries.STRUCTURE,
+            // 【fix263】定位自落码起从未真正运行过（114 棒定谳，证据＝字节码
+            // 双份对照）：编译产物里的方法引用本来是对的，但 Paper 的插件
+            // 重映射器在加载时按它自带构建的类层级，把 lookupOrThrow /
+            // Registry.getValue / Registry.wrapAsHolder 三处引用改指到父
+            // 接口 IdMap 名下，而 Leaves 1.21.11 运行时 IdMap 没有这些方法
+            // （getValue/wrapAsHolder 声明在 Registry 本类、lookupOrThrow
+            // 返回 Registry），每次调用抛 NoSuchMethodError、被下方 catch
+            // 吞成 null，对外伪装成「1024 格内没有找到」（fresh121 下界
+            // 33 次调用全异常）。改法＝整段只用重映射器不动的方法：
+            // RegistryAccess.lookup（返回 Optional）取注册表后，立刻
+            // 把引用收窄到 HolderLookup.RegistryLookup 型别再调
+            // get(ResourceKey) 取 Holder——方法引用的属主由接收者的
+            // 编译期型别决定，属主写成 Registry 时连 HolderLookup 支
+            // 系的 get 都会被改指 IdMap（实测三稿皆如此），属主写成
+            // RegistryLookup 才落在重映射器不动的支系。HolderSet
+            // .direct 与 findNearestMapStructure 的引用经重映射产物
+            // 逐行核对未被改动。
+            HolderLookup.RegistryLookup<Structure> registry = level.registryAccess()
+                    .lookup(Registries.STRUCTURE).orElse(null);
+            if (registry == null) {
+                LOG.info("[AIV][PLAN] " + npc.npcName() + " 结构注册表不可用：" + path);
+                return null;
+            }
+            var holder = registry.get(ResourceKey.create(Registries.STRUCTURE,
                     Identifier.withDefaultNamespace(path)));
-            if (structure == null) {
+            if (holder.isEmpty()) {
                 LOG.info("[AIV][PLAN] " + npc.npcName() + " 结构注册项不存在：" + path);
                 return null;
             }
             var found = level.getChunkSource().getGenerator().findNearestMapStructure(level,
-                    HolderSet.direct(registry.wrapAsHolder(structure)),
+                    HolderSet.direct(holder.get()),
                     npc.blockPosition(), radiusChunks, false);
             return found == null ? null : found.getFirst();
         } catch (Throwable throwable) {
@@ -3731,10 +5540,28 @@ public final class ProgressionPlanner {
                 || countItem("netherite_ingot") > 0 || countItem("netherite_scrap") > 0
                 || countItem("ancient_debris") > 0 || countItem("blaze_rod") > 0
                 || countItem("ender_pearl") > 0 || countItem("gold_ingot") > 0
-                || countItem("bone") > 0 || countItem("string") > 0
+                || countItem("bone") > 0
+                // 【fix346】床链挂起且床料未满时线是床料，不算可存物（与执行层存箱护线同口径），
+                // 免得线是唯一可存物时空跑一趟存箱、到箱前才发现一件不存。
+                || (countItem("string") > 0 && !stringIsBedMaterial())
                 || countItem("spider_eye") > 0 || countItem("iron_ingot") > 32
                 // 【fix92·Fong 2026-10-28】红石留存一组回家存箱，也算可存物。
                 || countItem("redstone") > 0;
+    }
+
+    /** 【fix346】线当前是不是床料：床未安置（bedPos==null）且床料等价量 <3 时是。
+     * 与执行层 bedWoolStock() 同口径（任一单色最大与白羊毛＋线/4 折算取大者）。 */
+    private boolean stringIsBedMaterial() {
+        com.example.aivillager.goals.BaseMemory.bindWorld(npc.level());
+        com.example.aivillager.goals.BaseMemory.Base base =
+                com.example.aivillager.goals.BaseMemory.base(npc.npcName());
+        if (base == null || base.bedPos() != null) {
+            return false;
+        }
+        if (woolColorWithThree() != null) {
+            return false;
+        }
+        return countItem("white_wool") + countItem("string") / 4 < 3;
     }
 
     /** 同色羊毛 ≥3 的颜色前缀（fix56：原版床配方要 3 张同色羊毛）；没有返回 null。 */
@@ -3859,6 +5686,49 @@ public final class ProgressionPlanner {
     }
 
     /**
+     * 【fix259】储备累积期判定（供生存层选食保护消费，只读现算、无存储标志）：
+     * 下界链待推进（PORTAL_PREP 在计划内、末影眼未齐）、储备未满软靶 40、
+     * 且 fix96 入境闸尚未同刻满足（food≥14 ∧ nutrition≥20）时为真。任一
+     * 不成立即关：计划无下界链（steady 等）永假；储备满或闸已同刻满足时
+     * 选食回归原口径。本判定只决定「累积期」这个机制状态，阈值全是既有
+     * 口径（软靶 40 / 闸 14∧20），不新增数字。
+     */
+    public boolean reserveGuardActive() {
+        if (!planHas(StagePlan.PORTAL_PREP)) {
+            return false;
+        }
+        if (countItem("ender_eye") >= 12) {
+            return false;
+        }
+        int nutrition = foodNutrition();
+        if (nutrition >= FOOD_RESERVE_NUTRITION) {
+            return false;
+        }
+        return !(npc.getFoodData().getFoodLevel() >= 14 && nutrition >= 20);
+    }
+
+    /** 【fix259】当前背包食物总营养（与盘点同口径），供生存层选食日志对账。 */
+    public int currentFoodNutrition() {
+        return foodNutrition();
+    }
+
+    /** 【fix259】包内是否存在腐肉以外的正经食物（步 13 让位支的防永等兜底判据）。 */
+    private boolean hasNonRottenFood() {
+        for (int slot = 0; slot < COUNT_SLOTS; slot++) {
+            ItemStack stack = npc.getInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
+            if (food != null && food.nutrition() > 0
+                    && !"rotten_flesh".equals(itemPath(stack))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 【第二十二轮】下矿口粮门（Fong 18:51 第 1 条）：下钻石层开工前先查口粮——
      * 长跑#7 反面教材是下到 -54 后 food=0 在矿下空转。营养值低于口粮线（24）时：
      * 人在地下先 ascend 回地表，在地表先 hunt 补到口粮线；没剑（极早期）不挡路。
@@ -3870,6 +5740,10 @@ public final class ProgressionPlanner {
         LOG.info("[AIV][PLAN] " + npc.npcName() + " 下矿口粮检查 | foodNutrition=" + value
                 + "/" + MINING_FOOD_NUTRITION + (ok ? " 通过" : " 不足，先补给再下矿"));
         if (ok) {
+            // 【fix350】口粮已够：口粮门 ascend 回读记账清零（下次口粮不足重计）。
+            miningFoodAscendIssued = false;
+            miningFoodAscendFailStreak = 0;
+            miningFoodAscendGiveUpPos = null;
             return null;
         }
         // 【fix59】夜里地表没猎物：口粮门曾整夜派 hunt 空转（300s 看门狗超时连烧，
@@ -3887,13 +5761,85 @@ public final class ProgressionPlanner {
             return null;
         }
         if (underground()) {
-            return skill("下矿口粮不足：先回地表补给", "ascend");
+            // 【fix350】ascend 结局回读：同点连败 ≥2 落回地表口径改派 hunt（详见 miningFoodAscendStep）。
+            Step ascendStep = miningFoodAscendStep();
+            if (ascendStep != null) {
+                return ascendStep;
+            }
+            // 已回地表或此地放弃：落回下方地表口径。
         }
         if (hasSword) {
             return goal("下矿前补口粮", "hunt",
                     params("need", "food", "stock", MINING_FOOD_NUTRITION, "radius", 12));
         }
         return null;
+    }
+
+    /**
+     * 【fix350】下矿口粮门 ascend 的结局回读状态机（范式照 fix149 的
+     * hungerAscendStep）：需要继续派 ascend 时返回该技能步；ascend 刚回读
+     * 成功、或此地已两度失败放弃时返回 null，示意口粮门落回地表口径处置
+     * （改派 hunt）。旧版口粮门只认 underground() 高度图口径无条件重派：
+     * 床边列高度图在悬挑顶、人在开阔地面恒判地下，ascend 每约 5 秒以
+     * 「连续 6 级上不去」收场也无人消费，hunt 永不派单（261 棒新图实证
+     * 本 boot 266 行、22 分钟+）。放弃点水平位移 ≥16 格自动失效（换地方重试）。
+     */
+    private Step miningFoodAscendStep() {
+        // 放弃点失效：人已挪开 ≥16 格，换了地方值得再试 ascend。
+        if (miningFoodAscendGiveUpPos != null) {
+            net.minecraft.core.BlockPos me = npc.blockPosition();
+            long gdx = me.getX() - miningFoodAscendGiveUpPos.getX();
+            long gdz = me.getZ() - miningFoodAscendGiveUpPos.getZ();
+            if (gdx * gdx + gdz * gdz >= 256L) {
+                miningFoodAscendGiveUpPos = null;
+                miningFoodAscendFailStreak = 0;
+                miningFoodAscendIssued = false;
+            }
+        }
+        if (miningFoodAscendGiveUpPos != null) {
+            return null;
+        }
+        if (!miningFoodAscendIssued) {
+            miningFoodAscendIssued = true;
+            miningFoodAscendSeq = skills.outcomeSeq();
+            return skill("下矿口粮不足：先回地表补给", "ascend");
+        }
+        if (skills.outcomeSeq() == miningFoodAscendSeq) {
+            // 结局还没回来（技能在跑/刚被打断）：继续派 ascend 等回读。
+            return skill("下矿口粮不足：先回地表补给", "ascend");
+        }
+        String ascendOutcome = skills.lastOutcome();
+        miningFoodAscendSeq = skills.outcomeSeq();
+        if (ascendOutcome != null && ascendOutcome.startsWith("ascend 已回到地表")) {
+            miningFoodAscendIssued = false;
+            miningFoodAscendFailStreak = 0;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 下矿口粮 ascend 结局回读（fix350） | outcome=" + ascendOutcome
+                    + "（已回地表，落回地表口径处置）");
+            return null;
+        }
+        if (ascendOutcome != null && ascendOutcome.startsWith("ascend ")) {
+            miningFoodAscendFailStreak++;
+            LOG.info("[AIV][PLAN] " + npc.npcName()
+                    + " 下矿口粮 ascend 结局回读（fix350） | outcome=" + ascendOutcome
+                    + " 连败=" + miningFoodAscendFailStreak
+                    + " 位置=" + npc.blockPosition().toShortString());
+            if (miningFoodAscendFailStreak >= 2) {
+                miningFoodAscendIssued = false;
+                miningFoodAscendGiveUpPos = npc.blockPosition();
+                LOG.info("[AIV][PLAN] " + npc.npcName()
+                        + " 下矿口粮 ascend 两度失败，此地放弃回地表（fix350） | pos="
+                        + miningFoodAscendGiveUpPos.toShortString()
+                        + "（落回 hunt 按地表处置，位移≥16 格后重试）");
+                return null;
+            }
+            // 未满两度：刷新基线、立刻再派一轮 ascend。
+            miningFoodAscendIssued = true;
+            miningFoodAscendSeq = skills.outcomeSeq();
+            return skill("下矿口粮不足：先回地表补给", "ascend");
+        }
+        // 非 ascend 结局（别的技能插队收场）：只更新基线，继续派 ascend。
+        return skill("下矿口粮不足：先回地表补给", "ascend");
     }
 
     /** 有煤/木炭，或者有木板/原木/木棍可以当燃料。 */

@@ -56,8 +56,14 @@ public final class FarmMemory {
         }
     }
 
-    /** 按活方块盘点的田况：成熟/生长中/空耕地/已损坏（土没了或变回普通土）格数 + 各作物在田株数。 */
-    public record Scan(int mature, int growing, int emptyFarmland, int lost,
+    /**
+     * 按活方块盘点的田况：成熟/生长中/空耕地/已损坏（土没了或变回普通土）格数
+     * + 各作物在田株数。【fix246】空耕地只数「上方为空气、能立刻下种」的格；
+     * 耕地上方被非作物方块压着的格另记 blocked（种不下、也干不了活——88 棒
+     * 新图实证：圆石压住锚点格，旧口径把被压格算「空」恒触发维护派单，
+     * 执行层播种复核又因上方非空气静默丢弃，2.7 秒一轮空转 169 次）。
+     */
+    public record Scan(int mature, int growing, int emptyFarmland, int lost, int blocked,
                        int plantedWheat, int plantedCarrot, int plantedPotato) {
         public int plantedTotal() {
             return plantedWheat + plantedCarrot + plantedPotato;
@@ -130,6 +136,29 @@ public final class FarmMemory {
         for (Cell cell : farm.cells()) {
             if (cell.x() == pos.getX() && cell.z() == pos.getZ()
                     && (cell.y() == pos.getY() || cell.y() + 1 == pos.getY())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 【fix311】仅土格本身（不含作物位）：mine() 农田守卫专用。
+     * fix309 把守卫改无条件时沿用 isFarmCell（含 y+1 作物位），而收获
+     * 走 mineBareHand→mine() 挖的正是作物格——159 棒实验场实证：
+     * fix309 boot 内 [FARM] 收获 0 行（此前 boot 有收获行）、小麦拒挖
+     * 行 5 次（121,62,53／122,63,53／196,63,-38），tend 颗粒无收。
+     * 守卫只拦土格：土是稀缺资源（丢了补锄无从下手、田格缩水），作物
+     * 可弃可补种（tend 下趟重播）；脱困挖穿作物格爬出亦可接受。
+     * isFarmCell 的 y+1 口径保留给建屋避让（fix219）等其他调用方。
+     */
+    public static boolean isFarmSoilCell(String npcName, BlockPos pos) {
+        Farm farm = farm(npcName);
+        if (farm == null) {
+            return false;
+        }
+        for (Cell cell : farm.cells()) {
+            if (cell.x() == pos.getX() && cell.y() == pos.getY() && cell.z() == pos.getZ()) {
                 return true;
             }
         }
@@ -257,12 +286,13 @@ public final class FarmMemory {
     public static Scan scan(Level level, String npcName) {
         Farm farm = farm(npcName);
         if (farm == null || level == null) {
-            return new Scan(0, 0, 0, 0, 0, 0, 0);
+            return new Scan(0, 0, 0, 0, 0, 0, 0, 0);
         }
         int mature = 0;
         int growing = 0;
         int empty = 0;
         int lost = 0;
+        int blocked = 0;
         int wheat = 0;
         int carrot = 0;
         int potato = 0;
@@ -286,12 +316,19 @@ public final class FarmMemory {
                     }
                 }
             } else if (soilState.is(Blocks.FARMLAND)) {
-                empty++;
+                // 【fix246】上方被非作物方块压着 = 被压格：播种复核（上方须
+                // 为空气）恒不过，这格不算「有活可干」，单列 blocked 供
+                // 日志与派单口径区分，防再被当成空耕地反复点火。
+                if (cropState.isAir()) {
+                    empty++;
+                } else {
+                    blocked++;
+                }
             } else {
                 lost++;
             }
         }
-        return new Scan(mature, growing, empty, lost, wheat, carrot, potato);
+        return new Scan(mature, growing, empty, lost, blocked, wheat, carrot, potato);
     }
 
     // ---------------------------------------------------------------- 落盘

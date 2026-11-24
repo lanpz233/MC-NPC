@@ -164,6 +164,75 @@ writeData(npcName, data);
 LOG.info("[AIV][BASE] 床账本已失效（床已不在） " + npcName);
 }
 
+/**
+ * 【fix265】床账重验（三处读者共用：复活判读/睡觉/安置床）：把「验真→自愈→
+ * 才失效」收敛成一个入口，取代旧版各读者单次读到非床就直接 clearBed 的
+ * 口径——116 棒定谳：farm276 一笔 state=air 单次判读即清账、其后两 boot
+ * 无人重建、两次死亡白白回落世界出生点（58/59 验）。流程：账本床格强制
+ * 加载区块后验真，在→原样返回；不在（被拆/坏读数/账本已清）→扫锚点近傍
+ * 现成床（fix174 扫描口径自 place_bed 前置到判定层）重新登记；扫不到且
+ * 账本原有床才失效账本。返回有效床脚格，无床返回 null。
+ */
+public static BlockPos revalidateBed(ServerLevel level, String npcName) {
+bindWorld(level);
+Base base = base(npcName);
+if (base == null) {
+return null;
+}
+BlockPos bed = base.bedPos();
+if (bed != null) {
+if (!level.hasChunkAt(bed)) {
+level.getChunk(bed);
+}
+if (level.getBlockState(bed).getBlock()
+instanceof net.minecraft.world.level.block.BedBlock) {
+return bed;
+}
+}
+BlockPos anchor = base.anchor();
+if (!level.hasChunkAt(anchor)) {
+level.getChunk(anchor);
+}
+BlockPos foundFoot = null;
+scan:
+for (int dx = -3; dx <= 3; dx++) {
+for (int dz = -3; dz <= 3; dz++) {
+for (int dy = -1; dy <= 1; dy++) {
+BlockPos cell = anchor.offset(dx, dy, dz);
+net.minecraft.world.level.block.state.BlockState state = level.getBlockState(cell);
+if (!(state.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+continue;
+}
+foundFoot = state.getValue(net.minecraft.world.level.block.BedBlock.PART)
+== net.minecraft.world.level.block.state.properties.BedPart.FOOT
+? cell : cell.relative(state.getValue(
+net.minecraft.world.level.block.BedBlock.FACING).getOpposite());
+break scan;
+}
+}
+}
+if (foundFoot != null) {
+if (!foundFoot.equals(bed)) {
+saveBed(npcName, foundFoot);
+LOG.info("[AIV][BASE] 床账重验：现成床重新登记（fix265） " + npcName
++ " | bed=" + foundFoot.toShortString());
+}
+return foundFoot;
+}
+if (bed != null) {
+// 【fix276】失效诊断（128 棒：fresh144 的失效行当时只留一行结论、
+// 跨 boot 回溯才拼出全貌）：清账前把账本床格的实读方块与扫描口径
+// 一并留痕，下次失效不必再靠多 boot 日志拼图。原失效行口径不动。
+LOG.info("[AIV][BASE] 床账失效诊断（fix276） " + npcName
++ " | 账本床格=" + bed.toShortString()
++ " 实读=" + net.minecraft.core.registries.BuiltInRegistries.BLOCK
+.getKey(level.getBlockState(bed).getBlock())
++ " 锚点=" + anchor.toShortString() + " 扫描=锚点±3/dy±1 命中=0");
+clearBed(npcName);
+}
+return null;
+}
+
 /** 安置箱子后落盘（fix69）：只更新箱子字段，锚点/床/世界沿用现有记录。 */
 public static void saveChest(String npcName, BlockPos chestPos) {
 if (folder == null) {

@@ -3,6 +3,7 @@ package com.example.aivillager.npc;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
@@ -66,6 +67,9 @@ public final class FakePlayerBody extends ServerPlayer {
     private Vec3 walkTarget;
     private boolean walkSprint;
     private Runnable walkCallback;
+    // 【fix237】直线行走的放弃回调：walk-stuck 自救攒满（gaveUp）时通知技能层，
+    // 与 followPath 的 onAbandon 同义。3 参 walkTo 不传放弃回调时为 null。
+    private Runnable walkAbandon;
 
     /**
      * 游泳目标（岸边格子）；非 null 时身体处于"游泳脱困"模式，优先于路径/直线行走。
@@ -79,6 +83,10 @@ public final class FakePlayerBody extends ServerPlayer {
     /** A* 路径；非 null 时优先级高于 walkTarget。 */
     private List<BlockPos> path;
     private int pathIndex;
+    /** 【fix352】上次因航点高出跳跃高度而 abort 的服务端 tick（-1 表示从未发生）。 */
+    private int lastHeightAbortTick = -1;
+    /** 【fix352】上次高差 abort 那条路的终点（腿目标），供技能层记失败腿记忆。 */
+    private BlockPos lastHeightAbortEndpoint;
     /** 【fix205】高台悬空航点脱困专行的节流记账：同一航点只打一次。 */
     private int lastLedgeSkipIndex = -1;
     private boolean pathSprint;
@@ -101,15 +109,21 @@ public final class FakePlayerBody extends ServerPlayer {
      * 启用/解除各打一条 pick-fallback 专行日志；石镐回包即解除。 */
     private boolean pickFallbackActive;
     /** fix99 床块守卫日志节流：卡住自救会反复试挖床格，10 秒最多打一行。 */
+    private long goldBootsProtectUntilTick = -100000L;
     private long lastBedGuardLogTick = -100000L;
     /** fix198 农田守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
     private long lastFarmGuardLogTick = -100000L;
     /** fix199 基岩守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
     private long lastBedrockGuardLogTick = -100000L;
+    /** 【fix349】传送门守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
+    private long lastPortalGuardLogTick = -100000L;
     /** 【fix198】最近一次被自家农田守卫拒挖的 tick（技能层据此区分"避让"与真挖不动，同 fix196 探针）。 */
     private long lastFarmGuardRefusalTick = -100000L;
-    /** 【fix198】田间作业许可：仅 farm 目标执行期间为真（收获走 mineBareHand 必须能挖作物格）。 */
-    private boolean farmWorkPermit;
+    /** 【fix239】存储/功能块守卫日志节流：同 fix99 口径，10 秒最多打一行。 */
+    private long lastStorageGuardLogTick = -100000L;
+    /** 【fix239】定点存储挖掘许可：仅工作站回收（挖自家登记的那台熔炉）与
+     * 围死兜底放行时，在单次挖掘前后设定/清除；其余任何挖掘一律拒挖存储块。 */
+    private BlockPos storageDigPermitPos;
     /** 【第四十五轮】逃生后岩浆位置记忆：生存层接触岩浆时写入的最后一格 + tick。 */
     private BlockPos recentLavaCell;
     private long recentLavaTick = -100000L;
@@ -139,6 +153,17 @@ public final class FakePlayerBody extends ServerPlayer {
         return targetDist < myDist;
     }
 
+    /**
+     * 【fix322】该目标点是否会被岩浆记忆守卫拦截（供技能层迈步前预判）：
+     * 与身体层 walk/path 分支同一口径。技能层下发 walkTo 前先问一句，
+     * 免得下发一个必被静默取消的行走、再由 travel 计时器 0.5 秒一轮重发
+     * 成 2 Hz 热循环（正式服 200 棒实证：walk-start 664 行/5.5 分钟）。
+     * 只读判断，不改记忆、不改拦截口径。
+     */
+    public boolean lavaGuardBlocks(double tx, double tz) {
+        return headingIntoRecentLava(tx, tz);
+    }
+
     private void logLavaGuard(String mode, double tx, double tz) {
         if (this.tickCount - lastLavaGuardLogTick >= 100) {
             lastLavaGuardLogTick = this.tickCount;
@@ -151,6 +176,8 @@ public final class FakePlayerBody extends ServerPlayer {
     private int noProgressTicks;
     /** 连续卡住自救次数：只有路径真正走完、或离开上次卡住的区域，才清零。 */
     private int stuckRescues;
+    /** 【fix323】农田守卫挡路导致救援跳过侧挖的累计次数（目标层轮换／爬升口径用）。 */
+    private int farmGuardRescueSkips;
     /**
      * 上次自救时所在的格子（自救计数不清零的依据）。
      * 两版旧逻辑都栽在"用距离变近判断有进展"上：先是自救后把基准重置成最大值、
@@ -225,6 +252,15 @@ public final class FakePlayerBody extends ServerPlayer {
             }
             this.level().getChunkSource().move(this);
         }
+
+        // 【fix379→fix380】定时挖掘由身体 tick 自行推进：技能层普遍是"派一次挖
+        // 一下就收尾"的口径（mine 技能到达站位只调一次 mineWithBestTool 就 finish），
+        // 靠调用续命的会话永远等不到下一次调用——Fong 实测砍树只碎最下面一块。
+        // 改为会话一旦开始就由 tick 驱动挖到底（够取距离/主手被换走才取消），
+        // 调用只负责"开始挖哪一格"，与真人按住左键不松手同理。
+        if (timedPos != null) {
+            tickTimedMining();
+        }
     }
 
     /**
@@ -262,6 +298,7 @@ public final class FakePlayerBody extends ServerPlayer {
             Runnable callback = this.walkCallback;
             this.walkTarget = null;
             this.walkCallback = null;
+            this.walkAbandon = null;
             this.stuckRescues = 0;
             this.lastRescueCell = null;
             this.setSprinting(false);
@@ -278,6 +315,7 @@ public final class FakePlayerBody extends ServerPlayer {
             logLavaGuard("walk", this.walkTarget.x, this.walkTarget.z);
             this.walkTarget = null;
             this.walkCallback = null;
+            this.walkAbandon = null;
             this.setSprinting(false);
             return;
         }
@@ -313,12 +351,25 @@ public final class FakePlayerBody extends ServerPlayer {
             Vec3 goal = this.walkTarget;
             this.walkTarget = null;
             this.walkCallback = null;
+            Runnable abandon = this.walkAbandon;
+            this.walkAbandon = null;
             this.setSprinting(false);
             log(npcName, "walk-stuck", "80 tick 内没有靠近目标，放弃行走 " + this.describe());
             if (goal != null) {
                 // 直线行走没有路径可以绕，卡住时先做一次自救：挖开挡路的方块脱困；
                 // 连续挖不开就放弃本次行走（上面已经清掉目标），由上层换路线。
-                rescueFromStuck("walk", goal.x, goal.z);
+                // 【fix237】旧代码把 gaveUp 直接丢掉：path 分支（约 585 行）会调
+                // finishPath(false) 通知技能层，walk 分支却静默——69 棒实证：
+                // travel 腿在 (218.50,64,-19.70) 贴石墙打转 6 分钟，石镐烧光后
+                // 分级守卫拒挖（mine-tier-guard ×33“交规划层补造石镐”），自救
+                // 全程挖不到东西，stuck-giveup 照打、walk 却立刻重发同一目标，
+                // 规划层“补一把备用石镐”保障步一次 decide 都拿不到。放弃信号
+                // 必须像 path 分支一样交上去：gaveUp 时跑 onAbandon，技能层收
+                // 失败重 decide，保障步当场补造石镐再续行。
+                boolean gaveUp = rescueFromStuck("walk", goal.x, goal.z);
+                if (gaveUp && abandon != null) {
+                    abandon.run();
+                }
             }
         }
     }
@@ -339,15 +390,32 @@ public final class FakePlayerBody extends ServerPlayer {
         double distanceSq = dx * dx + dz * dz;
         boolean inFluid = this.isInWater() || this.isInLava();
 
-        if (!inFluid && (this.onGround() || distanceSq <= 0.25D)) {
+        // 【fix255＋255c】到达还须脚格、脚下一格都不是流体：上浮自救（swimUp，
+        // 目标即自身格）在浆面浮动时 isInLava 会瞬间翻假、distSq≈0，旧判据
+        // 连续假宣告「已上岸」又沉回去（实验场 15×15 浆池两度实证 1 秒一轮
+        // 的假上岸循环）。255 首版只查脚下一格，被浅池证伪：池深 1 格时脚
+        // 下是池底石头、身体实际还泡在脚格的岩浆里（boot-lab105d 实证假上
+        // 岸照旧两连）。正判据：真上岸时脚格是岸上空气格、脚下是实心支撑，
+        // 两格流体皆空；泡在任何深度的流体里脚格必是流体本身——两格同查。
+        boolean feetFluid = !this.level().getFluidState(this.blockPosition()).isEmpty();
+        boolean belowFluid = !this.level().getFluidState(this.blockPosition().below()).isEmpty();
+        if (!inFluid && (this.onGround() || distanceSq <= 0.25D) && !feetFluid && !belowFluid) {
             log(npcName, "swim-arrive", "已上岸 " + this.describe());
             this.swimGoal = null;
+            // 【fix344】上岸即还跳跃输入：applySwimInput 在流体里把 this.jumping
+            // 置真（下方），全仓无处清零——残留的 jumping 使原版 travel 在每次落地
+            // 后再次弹起 NPC，waitingBody 的落定窗（Y 幅度 ≤1.05 连稳 60 轮）与严格
+            // 判定（!isWalking && onGround）双双永不到，树基边 bobbing 6 次连环超时。
+            // 251 棒实验场实证：平地草方块照样 bobbing，末次上岸约 70 秒后首现。
+            this.jumping = false;
             this.setSprinting(false);
             return;
         }
         if (--this.swimTicksLeft <= 0) {
             log(npcName, "swim-timeout", "游泳约 10 秒仍未上岸，放弃本次脱困 " + this.describe());
             this.swimGoal = null;
+            // 【fix344】同上：超时放弃游泳亦须还跳跃输入，否则同款残留跳跃。
+            this.jumping = false;
             this.setSprinting(false);
             return;
         }
@@ -388,12 +456,20 @@ public final class FakePlayerBody extends ServerPlayer {
         this.pathAbandon = null;
         this.walkTarget = null;
         this.walkCallback = null;
+        this.walkAbandon = null;
         this.swimGoal = shore;
         // 超时按距离放宽（第四轮修复 B）：沿岸找缓坡时岸可能在十几格外，
         // 固定约 10 秒游不到就放弃、反复重发只会原地打转。上限 600 tick（约 30 秒），
         // 再久就该由生存层的挖岸脱困接管，而不是继续干游。
         double swimDist = Math.sqrt(this.blockPosition().distSqr(shore));
-        this.swimTicksLeft = (int) Math.min(600, 200 + 20 * Math.ceil(swimDist));
+        int swimTicks = (int) Math.min(600, 200 + 20 * Math.ceil(swimDist));
+        // 【fix260】岩浆里游速远慢于水：同距离超时 ×2（上限 1200 tick≈60 秒），
+        // 否则远岸长游（fix260 远岸定向）每约 10–30 秒就被超时截断重发、
+        // 徒增抖动；生存层重发守卫本就不打断进行中的游泳，此项只降噪。
+        if (this.isInLava()) {
+            swimTicks = (int) Math.min(1200, swimTicks * 2L);
+        }
+        this.swimTicksLeft = swimTicks;
         log(npcName, "swim-start", "游泳脱困 → 岸边 " + shore.toShortString() + " " + this.describe());
     }
 
@@ -488,8 +564,19 @@ public final class FakePlayerBody extends ServerPlayer {
             double dz = tz - this.getZ();
             distanceSq = dx * dx + dz * dz;
 
+            // 【fix353】上行到达须真正站上台阶：fix352 的 onGround 要求有两处漏判——
+            // (1) 起跳 apex 时 getY() 超过航点 Y，above=false 使 onGround 要求整个失效，
+            // 半空即判“到达”（第五簇原机制；第六簇同型：航点 (11,62,-90) 在 apex 62.25
+            // 即判到达，落回 Y=61.23–61.43 后下一航点 y≈63 高出 1.57–1.77 格 abort，
+            // 265 第六簇 360 次同型 abort 实证）；(2) 站在一格之下、容差 0.6 内且
+            // onGround 时亦判到达。要求：到达须 onGround，且航点高于 NPC 时脚须已到
+            // 航点高度（getY() ≥ ty−0.1）。平地/下行口径不变（落地后 |dy|=0 到达；
+            // 半 slab 脚 ty+0.5、above=false、|dy|=0.5≤0.6 照旧到达）。
+            boolean above = ty > this.getY();
             boolean reached = distanceSq <= ARRIVE_DISTANCE_SQ
-                    && Math.abs(this.getY() - ty) <= ARRIVE_Y_TOLERANCE;
+                    && Math.abs(this.getY() - ty) <= ARRIVE_Y_TOLERANCE
+                    && this.onGround
+                    && (!above || this.getY() >= ty - 0.1D);
             if (!reached) {
                 break;
             }
@@ -549,6 +636,10 @@ public final class FakePlayerBody extends ServerPlayer {
         // 掉下路径（例如从台阶边滑落、被怪推下坡）后，当前 waypoint 可能高于头顶 2 格。
         // 玩家也跳不上 2 格，继续在这里顶墙只会站满 2 秒；立即放弃，让技能层按当前位置重新规划。
         if (ty - this.getY() > 1.5D) {
+            // 【fix352】记一笔高差 abort：技能层据此把本腿目标记入失败记忆、横向重取，
+            // 不再原样重喂同一条路（264 第五簇 675 次同型 abort 实证）。
+            this.lastHeightAbortTick = this.level().getServer().getTickCount();
+            this.lastHeightAbortEndpoint = this.path.get(this.path.size() - 1);
             log(npcName, "path-abort", "goal 高出 " + String.format(Locale.ROOT, "%.1f", ty - this.getY())
                     + " 格，超出跳跃高度，重新规划 " + this.describe());
             finishPath(false);
@@ -619,12 +710,21 @@ public final class FakePlayerBody extends ServerPlayer {
         BlockPos frontHead = frontFeet.above();
         boolean dugFeet = tryDigBlocking(frontFeet);
         boolean dugHead = tryDigBlocking(frontHead);
+        // 【fix323】头顶被自家农田守卫拒挖时不转斜向侧挖：头顶是自家耕地
+        // （挖不动是设计），侧挖挖的是邻格、清不掉头顶的耕地，只会拆自
+        // 家桥格／垫脚（202 棒生产实证：桥格 (-12,61,-113) 被挖 40 次、
+        // travel 反复重搭、微进展反复清 stuck、400 秒原地打转）。跳过
+        // 侧挖、直接给上层失败出口（换站位／跳过），不再原地挖。
+        boolean guardBlocked323 = !dugFeet && !dugHead && mineRefusedByFarmGuardRecently();
+        if (guardBlocked323) {
+            farmGuardRescueSkips++;
+        }
         // 斜着走被卡住时，真正挡路的往往不是斜前格（是空气），
         // 而是左右两侧正交格的边角（树冠、墙角）：身体 0.6 格宽，斜穿时两边都会剐蹭。
         // 实测 NPC 卡在树冠角落里，斜前全是空气、挖脚/挖头恒为 false，自救等于空转。
         // 斜向移动且斜前没挖到东西时，把两个正交侧格也试着挖开。
         boolean dugSide = false;
-        if (!dugFeet && !dugHead && dirX != 0 && dirZ != 0) {
+        if (!guardBlocked323 && !dugFeet && !dugHead && dirX != 0 && dirZ != 0) {
             BlockPos sideA = feet.offset(dirX, 0, 0);
             BlockPos sideB = feet.offset(0, 0, dirZ);
             dugSide = tryDigBlocking(sideA) | tryDigBlocking(sideA.above())
@@ -636,12 +736,20 @@ public final class FakePlayerBody extends ServerPlayer {
         if (!dugFeet && !dugHead && !dugSide) {
             dugCeiling = tryDigBlocking(feet.above(2)) | tryDigBlocking(feet.above());
         }
+        // 【fix239】四路全空才问围死兜底：四周若还有普通可挖块，兜底内部会
+        // 先挖普通块；只有全是存储块可挖时才放行挖最快的那一个（Fong
+        // 2026-11-06 20:43 口径：先避让、围死才兜底，只堵不疏不许出厂）。
+        boolean dugFallback = false;
+        if (!dugFeet && !dugHead && !dugSide && !dugCeiling) {
+            dugFallback = digStorageEscapeFallback();
+        }
         String detail = "阶段=" + phase + " 次数=" + this.stuckRescues
                 + " 方向=" + dirX + "," + dirZ
                 + " 前脚=" + this.level().getBlockState(frontFeet).getBlock()
                 + " 前头=" + this.level().getBlockState(frontHead).getBlock()
                 + " 脚下=" + this.level().getBlockState(feet.below()).getBlock()
-                + " 挖脚=" + dugFeet + " 挖头=" + dugHead + " 侧挖=" + dugSide + " 挖顶=" + dugCeiling;
+                + " 挖脚=" + dugFeet + " 挖头=" + dugHead + " 守卫挡路=" + guardBlocked323 + " 侧挖=" + dugSide + " 挖顶=" + dugCeiling
+                + " 兜底=" + dugFallback;
 
         boolean gaveUp = false;
         if (this.stuckRescues >= MAX_DIG_RESCUES) {
@@ -683,17 +791,156 @@ public final class FakePlayerBody extends ServerPlayer {
         }
     }
 
+    /**
+     * 【fix231→fix239】存储/功能块判定（全插件统一口径）：带方块实体的
+     * （箱子/熔炉/漏斗/桶等）与床/工作台一族。fix231 只在自救挖路径
+     * （tryDigBlocking）查它；81 棒实验场实证 travel 清障挖路
+     * （travelStepToward）无此守卫、照样挖穿工作台与熔炉——fix239 把
+     * 判定下沉为身体层统一谓词，mine()/mineWithBestTool() 默认拒挖，
+     * 只有定点许可（工作站回收、围死兜底）才放行。
+     */
+    public static boolean isStorageBlock(BlockState state) {
+        return state.hasBlockEntity()
+                || state.getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.CraftingTableBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.SmithingTableBlock
+                || state.is(net.minecraft.world.level.block.Blocks.FLETCHING_TABLE)
+                || state.getBlock() instanceof net.minecraft.world.level.block.CartographyTableBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.LoomBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.GrindstoneBlock;
+    }
+
+    /** 【fix239】定点存储挖掘许可：只认这一格、只在设定期间有效（同 fix198 许可式）。 */
+    public void setStorageDigPermit(BlockPos pos) {
+        this.storageDigPermitPos = pos;
+    }
+
+    /** 该格是否命中存储守卫（无定点许可时为真）：守卫触发时节流打一行专行。 */
+    private boolean storageGuardBlocks(BlockPos pos, BlockState state) {
+        if (!isStorageBlock(state) || pos.equals(this.storageDigPermitPos)) {
+            return false;
+        }
+        if (this.tickCount - lastStorageGuardLogTick >= 200) {
+            lastStorageGuardLogTick = this.tickCount;
+            log(npcName, "storage-guard", "拒绝挖存储/功能块 " + state.getBlock()
+                    + " " + pos.toShortString() + "（fix239：挖路/自救先避让，围死才走兜底）");
+        }
+        return true;
+    }
+
     /** 只挖"确实挡路"的方块：空气/液体不碰，基岩和黑曜石这种挖不动的也不碰。 */
     private boolean tryDigBlocking(BlockPos pos) {
         BlockState state = this.level().getBlockState(pos);
         if (state.isAir() || !state.getFluidState().isEmpty()) {
             return false;
         }
+        // 【fix231】自救不许挖存储/功能块：2026-11-05 farm209 基址边沿
+        // 卡住自救连挖 4 格，顺手挖掉基址贵重箱 (733,65,-131)（箱内钻石
+        // 8→10、红石 27→64 拾回，余物 despawn 灭失）；同一自救还挖掉
+        // (732,65,-131) 压顶圆石、误打误撞通了床边一格。玩家被卡住也不
+        // 会把自家箱子/床/工作台挖掉脱困——判定已下沉为身体层统一谓词
+        // isStorageBlock（fix239），本路径与 mine 层双重拒挖。
+        if (isStorageBlock(state)) {
+            return false;
+        }
         float hardness = state.getDestroySpeed(this.level(), pos);
         if (hardness < 0.0F || hardness > 3.0F) {
             return false;
         }
-        return this.mineWithBestTool(pos);
+        // 【fix226】行走层挖穿挡路块=自救/通行语义，钻镐兜底放行（见
+        // mineWithBestTool 三参版注释）：玩家被埋住时只剩钻镐也会挖出来，
+        // 不可能守着省镐规矩在石盒里干等。
+        return this.mineWithBestTool(pos, true, true);
+    }
+
+    /**
+     * 【fix239】围死兜底（Fong 2026-11-06 20:43 口径，与 fix101 兜底通则同源）：
+     * 存储块平时不许挖（fix231），但若被箱子/床/工作台一族四面围死、
+     * 没有任何其他可挖方块，只堵不疏就是死路——此时放行：候选格里
+     * 随机选一个"脱困最快"（destroy speed 最小、同速随机）的存储块挖掉。
+     *
+     * <p>触发门（缺一不可）：①围死判定——四个水平方向无一方向脚/头
+     * 两格同时可通行（单格开洞不算脱困：1.8 格高的身体过不去）；②候选
+     * 集（水平 8 格 + 头顶格）里先找普通可挖块——有就挖普通块（避让
+     * 优先，本方法顺带覆盖自救窄扫描漏掉的后向格）；③只剩存储块可挖
+     * 时才轮到存储兜底。每次真挖存储块必打 storage-fallback-dig 专行。
+     *
+     * @return 是否挖开了至少一块
+     */
+    public boolean digStorageEscapeFallback() {
+        BlockPos feet = this.blockPosition();
+        java.util.List<BlockPos> ring = new java.util.ArrayList<>();
+        boolean sealed = true;
+        for (Direction dir : Direction.Plane.HORIZONTAL) {
+            BlockPos dirFeet = feet.relative(dir);
+            BlockPos dirHead = dirFeet.above();
+            ring.add(dirFeet);
+            ring.add(dirHead);
+            BlockState fs = this.level().getBlockState(dirFeet);
+            BlockState hs = this.level().getBlockState(dirHead);
+            if (fs.getFluidState().isEmpty()
+                    && fs.getCollisionShape(this.level(), dirFeet).isEmpty()
+                    && hs.getFluidState().isEmpty()
+                    && hs.getCollisionShape(this.level(), dirHead).isEmpty()) {
+                sealed = false; // 有一向整个人能通过，不算围死
+            }
+        }
+        if (!sealed) {
+            return false;
+        }
+        java.util.List<BlockPos> candidates = new java.util.ArrayList<>(ring);
+        candidates.add(feet.above(2));
+        BlockPos normalPick = null;
+        java.util.List<BlockPos> storagePicks = new java.util.ArrayList<>();
+        float storageBestSpeed = Float.MAX_VALUE;
+        for (BlockPos cell : candidates) {
+            BlockState s = this.level().getBlockState(cell);
+            if (s.isAir() || !s.getFluidState().isEmpty()) {
+                continue;
+            }
+            float speed = s.getDestroySpeed(this.level(), cell);
+            if (speed < 0.0F || speed > 3.0F) {
+                continue; // 基岩/黑曜石一类挖不动，不入候选
+            }
+            if (isStorageBlock(s)) {
+                if (speed < storageBestSpeed - 1.0E-4F) {
+                    storageBestSpeed = speed;
+                    storagePicks.clear();
+                    storagePicks.add(cell);
+                } else if (Math.abs(speed - storageBestSpeed) <= 1.0E-4F) {
+                    storagePicks.add(cell);
+                }
+            } else if (normalPick == null) {
+                normalPick = cell;
+            }
+        }
+        if (normalPick != null) {
+            BlockState normalState = this.level().getBlockState(normalPick);
+            boolean dug = this.mineWithBestTool(normalPick, true, true);
+            if (dug) {
+                log(npcName, "storage-fallback", "围死候选里有普通可挖块，先挖普通块避让存储块 | "
+                        + normalState.getBlock()
+                        + " " + normalPick.toShortString());
+            }
+            return dug;
+        }
+        if (storagePicks.isEmpty()) {
+            return false;
+        }
+        BlockPos pick = storagePicks.get(this.random.nextInt(storagePicks.size()));
+        BlockState pickState = this.level().getBlockState(pick);
+        this.storageDigPermitPos = pick;
+        boolean dug;
+        try {
+            dug = this.mineWithBestTool(pick, true, true);
+        } finally {
+            this.storageDigPermitPos = null;
+        }
+        log(npcName, "storage-fallback-dig", "四面围死且只剩存储块可挖，兜底挖最快一块脱困 | "
+                + pickState.getBlock() + " " + pick.toShortString()
+                + " speed=" + String.format(Locale.ROOT, "%.1f", storageBestSpeed)
+                + " 候选=" + storagePicks.size() + " success=" + dug);
+        return dug;
     }
 
     /**
@@ -705,6 +952,17 @@ public final class FakePlayerBody extends ServerPlayer {
      * @param onAbandon 卡住/无法继续时触发
      */
     public void followPath(List<BlockPos> path, boolean sprint, Runnable onArrive, Runnable onAbandon) {
+        // 【fix248＋fix351】流体游泳护栏（与 walkTo 同口径）：人在流体里且游泳脱困
+        // 进行中时不受理路径行走——受理即清 swimGoal，等于把人按回水/浆里
+        // （岩浆 #92/#93 定谳；水域 263 棒新图生产实证：行走约 1 次/秒顶掉游泳、
+        // 游泳约 2 秒一轮来回换岸、11 分钟零位移）。放弃回调照常跑，让技能层当场收场重派。
+        if (this.swimGoal != null && (this.isInLava() || this.isInWater())) {
+            log(npcName, "lava-swim-guard", "岩浆游泳中，拒绝路径抢身 " + this.describe());
+            if (onAbandon != null) {
+                onAbandon.run();
+            }
+            return;
+        }
         if (path == null || path.isEmpty()) {
             if (onAbandon != null) {
                 onAbandon.run();
@@ -724,9 +982,26 @@ public final class FakePlayerBody extends ServerPlayer {
                     "身体 y=%.2f 与路径起点 %s 相差 %.2f，靠走/跳对齐（不传送）",
                     this.getY(), start.toShortString(), verticalGap));
         }
+        // 【fix245】起点可达性守卫：起点比身体高出跳跃高度（>1.5 格，与
+        // applyPathInput 的 path-abort 同判据）时，这条路径的第一步永远
+        // 执行不了——硬启只会每 tick abort、技能层同秒重派成热循环
+        // （86 棒新图 246 次零位移实证；根因在寻路起点解析，已在
+        // PathFinder 侧收紧到身体可执行窗口，这里是不变量守卫，防任何
+        // 来源的幻影路径再烧一遍）。不启路径，直接按放弃收场交技能层
+        // 重新规划/换法。
+        if (start.getY() - this.getY() > 1.5D) {
+            log(npcName, "path-start-blocked", String.format(Locale.ROOT,
+                    "路径起点 %s 高出身体 %.2f 格（>1.5 跳跃高度），拒绝启程交重规划 %s",
+                    start.toShortString(), start.getY() - this.getY(), this.describe()));
+            if (onAbandon != null) {
+                onAbandon.run();
+            }
+            return;
+        }
         this.swimGoal = null;
         this.walkTarget = null;
         this.walkCallback = null;
+        this.walkAbandon = null;
         this.path = path;
         this.pathIndex = 0;
         this.lastLedgeSkipIndex = -1;
@@ -741,6 +1016,16 @@ public final class FakePlayerBody extends ServerPlayer {
 
     public boolean isFollowingPath() {
         return this.path != null;
+    }
+
+    /** 【fix352】上次高差 abort 的服务端 tick（-1 表示从未发生）。 */
+    public int lastHeightAbortTick() {
+        return this.lastHeightAbortTick;
+    }
+
+    /** 【fix352】上次高差 abort 那条路的终点（null 表示从未发生）。 */
+    public BlockPos lastHeightAbortEndpoint() {
+        return this.lastHeightAbortEndpoint;
     }
 
     /**
@@ -769,6 +1054,24 @@ public final class FakePlayerBody extends ServerPlayer {
 
     /** 走到指定坐标；到达后执行 callback（在主线程 tick 内触发）。 */
     public void walkTo(Vec3 target, boolean sprint, Runnable callback) {
+        walkTo(target, sprint, callback, null);
+    }
+
+    /**
+     * 走到指定坐标；到达后执行 callback、自救攒满放弃时执行 onAbandon
+     * （在主线程 tick 内触发）。【fix237】与 followPath 的 onArrive/onAbandon 同义。
+     */
+    public void walkTo(Vec3 target, boolean sprint, Runnable callback, Runnable onAbandon) {
+        // 【fix248＋fix351】流体游泳护栏：人在流体里且游泳脱困进行中时，行走请求
+        // 不受理——岩浆 #92/#93 定谳：落浆后目标层派 ascend，其 walkTo 把
+        // swimGoal 清掉、生存层重发又被冷却挡住，数秒烧死；水域 263 棒新图
+        // 生产实证同款：行走约 1 次/秒顶掉游泳、11 分钟零位移。先游出水/浆面；
+        // 技能层靠自身走位看门狗收场，脱困后自会重派（兜底不缺位）。
+        if (this.swimGoal != null && (this.isInLava() || this.isInWater())) {
+            log(npcName, "lava-swim-guard", "岩浆游泳中，拒绝行走抢身 target=" + target
+                    + " " + this.describe());
+            return;
+        }
         // 直线行走和 A* 路径互斥，手动 walkTo 视为放弃当前路径；游泳脱困也一并取消。
         this.swimGoal = null;
         this.path = null;
@@ -778,6 +1081,7 @@ public final class FakePlayerBody extends ServerPlayer {
         this.walkTarget = target;
         this.walkSprint = sprint;
         this.walkCallback = callback;
+        this.walkAbandon = onAbandon;
         this.lastDistanceSq = Double.MAX_VALUE;
         this.noProgressTicks = 0;
         resetRescuesIfLeftArea();
@@ -788,12 +1092,18 @@ public final class FakePlayerBody extends ServerPlayer {
         this.swimGoal = null;
         this.walkTarget = null;
         this.walkCallback = null;
+        this.walkAbandon = null;
         this.path = null;
         this.pathIndex = 0;
         this.pathArrive = null;
         this.pathAbandon = null;
         this.xxa = 0.0F;
         this.zza = 0.0F;
+        // 【fix344】停走即停跳：phaseApproach 在 waitingBody 之前必调 stopWalking，
+        // 残留的 jumping（见 applySwimInput）会使 NPC 在落定门前继续原地弹跳。
+        // 行走／路径自动跳与 pillar 跳皆走 jumpFromGround() 直接调用、不读此标志，
+        // 清零不影响它们。
+        this.jumping = false;
         this.setSprinting(false);
     }
 
@@ -812,6 +1122,22 @@ public final class FakePlayerBody extends ServerPlayer {
     }
 
     /** 挖掘方块，返回是否成功。Survival 模式下会走正常掉落流程。 */
+    /**
+     * 【fix349】点亮门框的边框黑曜石判定：该格是黑曜石且任一相邻格是传送门方块。
+     * 门框边框（底边/顶边/侧边）必与传送门方块相邻；四角黑曜石不相邻、挖角不灭门。
+     */
+    private boolean isLitPortalFrameObsidian(BlockPos pos) {
+        if (!this.level().getBlockState(pos).is(net.minecraft.world.level.block.Blocks.OBSIDIAN)) {
+            return false;
+        }
+        for (Direction dir : Direction.values()) {
+            if (this.level().getBlockState(pos.relative(dir)).is(net.minecraft.world.level.block.Blocks.NETHER_PORTAL)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public boolean mine(BlockPos pos) {
         // 【fix99】床块永不挖：本方法是全插件唯一的 destroyBlock 包装，
         // 身体层卡住自救、生存层窒息/卡块自救、技能层全部挖掘最终都过这里，
@@ -827,12 +1153,29 @@ public final class FakePlayerBody extends ServerPlayer {
         if (targetState.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) {
             return false;
         }
-        if (targetState.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+        if (targetState.getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                && !pos.equals(this.storageDigPermitPos)) {
+            // 【fix239】唯一例外：围死兜底的定点许可（四面被存储块围死、
+            // 只剩床可挖时，Fong 20:43 口径放行挖最快一块脱困）；许可只由
+            // digStorageEscapeFallback 在单次挖掘期间设定，fix99 防线其余
+            // 情形一律不让。
             if (this.tickCount - lastBedGuardLogTick >= 200) {
                 lastBedGuardLogTick = this.tickCount;
                 log(npcName, "mine-bed-guard", "拒绝挖床块 " + targetState.getBlock()
                         + " " + pos.toShortString());
             }
+            return false;
+        }
+        // 【fix239】存储/功能块默认拒挖下沉到本方法：fix231 当年只堵了
+        // 自救挖路径，81 棒实验场实证 travel 清障挖路（travelStepToward
+        // 直调 mineWithBestTool）照样挖穿工作台/熔炉，与 67 棒贵重箱被
+        // 自救挖掉是同类风险。mine() 是全插件唯一 destroyBlock 包装，
+        // 在此拒挖即全覆盖：箱子/熔炉/工作台一族（isStorageBlock）无
+        // 定点许可一律不挖。定点许可只有两个来源——工作站回收挖自家
+        // 登记熔炉（GoalExecutor 设定）、围死兜底（digStorageEscapeFallback
+        // 设定）；调用方按"挖不开"改道/收场，围死情形由兜底专路解脱，
+        // 不是只堵不疏。
+        if (storageGuardBlocks(pos, targetState)) {
             return false;
         }
         // 【fix199】基岩永不挖：本体 destroyBlock 对假人真移除基岩（staging
@@ -845,24 +1188,47 @@ public final class FakePlayerBody extends ServerPlayer {
             }
             return false;
         }
-        // 【fix198】自家农田永不挖（田间作业许可期间除外）：全插件挖掘都过
-        // 本方法，一处守卫全覆盖。farm164/166/167 三度实证 descend 在田上
-        // 开井把耕地连土带苗挖成空气、田格 8→2 缩水至全毁。收获是 farm
-        // 目标自己的活（mineBareHand 挖作物格），靠 GoalExecutor 每 tick
-        // 刷新的 farmWorkPermit 放行；其余任何技能/生存层一律拒挖。
-        // 兜底（Fong 通则）：descend 有井口避让挪位+避让收场两条疏路，
-        // 不是只堵不疏。
-        if (!farmWorkPermit) {
-            com.example.aivillager.goals.FarmMemory.bindWorld(this.level());
-            if (com.example.aivillager.goals.FarmMemory.isFarmCell(npcName, pos)) {
-                lastFarmGuardRefusalTick = this.tickCount;
-                if (this.tickCount - lastFarmGuardLogTick >= 200) {
-                    lastFarmGuardLogTick = this.tickCount;
-                    log(npcName, "mine-farm-guard", "拒绝挖自家农田格 " + targetState.getBlock()
-                            + " " + pos.toShortString());
-                }
-                return false;
+        // 【fix349】已点亮的传送门永不挖：传送门方块本身与点亮门框的边框黑曜石
+        // （与传送门方块相邻）一律拒挖——新图 260 棒实证：NPC 行走清路
+        // （tryStepInto→mineWithBestTool→mine）把自家门框黑曜石挖穿，门灭后
+        // 账本仍记旧位、fix333 循环派往幻影点。废墟传送门无点亮方块，不受此
+        // 守卫拦（挖废墟黑曜石造门照常）；门框四角黑曜石不与传送门方块相邻、
+        // 挖角不灭门，不在此列。调用方按"挖不开"诚实改道/放弃（兜底：tryStepInto
+        // 副轴避让／travel 12 轮收场，规划层重派）。
+        if (targetState.is(net.minecraft.world.level.block.Blocks.NETHER_PORTAL)
+                || isLitPortalFrameObsidian(pos)) {
+            if (this.tickCount - lastPortalGuardLogTick >= 200) {
+                lastPortalGuardLogTick = this.tickCount;
+                log(npcName, "mine-portal-guard", "拒绝挖已点亮传送门／门框黑曜石 " + targetState.getBlock()
+                        + " " + pos.toShortString());
             }
+            return false;
+        }
+        // 【fix198】自家农田永不挖：全插件挖掘都过本方法，一处守卫全覆盖。
+        // farm164/166/167 三度实证 descend 在田上开井把耕地连土带苗挖成
+        // 空气、田格 8→2 缩水至全毁。【fix309】旧口径「田间作业许可期间
+        // 除外」是洞：GoalExecutor 每 tick 把 farmWorkPermit 置真，tend
+        // 全程许可敞开，流体脱困挖头顶（digOutAbove）与 stuck-rescue
+        // 侧挖趁 NPC 田边落水之机挖掉自家耕地——159 棒生产实证 tend-1
+        // 扩 2 格毁 2 格、田 5 格原地踏步。许可已撤：守卫从此无条件。
+        // 【fix311 修正】fix309 原句「收获挖作物格、本就不是田格、不受
+        // 守卫拦」是错的：isFarmCell 含 y+1 作物位，且收获走 mineBareHand
+        // →mine()、必经本守卫——159 棒实验场实证 fix309 boot 内收获 0 行、
+        // 小麦拒挖 5 次，tend 颗粒无收。守卫改只拦土格本身
+        // （isFarmSoilCell 精确匹配）：土是稀缺资源、作物可弃可补种；
+        // till/plant/place 走 setBlockAndUpdate，不走 mine。无任何 farm
+        // 动作需要挖土格本身。
+        // 兜底（Fong 通则）：descend 有井口避让挪位+避让收场两条疏路，
+        // 脱困挖不动则换向/续游，不是只堵不疏。
+        com.example.aivillager.goals.FarmMemory.bindWorld(this.level());
+        if (com.example.aivillager.goals.FarmMemory.isFarmSoilCell(npcName, pos)) {
+            lastFarmGuardRefusalTick = this.tickCount;
+            if (this.tickCount - lastFarmGuardLogTick >= 200) {
+                lastFarmGuardLogTick = this.tickCount;
+                log(npcName, "mine-farm-guard", "拒绝挖自家农田格 " + targetState.getBlock()
+                        + " " + pos.toShortString());
+            }
+            return false;
         }
         String before = this.level().getBlockState(pos).toString();
         // 【第二十三轮】工具损坏取证：动作前先记下主手工具，挖完比对（标准第 4 条）。
@@ -938,6 +1304,167 @@ public final class FakePlayerBody extends ServerPlayer {
                 || biome.equals("frozen_peaks") || biome.equals("ice_spikes");
     }
 
+    /**
+     * 【fix261】进门金靴保护窗：目标层进门前强制换上金靴（fix93·D8）后置此
+     * 窗（60 秒，覆盖一轮 enterportal 30 秒＋重试余量，每轮进门尝试刷新）。
+     * 窗内生存层 AutoArmor 不许把脚上金靴按防御分换下——fix93 的下界锁只管
+     * 界内，主世界进门窗口曾无保护：换上约 1 秒即被铁/钻靴换回，传送瞬间
+     * 从来没穿着金装（111/112 棒生产＋实验场双实证）。窗外恢复纯评分，
+     * 回主世界照常换回好靴，兜底不堵死。
+     */
+    public void protectGoldBoots() {
+        this.goldBootsProtectUntilTick = this.tickCount + 1200L;
+    }
+
+    /** 【fix261】当前是否在金靴保护窗内（生存层 FEET 换装守卫用）。 */
+    public boolean goldBootsProtected() {
+        return this.tickCount <= this.goldBootsProtectUntilTick;
+    }
+
+    // ===== 【fix379】定时挖掘（Fong 个人版开关 mining.timed）：像真人一样逐格耗时挖 =====
+    // 瞬时版（测试线默认）：mineWithBestTool 换上工具→destroyBlock 一击碎→立刻还原，
+    // 工具只在那一瞬间在手里，旁观者永远只看到保命层握着的剑，且一秒能碎好几块。
+    // 定时版：一次只挖一个方块，按原版公式（方块硬度÷主手工具速率）逐 tick 推进，
+    // 期间工具实实在在握在手里、带裂纹进度、带挥手动作，进度满才真正 destroyBlock。
+    // 速率直接用原版 BlockState.getDestroyProgress（与真人客户端同式），不自创数值。
+    private static boolean timedMiningEnabled = false;
+
+    public static void setTimedMiningEnabled(boolean enabled) {
+        timedMiningEnabled = enabled;
+    }
+
+    public static boolean timedMiningEnabled() {
+        return timedMiningEnabled;
+    }
+
+    private BlockPos timedPos;          // 正在挖的格（null=无会话）
+    private long timedStartTick;        // 会话开始 tick
+    private long timedLastCallTick;     // 最近一次推进调用 tick（过期判定）
+    private float timedPerTick;         // 每 tick 进度（会话开始时按当时主手算定）
+    private String timedToolPath = "";  // 会话开始时主手物品路径（空串=空手）
+    private Runnable timedRestore;      // 会话结束（挖完/取消/过期）时还原手部装备的动作
+    private int timedCrackStage = -1;   // 已广播的裂纹阶段（-1=未广播）
+    private long timedLastSwingTick;    // 上次挥手 tick
+
+    /** 定时挖掘会话是否活跃（生存层换武器守卫用：挖完这一格之前不许把镐换走）。 */
+    public boolean isActivelyMining() {
+        return timedPos != null && this.tickCount - timedLastCallTick <= 20;
+    }
+
+    /** 别的格子正在挖 → 本次让行（会话由 tick 驱动挖完/取消，不靠调用续命）。 */
+    private boolean timedBusyOther(BlockPos pos) {
+        return timedPos != null && !timedPos.equals(pos);
+    }
+
+    /** 结束会话：清裂纹；restore=true 时执行还原动作（主手被外部接管时传 false）。 */
+    private void cancelTimedSession(boolean restore) {
+        if (timedPos != null && timedCrackStage >= 0) {
+            this.level().destroyBlockProgress(this.getId(), timedPos, -1);
+        }
+        Runnable r = timedRestore;
+        timedPos = null;
+        timedRestore = null;
+        timedCrackStage = -1;
+        if (restore && r != null) {
+            r.run();
+        }
+    }
+
+    /**
+     * 开始/推进一次定时挖掘。调用方须已完成换工具（含素手腾手），并把"还原手部
+     * 装备"的动作以 restore 传入（仅建会话时采纳，推进时传 null 沿用已存的）。
+     *
+     * @return true=这一格刚刚挖掉；false=还在挖（或让行/失败），调用方按"未挖掉"处理
+     */
+    private boolean timedDig(BlockPos pos, Runnable restore) {
+        BlockState state = this.level().getBlockState(pos);
+        if (state.isAir()) {
+            cancelTimedSession(true);
+            return false;
+        }
+        if (timedPos == null || !timedPos.equals(pos)) {
+            float perTick = state.getDestroyProgress(this, this.level(), pos);
+            if (perTick <= 0.0F) {
+                // 硬度 -1 等真挖不动：不建会话，照旧失败（基岩等另有守卫在前）。
+                if (restore != null) {
+                    restore.run();
+                }
+                return false;
+            }
+            if (perTick >= 1.0F) {
+                // 一击即碎（草/花/火把等零硬度）：不建会话，直接挖。
+                boolean ok = mine(pos);
+                if (restore != null) {
+                    restore.run();
+                }
+                return ok;
+            }
+            timedPos = pos.immutable();
+            timedStartTick = this.tickCount;
+            timedLastCallTick = this.tickCount;
+            timedPerTick = perTick;
+            timedToolPath = itemPathOf(this.getMainHandItem());
+            timedRestore = restore;
+            timedCrackStage = -1;
+            timedLastSwingTick = this.tickCount - 4;
+            log(npcName, "timed-mine", "开始逐格挖 " + state.getBlock()
+                    + " tool=" + (timedToolPath.isEmpty() ? "空手" : timedToolPath)
+                    + " 约需=" + Math.round(1.0D / perTick) + "tick " + pos.toShortString());
+        } else {
+            timedLastCallTick = this.tickCount;
+            // 主手被外部换走（进食/战斗换武器接管）：取消会话、进度作废，手归外部不还原。
+            if (!itemPathOf(this.getMainHandItem()).equals(timedToolPath)) {
+                cancelTimedSession(false);
+                return false;
+            }
+        }
+        return advanceTimedMining();
+    }
+
+    /** 推进当前会话一格进度（挖掘调用与身体 tick 共用）：进度满则真挖并收尾。 */
+    private boolean advanceTimedMining() {
+        double progress = (this.tickCount - timedStartTick) * (double) timedPerTick;
+        if (progress >= 1.0D) {
+            boolean ok = mine(timedPos);
+            cancelTimedSession(true);
+            return ok;
+        }
+        if (this.tickCount - timedLastSwingTick >= 4) {
+            this.swing(InteractionHand.MAIN_HAND);
+            timedLastSwingTick = this.tickCount;
+        }
+        int stage = Math.min(9, (int) (progress * 10.0D));
+        if (stage != timedCrackStage) {
+            this.level().destroyBlockProgress(this.getId(), timedPos, stage);
+            timedCrackStage = stage;
+        }
+        return false;
+    }
+
+    /**
+     * 【fix380】身体 tick 驱动会话：目标格没了/主手被外部换走/走出够取距离
+     * → 取消会话；否则刷新活跃时戳（保生存层换武器守卫全程有效）并推进一格。
+     */
+    private void tickTimedMining() {
+        BlockState state = this.level().getBlockState(timedPos);
+        if (state.isAir()) {
+            cancelTimedSession(true);
+            return;
+        }
+        // 主手被外部换走（进食/战斗换武器接管）：取消会话、进度作废，手归外部不还原。
+        if (!itemPathOf(this.getMainHandItem()).equals(timedToolPath)) {
+            cancelTimedSession(false);
+            return;
+        }
+        // 原版生存够取 4.5 格，留 0.5 格余量防边界抖动误取消。
+        if (this.getEyePosition().distanceToSqr(Vec3.atCenterOf(timedPos)) > 5.0D * 5.0D) {
+            cancelTimedSession(true);
+            return;
+        }
+        timedLastCallTick = this.tickCount;
+        advanceTimedMining();
+    }
+
     public boolean mineWithBestTool(BlockPos pos) {
         return mineWithBestTool(pos, true);
     }
@@ -951,15 +1478,29 @@ public final class FakePlayerBody extends ServerPlayer {
         return this.tickCount - lastTierGuardRefusalTick <= 2;
     }
 
+    /**
+     * 【fix251】宽窗探针：最近 ticks tick 内是否有挖掘被分级守卫拒挖。
+     * travel 的 followPath 挖墙发生在身体层、技能层只能在重规划结算时
+     * 回看整段——2 tick 窗（fix196、为同 tick 同步查格设计）够不着，
+     * 故另开宽窗版；fix196 版语义不动，descend/strip 照旧。
+     */
+    public boolean mineRefusedByTierGuardWithin(int ticks) {
+        return this.tickCount - lastTierGuardRefusalTick <= ticks;
+    }
+
     /** 【fix198】最近 2 tick 内是否被自家农田守卫拒挖（技能层避让收场判定，同 fix196 探针）。 */
     public boolean mineRefusedByFarmGuardRecently() {
         return this.tickCount - lastFarmGuardRefusalTick <= 2;
     }
 
-    /** 【fix198】田间作业许可开关（GoalExecutor 每 tick 按当前目标类型刷新：仅 farm 目标为真）。 */
-    public void setFarmWorkPermit(boolean permit) {
-        this.farmWorkPermit = permit;
+    /** 【fix323】农田守卫挡路导致救援跳过侧挖的累计次数（目标层读）。 */
+    public int farmGuardRescueSkips() {
+        return farmGuardRescueSkips;
     }
+
+    // 【fix309】farmWorkPermit 已删除：许可制在 tend 全程敞开，流体脱困/
+    // stuck-rescue 趁机挖田（159 棒生产实证）；收获挖作物格本就不受
+    // 守卫拦，无任何 farm 动作需要挖土格本身，守卫现无条件。
 
     /**
      * @param allowLastResort 是否允许动用"剩最后 1 点耐久"的退役工具兜底。一般挖掘
@@ -968,8 +1509,34 @@ public final class FakePlayerBody extends ServerPlayer {
      *                        烧一把、烧完照样得素手挖，壳白白烧光。
      */
     public boolean mineWithBestTool(BlockPos pos, boolean allowLastResort) {
+        return mineWithBestTool(pos, allowLastResort, false);
+    }
+
+    /**
+     * @param allowDiamondFallback 【fix226】是否放行钻石/下界镐作兜底工具。
+     *        fix225 的钻镐排除只应覆盖技能层常规挖掘（省镐经济面）；行走层
+     *        挖穿挡路块（tryDigBlocking）是自救/通行——farm203 live 实证：
+     *        峡谷石盒里铁镐烧至退役后只剩钻镐，被排除→mine-no-tool 永冻。
+     *        玩家被埋只剩钻镐照样挖出，故行走层传 true 放行。
+     */
+    public boolean mineWithBestTool(BlockPos pos, boolean allowLastResort, boolean allowDiamondFallback) {
         BlockState state = this.level().getBlockState(pos);
         if (state.isAir()) {
+            return false;
+        }
+        // 【fix379】定时挖掘会话进行中：同格直接推进（工具已在手，不重跑选工具），
+        // 异格让行（一次只挖一个方块）；会话过期时 timedBusyOther 顺手清理并放行。
+        if (timedMiningEnabled && timedPos != null) {
+            if (timedPos.equals(pos)) {
+                return timedDig(pos, null);
+            }
+            if (timedBusyOther(pos)) {
+                return false;
+            }
+        }
+        // 【fix239】存储/功能块在选工具之前先拒：免得为一块箱子白跑
+        // 分级守卫/兜底链的日志与状态（mine() 层另有同口径拒挖兜底）。
+        if (storageGuardBlocks(pos, state)) {
             return false;
         }
         Inventory inventory = this.getInventory();
@@ -1021,6 +1588,20 @@ public final class FakePlayerBody extends ServerPlayer {
                         }
                     }
                 }
+            }
+            if (timedMiningEnabled) {
+                // 【fix379】定时版：腾手状态在整个挖掘会话期间保持，挖完/取消才还原。
+                final int swapSlotF = swappedSlot;
+                Runnable restore = () -> {
+                    if (swapSlotF >= 0) {
+                        ItemStack handNow = inventory.getItem(selected);
+                        ItemStack bagNow = inventory.getItem(swapSlotF);
+                        inventory.setItem(selected, bagNow);
+                        inventory.setItem(swapSlotF, handNow);
+                    }
+                    inventory.setSelectedSlot(previous);
+                };
+                return timedDig(pos, restore);
             }
             boolean mined = mine(pos);
             if (swappedSlot >= 0) {
@@ -1087,9 +1668,18 @@ public final class FakePlayerBody extends ServerPlayer {
         // 玩家也会先花 1 点高级镐耐久凑出做石镐的圆石），防"没圆石→做不了石镐
         // →又不许挖石"的死角。需高级镐的方块（钻石/金等，石镐探针为假）不受
         // 影响、照常评分。每次触发都打 mine-tier-guard 流水可审计。
+        // 【fix225】本调用是否进入了分级守卫面（石镐能采的方块、无可用石镐）：
+        // 进入后若走到评分兜底，钻石/下界镐不入候选——farm201 实证：满包
+        // 「合不出」窗口里兜底链先烧铁镐再烧钻镐，单 boot 钻镐 527→73，
+        // 而钻镐是黑曜石唯一工具、属保命级资产。Fong 兜底口径（fix101）
+        // 点名的是「铁镐顶上」，钻镐只许挖石镐/铁镐采不了的方块（黑曜石、
+        // 钻石矿等——那些方块石镐探针为假、根本不进本守卫面，不受影响）。
+        boolean diamondExcludedFromFallback = false;
         if (stoneSlot < 0 && allowLastResort
                 && new ItemStack(Items.STONE_PICKAXE).isCorrectToolForDrops(state)
                 && !hasUsableCheapPick(inventory, state)) {
+            // 【fix226】行走层自救挖掘（allowDiamondFallback）不排除钻镐。
+            diamondExcludedFromFallback = !allowDiamondFallback;
             // 【fix101·Fong 2026-10-28 通则：守卫必须配兜底】fix44 旧口径只看
             // 圆石 ≥3 就一律拒挖——但圆石够 ≠ 合得出（缺木棍料/没工作台时
             // 合成路径同样不通），守卫只有「不许」没有出路：浇铸三趟里
@@ -1136,11 +1726,25 @@ public final class FakePlayerBody extends ServerPlayer {
             if (stack.isDamageableItem() && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
                 continue;
             }
+            // 【fix225】守卫面内钻石/下界镐不入兜底候选（见上方 diamondExcludedFromFallback）。
+            if (diamondExcludedFromFallback
+                    && (stack.is(Items.DIAMOND_PICKAXE) || stack.is(Items.NETHERITE_PICKAXE))) {
+                continue;
+            }
             int score = toolScore(stack, state);
             if (score > bestScore) {
                 bestScore = score;
                 bestSlot = slot;
             }
+        }
+        // 【fix234】非正确工具不得占位遮挡退役壳兜底。
+        // 68 棒实测：包里只剩两把 1 耐久石镐（第一遍跳过）+ 被 fix225 排除的钻镐时，
+        // 剑/弓等非正确工具以 toolScore≈100“胜出”当 bestSlot，终检即拒 → mine-no-tool；
+        // 而“只剩 1 耐久还是要用一下”的兜底遍只在 bestSlot<0 时跑，剑占位致其永不点火。
+        // 非正确工具本就挖不出掉落，占位毫无意义：置回 -1 落回兜底遍（fix225 排除面不变）。
+        if (bestSlot >= 0 && !inventory.getItem(bestSlot).isCorrectToolForDrops(state)) {
+            bestSlot = -1;
+            bestScore = -1;
         }
         // 兜底：所有工具都只剩最后 1 耐久时，还是要用一下——总比全空转好。
         // 这种情况只会在多条矿道挖穿、工具群灭时发生（descend 140 级用掉 400+ 耐久）。
@@ -1151,12 +1755,80 @@ public final class FakePlayerBody extends ServerPlayer {
                 if (stack.isEmpty()) {
                     continue;
                 }
+                // 【fix225】退役壳兜底遍同样排除钻石/下界镐（守卫面内）。
+                if (diamondExcludedFromFallback
+                        && (stack.is(Items.DIAMOND_PICKAXE) || stack.is(Items.NETHERITE_PICKAXE))) {
+                    continue;
+                }
+                // 【fix236】退役壳遍同样不烧只剩 1 耐久的钻石/下界镐（黑曜石种子）。
+                // 69 棒实证：fix235 第三遍有此护栏、第一遍也有，但壳遍没有——
+                // tryDigBlocking（allowDiamondFallback=true，fix226 自救放行钻镐）
+                // 走壳遍选中 1 耐久钻镐，stuck-rescue 一格挖断（52→0）；而同一秒前
+                // strip 路径的 mine-no-tool 刚正确拒挖（护栏在第三遍生效）。
+                // 石/铁壳仍可烧到最后 1 点（壳遍本意），只保钻石/下界镐种子。
+                if ((stack.is(Items.DIAMOND_PICKAXE) || stack.is(Items.NETHERITE_PICKAXE))
+                        && stack.isDamageableItem()
+                        && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
+                    continue;
+                }
                 int score = toolScore(stack, state);
                 if (score > bestScore) {
                     bestScore = score;
                     bestSlot = slot;
                 }
             }
+        }
+        // 【fix234 追补】兜底遍本身也会把剑/弓等非正确工具以 toolScore≈100 选为
+        // bestSlot（当包里已无任何正确工具时），终检即拒 → mine-no-tool，且会挡住
+        // 下面的 fix235。非正确工具占位毫无意义：再置回 -1。
+        if (bestSlot >= 0 && !inventory.getItem(bestSlot).isCorrectToolForDrops(state)) {
+            bestSlot = -1;
+            bestScore = -1;
+        }
+        // 【fix235】绝对最后手段：两遍扫完仍无可用工具、且钻镐被 fix225 排除时，
+        // 若包里只剩钻石/下界镐这一把镐（无任何其他可用镐、也无圆石可合石镐），
+        // 放行钻镐挖这一格——否则 NPC 在无镐无圆石时永冻（68 棒实测：两把 1 耐久
+        // 石镐先后殉职、圆石耗尽、travel 换位在 fix186/fix150 里空转）。
+        // 玩家口径：只剩钻镐时就拿它挖 3 块圆石合石镐，1 点耐久换脱困。专行计数
+        // 防长烧：一旦合出石镐，第一遍即有候选、此处不再点火，钻镐重新被排除。
+        // fix101 通则：fix225 的排除须配兜底，此处即该兜底。
+        if (bestSlot < 0 && allowLastResort && diamondExcludedFromFallback) {
+            for (int slot = 0; slot < 36; slot++) {
+                ItemStack stack = inventory.getItem(slot);
+                if (stack.isEmpty()) {
+                    continue;
+                }
+                if (!(stack.is(Items.DIAMOND_PICKAXE) || stack.is(Items.NETHERITE_PICKAXE))) {
+                    continue;
+                }
+                // 钻镐本身也只剩最后 1 点耐久时不烧（留着当黑曜石的种子）。
+                if (stack.isDamageableItem() && stack.getDamageValue() >= stack.getMaxDamage() - 1) {
+                    continue;
+                }
+                int score = toolScore(stack, state);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestSlot = slot;
+                }
+            }
+            if (bestSlot >= 0) {
+                log(npcName, "pick-last-resort-diamond", "只剩钻镐兜底掘进 block=" + state.getBlock()
+                        + " pos=" + pos.toShortString());
+            }
+        }
+        // 【fix225】守卫面内无合法工具（只剩钻镐）→ 按礼让收场处理（置
+        // fix196 探针，技能层让位交规划层补镐/腾包），不许烧钻镐硬挖。
+        // fix235 点火时 bestSlot 已 >= 0，此处不置探针。
+        // 【fix357】探针只在包里真有一把钻石/下界镐被排除时才置：
+        // 包里一把镐都没有时 bestSlot<0 与"只剩钻镐"同形，旧口径一律
+        // 置探针，descend 误读为"分级守卫拒挖（石镐可合）"礼让收场——
+        // 而石镐根本合不出（圆石 0）、亦无高级镐被拒，fix320 守卫
+        // "合不出"分支空转返回、目标层原样重派，1.5 次/秒空转
+        // （269 棒实验场实证）。无镐时不置探针，诚实走 mine-no-tool。
+        if (bestSlot < 0 && diamondExcludedFromFallback
+                && (countInventoryItem(inventory, Items.DIAMOND_PICKAXE) > 0
+                        || countInventoryItem(inventory, Items.NETHERITE_PICKAXE) > 0)) {
+            lastTierGuardRefusalTick = this.tickCount;
         }
         // 需要正确工具才有掉落的方块（石头/矿石/金属块），没有对应镐就别挖了。
         if (bestSlot < 0 || !inventory.getItem(bestSlot).isCorrectToolForDrops(state)) {
@@ -1185,7 +1857,28 @@ public final class FakePlayerBody extends ServerPlayer {
             lastToolLogName = toolName;
             toolLogCounter = 0;
         }
+        if (timedMiningEnabled) {
+            // 【fix379】定时版：工具在整个挖掘会话期间握在手里，挖完/取消才换回。
+            final int bestSlotF = bestSlot;
+            Runnable restore = () -> {
+                if (bestSlotF >= 9) {
+                    ItemStack curNow = inventory.getItem(selected);
+                    inventory.setItem(selected, inventory.getItem(bestSlotF));
+                    inventory.setItem(bestSlotF, curNow);
+                }
+                inventory.setSelectedSlot(selected);
+            };
+            return timedDig(pos, restore);
+        }
         boolean mined = mine(pos);
+        // 【fix348】深槽换镐后把物品换回去：只还原选中格、不还原物品时，
+        // 原选中格的物品（可能是在吃的口粮）被埋进背包深槽，下一实体 tick
+        // updatingUsingItem() 见手持物≠useItem 即取消进食。素手分支同款还原在上。
+        if (bestSlot >= 9) {
+            ItemStack cur = inventory.getItem(selected);
+            inventory.setItem(selected, inventory.getItem(bestSlot));
+            inventory.setItem(bestSlot, cur);
+        }
         // 挖完把选中格还原，理由同上面空手挖的分支：否则生存层每次检查都会切回武器。
         inventory.setSelectedSlot(selected);
         return mined;
@@ -1225,11 +1918,21 @@ public final class FakePlayerBody extends ServerPlayer {
      * 的真实门槛是 fix129 腾格 3 格；空槽 1–2 且丢弃腾不出格时合成仍恒
      * 败、本判定却报可合，守卫委托落空成死局（farm148）。现口径：空槽
      * ≥3，或消耗本身腾格（圆石恰好 3 / 木棍恰好 2）。
+     *
+     * <p>【fix369·310 棒】石料口径补黑石：圆石／深板岩圆石／黑石在原版
+     * 石镐配方里完全等价（同属 stone_tool_materials 标签，Wiki 黑石条目：
+     * “黑石可替代圆石来合成石制工具”）。旧口径只数前两者，下界里袋里
+     * 躺着黑石也判「合不出石镐 missing=圆石=0/3」（309 正式服实证），
+     * 分级守卫、pick-fallback、fix306 下界镐保障三路同堵。黑石计入后，
+     * 判定与执行层（craftOne 走真实配方、标签候选天然含黑石）一致。
+     * missing 文案的“圆石=”标签不动（保日志口径连续）；主世界 decide()
+     * 的 fix57 口径（ProgressionPlanner:1680）不改——主世界无黑石，数了无用。
      */
     public boolean stonePickCraftableNow(StringBuilder missing) {
         Inventory inventory = this.getInventory();
         int cobble = countInventoryItem(inventory, Items.COBBLESTONE)
-                + countInventoryItem(inventory, Items.COBBLED_DEEPSLATE);
+                + countInventoryItem(inventory, Items.COBBLED_DEEPSLATE)
+                + countInventoryItem(inventory, Items.BLACKSTONE);
         int sticks = countInventoryItem(inventory, Items.STICK);
         int planks = 0;
         int logs = 0;
@@ -1258,7 +1961,24 @@ public final class FakePlayerBody extends ServerPlayer {
         // 层补造」、委托落空，NPC 钉死恢复栈台阶（descend 挖不动+travel
         // A* 耗尽双循环）。守卫必配兜底（fix101 通则）：紧包时如实报合不
         // 出 → pick-fallback 顺位开挖（铁>钻）脱困；空槽 ≥3 省镐口径不变。
-        boolean placeable = emptySlots >= 3 || cobble == 3 || sticks == 2;
+        // 【fix232】fix183 的 cobble==3||sticks==2 逃生口仍谎报：它只算了
+        // 产物镐本身的格，没算合成链中间产物。合石镐要 3 圆石 + 2 木棍：
+        // 木棍现成（sticks>=2）时中间产物 0 格，产物镐需 1 格（空槽或圆
+        // 石/木棍堆叠耗尽腾出的格）；木棍须由木板合（planks>=2）时中间产
+        // 物木棍占 1 格（木板恰为 2 时其格腾出抵 1 格）；木棍须由原木现合
+        // （logs>=1）时中间产物木板+木棍占 2 格。farm211 基址实证：
+        // cobble=3、logs=19、sticks=0、空槽=1，旧口径报可合，实合木棍时
+        // 「4 个 stick 放不下」恒败，分级守卫持续拒挖、NPC 钉死基址边沿
+        // （fix186 连环 4 次）。按链算格，合不出时如实报 → pick-fallback。
+        int freedSlots = (cobble == 3 ? 1 : 0) + (sticks == 2 ? 1 : 0);
+        boolean placeable;
+        if (sticks >= 2) {
+            placeable = emptySlots + freedSlots >= 1;
+        } else if (planks >= 2) {
+            placeable = emptySlots + freedSlots + (planks == 2 ? 1 : 0) >= 2;
+        } else { // logs >= 1（stickMaterial 已保证三者其一）
+            placeable = emptySlots + freedSlots >= 3;
+        }
         if (cobble < 3) {
             missing.append("圆石=").append(cobble).append("/3 ");
         }
@@ -1344,6 +2064,15 @@ public final class FakePlayerBody extends ServerPlayer {
         if (state.isAir()) {
             return false;
         }
+        // 【fix379】定时挖掘会话进行中：同格推进、异格让行（同 mineWithBestTool 口径）。
+        if (timedMiningEnabled && timedPos != null) {
+            if (timedPos.equals(pos)) {
+                return timedDig(pos, null);
+            }
+            if (timedBusyOther(pos)) {
+                return false;
+            }
+        }
         Inventory inventory = this.getInventory();
         int selected = inventory.getSelectedSlot();
         int swappedSlot = -1;
@@ -1371,6 +2100,20 @@ public final class FakePlayerBody extends ServerPlayer {
                     }
                 }
             }
+        }
+        if (timedMiningEnabled) {
+            // 【fix379】定时版：腾手状态在整个挖掘会话期间保持，挖完/取消才还原。
+            final int swapSlotF = swappedSlot;
+            Runnable restore = () -> {
+                if (swapSlotF >= 0) {
+                    ItemStack handNow = inventory.getItem(selected);
+                    ItemStack bagNow = inventory.getItem(swapSlotF);
+                    inventory.setItem(selected, bagNow);
+                    inventory.setItem(swapSlotF, handNow);
+                }
+                inventory.setSelectedSlot(selected);
+            };
+            return timedDig(pos, restore);
         }
         boolean mined = mine(pos);
         if (swappedSlot >= 0) {

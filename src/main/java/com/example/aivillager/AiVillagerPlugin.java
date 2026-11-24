@@ -101,6 +101,18 @@ public final class AiVillagerPlugin extends JavaPlugin {
         survivalDefendRadius = Math.max(2.0D, Math.min(16.0D, getConfig().getDouble("survival.defend-radius", 8.0D)));
         // 默认开启：没有它 NPC 只会被 LLM 随机指挥，永远走不到钻石装备。
         progressionEnabled = getConfig().getBoolean("progression.enabled", true);
+        // 【fix379】挖掘方式：true=像真人一样逐格按原版耗时挖（工具全程在手、带裂纹，
+        // 一次只挖一个方块；Fong 个人版 jar 内置开启）；false=瞬时挖（测试线提速口径，
+        // 默认）。启动时读一次，改后需重启生效。
+        boolean timedMining = getConfig().getBoolean("mining.timed", false);
+        com.example.aivillager.npc.FakePlayerBody.setTimedMiningEnabled(timedMining);
+        getLogger().info("[AIV] 挖掘方式 timed-mining=" + timedMining
+                + (timedMining ? "（逐格耗时，像真人）" : "（瞬时，测试线口径）"));
+        // 【fix380】顺路捡远处有用掉落物：true=技能空档时主动跑去捡 12 格内的有用
+        // 掉落物（Fong 个人版 jar 内置开启）；false=只收脚边 3 格内（默认）。
+        boolean detourPickup = getConfig().getBoolean("pickup.detour", false);
+        com.example.aivillager.goals.GoalExecutor.setDetourPickupEnabled(detourPickup);
+        getLogger().info("[AIV] 顺路捡掉落 pickup.detour=" + detourPickup);
         // 阶段模式：全局默认 + 按 NPC 名覆盖。后续"玩家改某个 NPC 的目标"也走这张表：
         // 运行时改表并重建该 NPC 的规划器即可，规划器本身不关心模式是谁设的。
         defaultProgressionMode = ProgressionMode.parse(
@@ -485,6 +497,12 @@ public final class AiVillagerPlugin extends JavaPlugin {
         getLogger().info("[AIV][AUTO-ASK] 自动提问受理=" + accepted + " text=" + text);
     }
 
+    /** 【fix347】背包持久化锚定主世界 PDC。存写曾用 NPC 当前世界（下界存进下界 PDC），读只读主世界 PDC——下界期全部收入重启即丢（烈焰棒 x6＋x1 两案：生产 13:32 部署重启丢 x6、14:06 换机丢 x1；实验室 G0 同夹具复现）。存／读一律走主世界，与 NPC 当前维度无关。 */
+    private World persistentWorld() {
+        java.util.List<World> worlds = Bukkit.getWorlds();
+        return worlds.isEmpty() ? null : worlds.get(0);
+    }
+
     /** 背包持久化用的世界 PDC 键；名字里的 UUID 是稳定的（离线 UUID 按名字算）。 */
     private NamespacedKey npcInventoryKey(String name) {
         return new NamespacedKey(this, "npc_inv_" + name.toLowerCase(Locale.ROOT));
@@ -497,7 +515,7 @@ public final class AiVillagerPlugin extends JavaPlugin {
     }
 
     /**
-     * 把伪玩家背包序列化进世界 PDC。
+     * 把伪玩家背包序列化进主世界 PDC（fix347：曾写 NPC 当前世界，下界存写进了下界 PDC、重启读主世界 PDC 时永不可读，烈焰棒两案即此丢法；现存／读一律锚定主世界）。
      *
      * <p>为什么不用原版 playerdata：伪玩家是用 {@code placeNewPlayer} 直接塞进 PlayerList 的，
      * 实测重启后拿不到之前的背包（新建的 ServerPlayer 是空的），科技树每次重启都从零开始。
@@ -508,13 +526,18 @@ public final class AiVillagerPlugin extends JavaPlugin {
         if (!body.isAlive()) {
             return;
         }
+        // 【fix347】主世界可能尚未加载时回落当前世界（启动期防御，正常流程恒为主世界）。
+        World world = persistentWorld();
+        if (world == null) {
+            world = body.getBukkitEntity().getWorld();
+        }
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             try (BukkitObjectOutputStream out = new BukkitObjectOutputStream(bytes)) {
                 out.writeObject(body.getBukkitEntity().getInventory().getContents());
             }
             String encoded = Base64.getEncoder().encodeToString(bytes.toByteArray());
-            body.getBukkitEntity().getWorld().getPersistentDataContainer()
+            world.getPersistentDataContainer()
                     .set(npcInventoryKey(body.npcName()), PersistentDataType.STRING, encoded);
         } catch (Throwable throwable) {
             getLogger().warning("[AIV] 背包保存失败 " + body.npcName() + " -> " + throwable);
@@ -523,7 +546,12 @@ public final class AiVillagerPlugin extends JavaPlugin {
 
     /** 读回上次保存的背包；没有存档时保持原版空背包。 */
     private void loadNpcInventory(FakePlayerBody body) {
-        String encoded = body.getBukkitEntity().getWorld().getPersistentDataContainer()
+        // 【fix347】与存写同锚定主世界 PDC（曾读 NPC 当前世界＝生成时主世界，存写却是下界时下界 PDC，读写分裂）。
+        World world = persistentWorld();
+        if (world == null) {
+            world = body.getBukkitEntity().getWorld();
+        }
+        String encoded = world.getPersistentDataContainer()
                 .get(npcInventoryKey(body.npcName()), PersistentDataType.STRING);
         if (encoded == null || encoded.isEmpty()) {
             getLogger().info("[AIV] " + body.npcName() + " 没有背包存档，从空背包开始");

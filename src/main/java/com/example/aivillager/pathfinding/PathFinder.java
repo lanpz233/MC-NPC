@@ -103,12 +103,19 @@ public final class PathFinder {
                               boolean avoidPowderSnow) {
         long begin = System.nanoTime();
 
-        // 起点解析放宽（第五轮修复）：NPC 可能正站在树冠/细雪这类
-        // "旧判定算数、新判定不算"的表面上，只找同列 ±2 格会让所有寻路瞬间失败、
-        // 身体连"走下树冠"都规划不出来。先同列上下 ±6 找真地面；同列没有
-        // （正站树干列上：整列不是树叶就是树干）再横向 ±2 列兜底，取三维距离
-        // 最近的可站立格作起点——身体朝第一个路点走时靠物理走下/落下树冠，
-        // 全程不传送。终点不享有这个兜底：目标点无路可走就该如实失败让上层换目标。
+        // 起点解析（第五轮放宽，【fix245】改身体可执行窗口）：NPC 可能正站在
+        // 树冠/细雪这类"旧判定算数、新判定不算"的表面上，脚格本身不算可站立
+        // 时需要把起点吸附到附近真地面。但旧版同列 ±6、横向只拦"低 3 格以上"
+        // 的放宽会把起点吸附到身体够不着的高处：86 棒新图实证——假人站在崖唇
+        // 下（头顶 1 格是唇块、脚格不算可站），起点被吸附到自己头顶 2 格的唇
+        // 顶，路径 found=true 却第一步永远执行不了，身体每 tick path-abort、
+        // 目标层每秒重派，246 次零位移（travel 的 fix202 无菌重规划同根）。
+        // 改为只吸附到身体一步可达的窗口：同列 dy 优先序 {0, +1, -1, -2, -3}
+        // （+1 跳得上、-3 落得下不摔伤），同列无合格格再横向 ±2 列同窗口取
+        // 三维距离最近者；窗口外一律不取——宁可如实判"起点不可站立"让上层
+        // 换法（travel 挖/搭、ascend 挖楼梯、生存层脱困都不依赖 A* 起点），
+        // 不再生成幻影路径。终点不享有这个兜底：目标点无路可走就该如实
+        // 失败让上层换目标。
         BlockPos safeStart = nearestStandableWide(level, start, 6, 2);
         if (safeStart == null) {
             return new Result(List.of(), 0, elapsedMillis(begin), "起点不可站立 " + start.toShortString());
@@ -459,12 +466,37 @@ public final class PathFinder {
     }
 
     /**
-     * 起点专用落脚解析：先同列上下找，再横向扩列兜底（见 find 里的说明）。
-     * 返回三维距离最近的可站立格；都找不到返回 null。
+     * 起点落脚解析的 dy 优先序（【fix245】身体可执行窗口）：0 是本格、
+     * +1 跳得上、-1/-2/-3 落得下不摔伤（与 {@link #MAX_DROP} 同口径）。
+     * 窗口之外的格（尤其头顶 +2 以上的崖唇/台顶）身体一步永远到不了，
+     * 吸附过去只会生成第一步必中断的幻影路径（见 find 里的说明）。
+     */
+    private static final int[] START_DY_ORDER = {0, 1, -1, -2, -3};
+
+    /** 在同一列里按 {@link #START_DY_ORDER} 找第一个可站立格；没有返回 null。 */
+    private static BlockPos resolveStartColumn(BlockGetter level, BlockPos pos) {
+        for (int dy : START_DY_ORDER) {
+            BlockPos cand = pos.above(dy);
+            if (isStandable(level, cand)) {
+                return cand;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 起点专用落脚解析：先同列按身体可执行窗口找，再横向扩列同窗口兜底
+     * （见 find 里的说明）。返回三维距离最近的可站立格；都找不到返回 null。
+     *
+     * <p>【fix245】旧版同列用 nearestStandable(±verticalRange) 上优先吸附、
+     * 横向格只拦低 3 格以上：身体上方的高格（崖唇顶、台顶）会被选作起点，
+     * 生成幻影路径。现同列与横向一律走 {@link #START_DY_ORDER} 窗口，
+     * fix7 的"横向不得低 3 格以上"由窗口下界 -3 天然包含；verticalRange
+     * 参数保留只为签名稳定，语义已被窗口取代。
      */
     private static BlockPos nearestStandableWide(BlockGetter level, BlockPos pos,
                                                  int verticalRange, int horizontalRange) {
-        BlockPos best = nearestStandable(level, pos, verticalRange);
+        BlockPos best = resolveStartColumn(level, pos);
         if (best != null) {
             return best;
         }
@@ -474,17 +506,8 @@ public final class PathFinder {
                 if (dx == 0 && dz == 0) {
                     continue;
                 }
-                BlockPos cand = nearestStandable(level, pos.offset(dx, 0, dz), verticalRange);
+                BlockPos cand = resolveStartColumn(level, pos.offset(dx, 0, dz));
                 if (cand == null) {
-                    continue;
-                }
-                // 横向锚点不得比起点低 3 格以上（fix7 长跑实测）：NPC 站在 5 格高的
-                // 树冠上、目标格就在正下方地面时，旧逻辑锚到地面格生成"1 节点幻影
-                // 路径"——起点与目标重合、A* 秒成，但身体与地面之间隔着树干树冠，
-                // 水平方向已经"到达"、垂直方向永远下不去，原地卡死。
-                // 超过合法下落高度（MAX_DROP=3）的横向格对身体就是不可达的，
-                // 宁可判无路让上层换目标，下树交给生存层的挖树叶脱困。
-                if (cand.getY() < pos.getY() - MAX_DROP) {
                     continue;
                 }
                 double sq = pos.distSqr(cand);

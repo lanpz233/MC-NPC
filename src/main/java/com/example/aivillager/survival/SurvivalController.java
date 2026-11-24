@@ -53,6 +53,15 @@ public final class SurvivalController {
      * 实测打一只骷髅要 40 秒、NPC 被白打十几下。
      */
     private static final int ATTACK_COOLDOWN_TICKS = 12;
+    /**
+     * 【fix341】近战抢吃压制窗：自卫出手后 30 tick 内不许重起进食。原版换手会重置
+     * 攻击蓄力（attackStrengthTicker），而抢吃循环每 tick 都把手换回食物、下一击
+     * 又换回武器——蓄力永远归零、属性也永远慢一拍，G1 实测进食中 28 击全为
+     * 0.75/1.73（fix163 已点火也无用）。压住重起、让武器在手里待满一个冷却，
+     * 下一击才是满蓄力满伤。窗长盖过一次攻击间隔（约 20 tick）并留 lag 余量；
+     * 威胁拉开/追击时无新出手，窗过即恢复间隙补食，不影响追击途中的进食。
+     */
+    private static final int MELEE_EAT_SUPPRESS_TICKS = 30;
     /** 装备检查间隔：每 3 次检查（约 1.5 秒）扫一次背包，换甲/换武器都要够快。 */
     private static final int ARMOR_CHECK_INTERVAL = 3;
     /** 死亡后多少生存层 tick 复活：每 tick 10 游戏 tick，4 tick ≈ 2 秒。 */
@@ -105,6 +114,8 @@ public final class SurvivalController {
     private BukkitTask task;
     /** 下一次可以攻击的游戏 tick（npc.tickCount 基准）。 */
     private int nextAttackTick;
+    /** 【fix341】上一次近战出手的游戏 tick：压制抢吃重起的计时基准（初始极小=从未出手）。 */
+    private int lastMeleeAttackTick = -10000;
     private int armorCheckTimer;
     /** 卡方块自救的计时器，与装备检查分开计数（两者节奏不同）。 */
     private int unstuckTimer;
@@ -144,6 +155,16 @@ public final class SurvivalController {
     private double fluidProgressShoreDist = -1.0D;
     /** 【fix194】最近一次由本层下发的游泳目标（岸格或 press 点），横挖朝向的依据。 */
     private net.minecraft.core.BlockPos fluidLastShore;
+    /**
+     * 【fix260】远岸扫描缓存：岩浆久困（checks≥8）且常规找岸（≤11 格）失败时，
+     * 节流做 12–32 格环形扩围找岸（下界浆湖动辄 50+ 格宽，湖心两把短尺都够
+     * 不着岸——111 棒生产实证 checks 2338+ 仍恒 null）。缓存以扫描时脚位为锚，
+     * 锚移 ≥3 格或超 10 秒即失效重扫；朝向兜底（48 格探岸向）同锚缓存。
+     */
+    private long lastFarShoreScanMillis;
+    private net.minecraft.core.BlockPos farShoreAnchor;
+    private net.minecraft.core.BlockPos farShoreCell;
+    private net.minecraft.core.BlockPos farHeadingDir;
     /** 【fix194】横挖向岸模式：朝岸向逐格挖穿岩壁、挖开即短跳游入。 */
     private boolean fluidLateral;
     private net.minecraft.core.BlockPos fluidLateralDir;
@@ -153,6 +174,18 @@ public final class SurvivalController {
     private boolean fluidPillar;
     private int fluidPillarPlaced;
     private long fluidPillarLastMillis;
+    /** 【fix312】挖岸连败计数：同一选向连续挖不开（田格被守卫拒／邻列全是水）时重选向。 */
+    private int fluidDigMissStreak;
+    /** 【fix314】垫柱连败计数：垫柱放置连续失败达 3 次即退出垫柱模式（兜底通则：模式必须有失败出口）。 */
+    private int fluidPillarFailStreak;
+    /** 【fix314】上次垫柱尝试的真实结果：节流窗内按此回执，失败不再无条件接管饿死挖岸臂。 */
+    private boolean fluidPillarLastOk = true;
+    /** 【fix314】游泳失败记账：最近一次下发游泳的目标岸与上一查游泳是否进行中。 */
+    private net.minecraft.core.BlockPos fluidSwimShore;
+    private boolean fluidSwimWasActive;
+    /** 【fix314】本集拉黑岸：同一岸游泳连败 ≥3 次后本集内选岸跳过它（真脱困随 resetFluidTrap 清）。 */
+    private net.minecraft.core.BlockPos fluidBadShore;
+    private int fluidBadShoreFails;
     /**
      * "原地不动"锚点与计数（第六轮补充·树干顶脱困）：水平离开锚点 2 格以上清零，
      * 垂直下落不算移动（逐层挖树干时每挖一层只落 1 格，不能被误判成"在动")。
@@ -165,7 +198,31 @@ public final class SurvivalController {
     /** 【fix70·D4】灭火倒水的位置与已过 tick：约 2.5 秒后把水收回桶（收不回不强求）。 */
     private net.minecraft.core.BlockPos douseWaterPos;
     private int douseAge;
+    /** 【fix255】着火找水灭火：找水目标、重算计数与无水日志节流。 */
+    private net.minecraft.core.BlockPos douseSeekTarget;
+    private int douseSeekTicks;
+    private long lastDouseSeekLogMillis;
     private boolean chasing;
+    /** 【fix238】追击连续立即中断计数：A* 找得到路、身体跳不上去（航点高出 2 格）时，
+     * 追击支每 tick 重发同一条走不上去的路会原地冻住（farm219：17 分钟 2185 条 abort）。
+     * 追击发出后 40 tick 内未走出 0.6 格即算一次"立即中断"，连续 3 次拉黑该怪 10 秒
+     * （走既有 ignoreThreat 口径），让目标层继续干活；拉黑过期后若威胁仍在且可达，
+     * 恢复正常追击。计数不用 chasing 标志——flee() 也复用它（~1764 行），
+     * 改用追击支自己的 issuance 记录（威胁 UUID + 发出 tick + 发出时位置）。 */
+    private java.util.UUID chaseAbortThreat;
+    private int chaseIssuedTick = -1000;
+    private net.minecraft.core.BlockPos chaseStartPos;
+    private int chaseAbortFails;
+    private static final int CHASE_ABORT_FAIL_LIMIT = 3;
+    private static final int CHASE_ABORT_WINDOW_TICKS = 40;
+    private static final double CHASE_ABORT_MOVE_SQ = 0.36D;
+    /** 【fix334】同一威胁连续追击超时：fix238 只计"40 tick 内一步没走出去"，
+     * 蜘蛛在头顶高台上漫游时 NPC 在下方两点间往返（farm222：17 分钟 2000+ 条追击，
+     * 只命中 1 次），每次重发都因"走出 0.6 格"把计数清零，守卫永不点火。
+     * 连续追击同一威胁超 120 秒（2400 tick，与 fix106 猎杀时限同值）仍未近身，
+     * 即拉黑 10 秒放行，让目标层恢复干活；进攻击距离或换怪时时钟重算。 */
+    private int chaseStartedTick = -1000;
+    private static final int CHASE_TIMEOUT_TICKS = 2400;
     private int deadTicks;
     private boolean deathLogged;
     /** 【第二十三轮】存活 tick 的最新血量：死亡现场行里的"最后一击前后血量"取它。 */
@@ -313,7 +370,11 @@ public final class SurvivalController {
             armorCheckTimer = 0;
             equipBetterArmor();
             equipShieldOffhand();
-            ensureBestWeaponInHand();
+            // 【fix379】定时挖掘中不换武器：镐要全程握在手里挖完这一格
+            // （战斗换武器走 fix163 专路，不受此限；进食换手会由身体层取消挖掘会话）。
+            if (!npc.isActivelyMining()) {
+                ensureBestWeaponInHand();
+            }
             // 换完武器再算评分，生存层要用它判断"现在打得过还是该跑"。
             cachedWeaponScore = weaponScore(npc.getMainHandItem());
             // 背包快照放在装备检查里：每 1.5 秒一次，死亡时最多丢 1.5 秒内的收入。
@@ -335,7 +396,88 @@ public final class SurvivalController {
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 放下盾（威胁解除）");
         }
 
+        // 【fix255】着火收尾：有水桶的倒水已在本 tick 前段处理；没水桶时
+        // 走向半径内最近的水面进水灭火（玩家第二反应）。#106/#107 实证
+        // 旧链上岸后只抢吃、站着烧死，此环此前不存在。有威胁时上方已
+        // return 先逃命；技能忙/游泳脱困/dryland 接管中不抢身（两死样本
+        // skill 均为 idle，技能自有中止面不受影响）。
+        if (seekWaterToDouse()) {
+            return;
+        }
+
         eat(false);
+    }
+
+    /**
+     * 【fix255】着火且无水可倒时，走向最近的水面格进水灭火。返回 true =
+     * 本 tick 已接管走位（跳过进食，火灭后自然恢复）。半径 16 内无水源
+     * 时不接管（站着靠抢吃回血硬扛，总比乱跑再遇险强），节流记一行。
+     */
+    private boolean seekWaterToDouse() {
+        // 【fix255b】人在岩浆里时绝不接管：浸浆中该由游泳脱困/dryland/倒水
+        // 层处置，走向远处水源等于在浆里步行送死——实验场 boot-lab105b
+        // 实证：douse 成黑曜石后 ascend 挖掉脚下黑曜石、人落回浆中，
+        // 本环抢发 walkTo 与游泳层对冲，hp 16 三秒内在浆中走到 1 致死。
+        if (npc.getRemainingFireTicks() <= 0 || npc.isInWater() || npc.isInLava()
+                || hasInventoryItem("water_bucket")
+                || npc.isSwimmingEscape()
+                || !"idle".equals(skills.currentSkill())) {
+            douseSeekTarget = null;
+            douseSeekTicks = 0;
+            return false;
+        }
+        if (douseSeekTarget == null || ++douseSeekTicks % 20 == 1) {
+            net.minecraft.core.BlockPos found = findWaterCell(16);
+            if (found == null) {
+                long now = System.currentTimeMillis();
+                if (now - lastDouseSeekLogMillis >= 5_000L) {
+                    lastDouseSeekLogMillis = now;
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 着火找水：半径 16 内无水源"
+                            + " | pos=" + npc.blockPosition().toShortString()
+                            + " 火tick=" + npc.getRemainingFireTicks());
+                }
+                douseSeekTarget = null;
+                return false;
+            }
+            if (!found.equals(douseSeekTarget)) {
+                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 着火找水灭火 | 目标="
+                        + found.toShortString() + " pos=" + npc.blockPosition().toShortString()
+                        + " hp=" + String.format(Locale.ROOT, "%.1f", npc.getHealth()));
+            }
+            douseSeekTarget = found;
+        }
+        npc.walkTo(new net.minecraft.world.phys.Vec3(
+                douseSeekTarget.getX() + 0.5D, douseSeekTarget.getY(),
+                douseSeekTarget.getZ() + 0.5D), false, null);
+        return true;
+    }
+
+    /** 半径内最近的水面格（水格本身、头顶无碰撞可进）。 */
+    private net.minecraft.core.BlockPos findWaterCell(int radius) {
+        net.minecraft.core.BlockPos from = npc.blockPosition();
+        net.minecraft.core.BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (int dy = -2; dy <= 1; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    net.minecraft.core.BlockPos pos = from.offset(dx, dy, dz);
+                    if (!npc.level().getBlockState(pos).is(
+                            net.minecraft.world.level.block.Blocks.WATER)) {
+                        continue;
+                    }
+                    if (!npc.level().getBlockState(pos.above()).getCollisionShape(
+                            npc.level(), pos.above()).isEmpty()) {
+                        continue;
+                    }
+                    double sq = from.distSqr(pos);
+                    if (sq < bestSq) {
+                        bestSq = sq;
+                        best = pos.immutable();
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     /**
@@ -608,9 +750,16 @@ public final class SurvivalController {
                     resetFluidTrap();
                 }
             } else if (fluidDryChecks >= 15
-                    || (feet.getX() - fluidTrapAnchor.getX()) * (feet.getX() - fluidTrapAnchor.getX())
+                    || ((feet.getX() - fluidTrapAnchor.getX()) * (feet.getX() - fluidTrapAnchor.getX())
                             + (feet.getZ() - fluidTrapAnchor.getZ())
                                     * (feet.getZ() - fluidTrapAnchor.getZ()) >= 9
+                            // 【fix260c】远岸长游进行中不走「走开 ≥3 格」清零：浆面
+                            // 浮沉时 isInLava 会瞬时翻假、脚格读空，长游刚出 3 格
+                            // 就被当成已脱困、整组计数与远岸缓存被清、重爬 8 查
+                            // 再扫（boot-lab111d 实证 28 格游程被切成多段空耗）。
+                            // 远岸/朝向目标在手时只认 15 查真干与爬高 +2 两条真
+                            // 脱困口径；短程旧行为（无远岸目标）一字不变。
+                            && farShoreCell == null && farHeadingDir == null)
                     || feet.getY() >= fluidTrapSurfaceY + 2) {
                 resetFluidTrap();
             }
@@ -662,6 +811,34 @@ public final class SurvivalController {
                                 + (feet.getZ() - fluidTrapAnchor.getZ())
                                         * (feet.getZ() - fluidTrapAnchor.getZ()) < 9) {
                     fluidStuckChecks++;
+                    // 【fix256】涉水支对岩浆补游泳下发：涉水早退本为水里蹚水设计，
+                    // 岩浆没有「蹚过去」一说——站在 1 格深浆里不动时旧版只有挖岸/
+                    // 挖顶臂，宽浆面（挖向 10 格内无旱地）下永不下发游泳（105 棒
+                    // 实验场实证：站浆 29 秒零游泳下发、只有挖岸臂）。计数与挖岸
+                    // 臂同门槛（≥12∧静止≥5）才补发，不干扰正常涉水与短暂触浆；
+                    // 水体口径完全不变。下发守卫与深水支同口径（dryland 接管中
+                    // 不抢身、岩浆重发冷却 1 秒）。
+                    if (!isWater && fluidStuckChecks >= 12 && stillChecks >= 5) {
+                        boolean drylandActiveW = "dryland".equals(skills.currentSkill());
+                        long nowW = System.currentTimeMillis();
+                        if (!drylandActiveW && !npc.isSwimmingEscape()
+                                && nowW - lastSwimIssueMillis >= 1_000L) {
+                            lastSwimIssueMillis = nowW;
+                            net.minecraft.core.BlockPos shoreW = findShoreCell(feet, 11);
+                            if (shoreW != null) {
+                                fluidLastShore = shoreW;
+                                npc.swimTo(shoreW);
+                                LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                        + " 站浆涉水补发游泳（fix256） | pos=" + feet.toShortString()
+                                        + " 岸边=" + shoreW.toShortString());
+                            } else {
+                                npc.swimUp();
+                                LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                        + " 站浆涉水补发游泳（fix256）：附近无岸，先上浮 | pos="
+                                        + feet.toShortString());
+                            }
+                        }
+                    }
                     if (fluidStuckChecks >= 12 && stillChecks >= 5
                             && fluidStuckChecks % 2 == 0) {
                         if (!fluidEscapeDirPicked) {
@@ -674,17 +851,72 @@ public final class SurvivalController {
                         }
                         boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
                         if (dug) {
+                            fluidDigMissStreak = 0;
                             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
                                     + fluidName + " pos=" + feet.toShortString()
                                     + " dir=" + (fluidEscapeDir == null ? "above"
                                             : fluidEscapeDir.toShortString()));
                         } else {
+                            fluidDigMissStreak++;
                             logEscapeDigMiss(fluidName, feet);
+                        }
+                        // 【fix312】挖岸连败断路：同一选向连续 3 次挖不开即清闩重选
+                        // （田格被守卫拒／邻列全是水时旧版永久 miss）；涉水支另有
+                        // 游泳兜底（见下），须先记下连败态再清零。
+                        boolean digHopeless = fluidDigMissStreak >= 3;
+                        if (digHopeless) {
+                            fluidDigMissStreak = 0;
+                            fluidEscapeDirPicked = false;
+                            fluidEscapeDir = null;
+                            LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                    + " fluid-escape-dig-repick（fix312） | fluid="
+                                    + fluidName + " pos=" + feet.toShortString()
+                                    + " why=挖岸连败 3 次");
+                        }
+                        // 【fix312】涉水支游泳兜底：1 格深水里只有挖岸臂；挖岸连败
+                        // （方向无田可挖或邻列全是水）时横游到最近非田岸——
+                        // 159 北缘档即此几何，旧版只有挖岸臂、永久 miss。
+                        if (digHopeless && !npc.isSwimmingEscape()
+                                && System.currentTimeMillis() - lastSwimIssueMillis >= 4_000L) {
+                            net.minecraft.core.BlockPos shore =
+                                    findShoreCellWithHinterland(feet, 11);
+                            if (shore != null) {
+                                lastSwimIssueMillis = System.currentTimeMillis();
+                                fluidLastShore = shore;
+                                npc.swimTo(shore);
+                                LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                        + " 涉水脱困游泳兜底（fix312） | fluid=" + fluidName
+                                        + " pos=" + feet.toShortString()
+                                        + " 岸边=" + shore.toShortString());
+                            }
                         }
                     }
                 }
                 return;
             }
+            // 【fix314】游泳失败记账：上一次下发的游泳已结束（超时/被技能抢身）
+            // 而人仍在深水里 = 目标岸一次失败；同一岸连败 3 次本集拉黑（选岸
+            // 跳过，见 findShoreCell/findShoreCellWithHinterland/findFarShoreCell），
+            // 防同一不可达岸被无限重发（166 棒生产 L1：同岸 swim-timeout 循环
+            // 约 20 分钟、零位移）。游到岸并真离水者走上方干清/resetFluidTrap，
+            // 不进本分支、不会误记。
+            boolean swimmingNow = npc.isSwimmingEscape();
+            if (fluidSwimWasActive && !swimmingNow && fluidSwimShore != null) {
+                if (fluidSwimShore.equals(fluidBadShore)) {
+                    fluidBadShoreFails++;
+                } else {
+                    fluidBadShore = fluidSwimShore;
+                    fluidBadShoreFails = 1;
+                }
+                if (fluidBadShoreFails == 3) {
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                            + " fluid-swim-shore-blacklist（fix314） | fluid=" + fluidName
+                            + " pos=" + feet.toShortString()
+                            + " shore=" + fluidBadShore.toShortString() + " fails=3");
+                }
+                fluidSwimShore = null;
+            }
+            fluidSwimWasActive = swimmingNow;
             if (fluidTrapAnchor == null) {
                 fluidTrapAnchor = feet.immutable();
                 fluidTrapSurfaceY = fluidSurfaceY(feet);
@@ -711,30 +943,62 @@ public final class SurvivalController {
             // ② 刚下发过游泳（4 秒内）就别重发：别的技能把游泳顶掉后，给它一个观察窗。
             boolean drylandActive = "dryland".equals(skills.currentSkill());
             long now = System.currentTimeMillis();
+            // 【fix248】岩浆里重发冷却 4 秒→1 秒：岩浆可用窗口只有数秒，
+            // 游泳目标被抢身清掉后等满 4 秒等于烧死（#92/#93 定谳）；水域
+            // 不致命，维持 4 秒防刷屏口径不变。
+            // 【fix314】水域已升级被困（checks≥12）时重发冷却 4 秒→1 秒（fix248
+            // 岩浆同款口径）：游泳被目标层行走命令抢身清掉后，等满 4 秒等于把
+            // 每次脱困窗口切碎（166 棒生产 L1 定谳）；未升级的普通落水维持
+            // 4 秒防刷屏口径不变。
+            long swimReissueMillis = isWater
+                    ? (fluidStuckChecks >= 12 ? 1_000L : 4_000L) : 1_000L;
             if (!drylandActive && !npc.isSwimmingEscape()
-                    && now - lastSwimIssueMillis >= 4_000L) {
+                    && now - lastSwimIssueMillis >= swimReissueMillis) {
                 lastSwimIssueMillis = now;
                 // 找岸按被困时长逐步扩围（第四轮修复 B）：旧版只找 ±3 格且不看岸高，
                 // 陡岸水塘边明明 5 格外就有缓坡（长跑1 实测）却永远够不着；
                 // 现在候选必须是"贴水面、最多高 1 格"的真岸（PathFinder.isShoreCell），
                 // 找不到就沿岸横向扩围找缓坡，而不是对着崖壁干游。
                 int shoreRadius = fluidStuckChecks <= 3 ? 4 : fluidStuckChecks <= 8 ? 7 : 11;
-                net.minecraft.core.BlockPos shore = findShoreCell(feet, shoreRadius);
+                // 【fix301a】水域选岸加后路判据：只认连着陆地的真岸
+                // （findShoreCellWithHinterland），1 格孤岛／洞壁小台不再当上岸点
+                // （151 棒生产定谳：最近岸恒为死路小台，游上去又跌回，空腔循环）。
+                // 岩浆支保持原口径（孤岛在浆里是保命落脚点，另有 fix260 远岸臂）。
+                net.minecraft.core.BlockPos shore = isWater
+                        ? findShoreCellWithHinterland(feet, shoreRadius)
+                        : findShoreCell(feet, shoreRadius);
                 if (shore != null) {
                     fluidLastShore = shore;
+                    fluidSwimShore = shore;
                     npc.swimTo(shore);
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，游泳上岸 | fluid="
+                            + fluidName + " pos=" + feet.toShortString() + " 岸边=" + shore.toShortString());
+                } else if (fluidStuckChecks >= 8
+                        && issueFarShoreSwim(feet, fluidName, now)) {
+                    // 【fix301b】远岸兜底对水域同样开放（原只限岩浆，!isWater 门已去）：
+                    // 11 格内无连陆真岸时，12–32 环找远岸，无则 8 向×48 格探干地方向
+                    // 分段游。岩浆支行为不变（fix260 原口径）。
+                } else if (isWater && fluidStuckChecks >= 12
+                        && (shore = findShoreCell(feet, shoreRadius)) != null) {
+                    // 【fix301c】最后兜底：48 格内无任何陆地方向、远岸亦空时，孤岛
+                    // 仍比泡在水里强（站上去后 fix194 挖岸／垫柱臂可接管）。
+                    fluidLastShore = shore;
+                    fluidSwimShore = shore;
+                    npc.swimTo(shore);
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，游泳上岸（孤岛兜底，fix301） | fluid="
                             + fluidName + " pos=" + feet.toShortString() + " 岸边=" + shore.toShortString());
                 } else if (fluidStuckChecks >= 12 && fluidEscapeDir != null && stillChecks >= 5) {
                     // 没有能爬的岸：朝岸壁方向贴过去，配合下面的挖岸台阶脱困。
                     fluidLastShore = feet.offset(
                             fluidEscapeDir.getX() * 3, 0, fluidEscapeDir.getZ() * 3);
+                    fluidSwimShore = null;
                     npc.swimTo(fluidLastShore);
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-press | fluid="
                             + fluidName + " pos=" + feet.toShortString()
                             + " dir=" + fluidEscapeDir.toShortString());
                 } else {
                     // 附近没找到岸：先原地上浮到水面，别沉底，之后由技能层想办法靠岸。
+                    fluidSwimShore = null;
                     npc.swimUp();
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 落入流体，附近无岸，先上浮 | fluid="
                             + fluidName + " pos=" + feet.toShortString());
@@ -776,6 +1040,9 @@ public final class SurvivalController {
                         fluidLateral = false;
                         fluidPillar = true;
                         fluidPillarPlaced = 0;
+                        fluidPillarFailStreak = 0;
+                        fluidPillarLastOk = true;
+                        fluidPillarLastMillis = 0L;
                         fluidProgressMillis = nowMs;
                         LOG.info("[AIV][SURVIVAL] " + npc.npcName()
                                 + " fluid-escape-pillar start | fluid=" + fluidName
@@ -798,6 +1065,9 @@ public final class SurvivalController {
                         } else {
                             fluidPillar = true;
                             fluidPillarPlaced = 0;
+                            fluidPillarFailStreak = 0;
+                            fluidPillarLastOk = true;
+                            fluidPillarLastMillis = 0L;
                             LOG.info("[AIV][SURVIVAL] " + npc.npcName()
                                     + " fluid-escape-pillar start | fluid=" + fluidName
                                     + " pos=" + feet.toShortString()
@@ -817,15 +1087,47 @@ public final class SurvivalController {
             // 有岸壁方向就贴墙把水面以上两格挖成台阶口，挖通后那一格自然成为合格的岸，
             // 上面的找岸逻辑会把 NPC 领进去站稳；全淹洞穴没有岸壁方向时挖头顶开气腔。
             // 只挖和走，全程无传送。挖岸节奏约 2 秒一次，给身体留出贴墙/上浮的时间。
+            // 【fix260d】选向 null 重探：选向闩是一次性闩，湖心首选时岸壁在
+            // 10 格外、恒选 null 且永不重试——fix260 的朝向分段游把人送到岸根
+            // 后，挖岸臂仍拿着旧 null 只会挖头顶（boot-lab111e 实证：人已贴
+            // 岸根、dir 恒 above）。已选 null 者每 10 查重探一次，探到即改锁
+            // 真方向；已锁真方向者不重探（方向稳定性口径不变）。
+            if (fluidEscapeDirPicked && fluidEscapeDir == null
+                    && fluidStuckChecks >= 12 && fluidStuckChecks % 10 == 0) {
+                net.minecraft.core.BlockPos repick = pickFluidEscapeDir(feet);
+                if (repick != null) {
+                    fluidEscapeDir = repick;
+                    LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                            + " fluid-escape-dig repick（fix260） | fluid=" + fluidName
+                            + " pos=" + feet.toShortString()
+                            + " dir=" + repick.toShortString());
+                }
+            }
             if (!fluid194Handled && fluidStuckChecks >= 12 && fluidStuckChecks % 2 == 0 && stillChecks >= 5) {
                 boolean dug = fluidEscapeDir != null ? digBankStep(feet) : npc.digOutAbove();
                 if (dug) {
+                    fluidDigMissStreak = 0;
+                    // 【fix314】挖岸挖通同样是推进，刷新 fix194 推进看门狗
+                    // （与横挖同口径，防正在开台阶时被误转垫柱）。
+                    fluidProgressMillis = System.currentTimeMillis();
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-dug | fluid="
                             + fluidName + " pos=" + feet.toShortString()
                             + " dir=" + (fluidEscapeDir == null ? "above"
                                     : fluidEscapeDir.toShortString()));
                 } else if (fluidEscapeDirPicked) {
+                    fluidDigMissStreak++;
                     logEscapeDigMiss(fluidName, feet);
+                    // 【fix312】挖岸连败断路：同一选向连续 3 次挖不开即清闩重选
+                    // （田格被守卫拒／邻列全是水时旧版永久 miss）。
+                    if (fluidDigMissStreak >= 3) {
+                        fluidDigMissStreak = 0;
+                        fluidEscapeDirPicked = false;
+                        fluidEscapeDir = null;
+                        LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                                + " fluid-escape-dig-repick（fix312） | fluid="
+                                + fluidName + " pos=" + feet.toShortString()
+                                + " why=挖岸连败 3 次");
+                    }
                 }
             } else if (!fluid194Handled && fluidStuckChecks >= 3 && fluidStuckChecks % 5 == 3 && npc.digOutAbove()) {
                 // 未进入挖岸阶段前的旧升级：泡约 3 秒先试挖头顶（被水洞顶盖住时凿开继续上浮）。
@@ -914,6 +1216,14 @@ public final class SurvivalController {
                     if (!PathFinder.isShoreCell(npc.level(), cand)) {
                         continue;
                     }
+                    // 【fix312】田岸不作游泳目标（见 isFarmBankCell）。
+                    if (isFarmBankCell(cand)) {
+                        continue;
+                    }
+                    // 【fix314】本集拉黑岸不作游泳目标（同岸游泳连败 ≥3 次）。
+                    if (fluidBadShoreFails >= 3 && cand.equals(fluidBadShore)) {
+                        continue;
+                    }
                     double sq = feet.distSqr(cand);
                     if (sq < bestSq) {
                         bestSq = sq;
@@ -923,6 +1233,205 @@ public final class SurvivalController {
             }
         }
         return best;
+    }
+
+    /**
+     * 【fix301a】水域选岸：只认连着陆地的真岸（与 {@link #findShoreCell} 同扫描、
+     * 同半径档、同最近口径），多一层后路判据：岸格 2 格内（切比雪夫 ≤2、
+     * dy −1..+1）须有一块可站立的干燥格，且该格本身不是岸格（四邻无表面
+     * 流体）——即岸后至少还有一格陆地。1 格孤岛／洞壁小台／2 格窄条无此
+     * 后路，返回 null，由调用方落入远岸兜底（fix301b）或孤岛最后兜底
+     * （fix301c）。岩浆支不走本方法（见调用处 isWater 门）。
+     */
+    private net.minecraft.core.BlockPos findShoreCellWithHinterland(
+            net.minecraft.core.BlockPos feet, int radius) {
+        net.minecraft.core.BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                for (int dy = -3; dy <= 3; dy++) {
+                    net.minecraft.core.BlockPos cand = feet.offset(dx, dy, dz);
+                    if (cand.equals(feet)) {
+                        continue;
+                    }
+                    if (!PathFinder.isShoreCell(npc.level(), cand)) {
+                        continue;
+                    }
+                    // 【fix312】田岸不作游泳目标（见 isFarmBankCell）。
+                    if (isFarmBankCell(cand)) {
+                        continue;
+                    }
+                    // 【fix314】本集拉黑岸不作游泳目标（同岸游泳连败 ≥3 次）。
+                    if (fluidBadShoreFails >= 3 && cand.equals(fluidBadShore)) {
+                        continue;
+                    }
+                    if (!hasDryHinterland(cand)) {
+                        continue;
+                    }
+                    double sq = feet.distSqr(cand);
+                    if (sq < bestSq) {
+                        bestSq = sq;
+                        best = cand.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 【fix301a】岸格有没有后路：2 格内（切比雪夫 ≤2、dy −1..+1）存在一块
+     * 可站立干燥格，且该格本身不是岸格。孤岛四周 2 格内只有水／空气／孤岛
+     * 本身，故返回 false；连陆的岸边 1–2 格内必有干燥非岸格，返回 true。
+     */
+    private boolean hasDryHinterland(net.minecraft.core.BlockPos shoreCell) {
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    net.minecraft.core.BlockPos cand = shoreCell.offset(dx, dy, dz);
+                    if (cand.equals(shoreCell)) {
+                        continue;
+                    }
+                    if (!PathFinder.isStandable(npc.level(), cand)) {
+                        continue;
+                    }
+                    if (!npc.level().getBlockState(cand).getFluidState().isEmpty()) {
+                        continue;
+                    }
+                    if (PathFinder.isShoreCell(npc.level(), cand)) {
+                        continue;
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 【fix260】岩浆宽湖的远岸下发：常规找岸（≤11 格）失败且久困（checks≥8）时调用。
+     * 先查 12–32 格环形扩围内的真岸（{@link PathFinder#isShoreCell} 同判据），
+     * 命中即定向长游；无真岸则退朝向兜底：8 向 ×48 格探第一列可站立旱地定
+     * 朝向，朝该向 8 格处分段游（leapfrog），每次重发按新位置重算——任意有
+     * 限宽浆湖必达岸根，岸根 10 格内既有挖岸/找岸臂接管切台阶上岸。
+     * 扫描有成本（环扫约 1.3 万格判据），以脚位为锚缓存、10 秒节流：锚移
+     * ≥3 格视为失效。返回是否已下发游泳（false 时上层落回 press/上浮旧臂）。
+     */
+    private boolean issueFarShoreSwim(net.minecraft.core.BlockPos feet, String fluidName,
+            long now) {
+        // 【fix260b】远岸一旦扫到就恒有效（岸格不会动），游到/真脱困清零前不因
+        // 脚位漂移作废：首测实证 NPC 游出 2.5 格即越过「锚移 ≥3 格失效」线、
+        // 远岸下发被自家缓存口径掐掉（boot-lab111b）。重扫只在「尚无远岸」时
+        // 按 10 秒节流做；朝向按当下脚位逐发重算（探岸向扫描较廉且分段游
+        // 本就逐段逼近），同以 10 秒节流防技能层高频清目标时的连扫。
+        if (farShoreCell == null && now - lastFarShoreScanMillis >= 10_000L) {
+            lastFarShoreScanMillis = now;
+            farShoreAnchor = feet.immutable();
+            farShoreCell = findFarShoreCell(feet, 32);
+            farHeadingDir = farShoreCell == null ? pickFarLandDir(feet) : null;
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 远岸扫描（fix260） | fluid="
+                    + fluidName + " pos=" + feet.toShortString()
+                    + " far=" + (farShoreCell == null ? "none" : farShoreCell.toShortString())
+                    + " heading=" + (farHeadingDir == null ? "none"
+                            : farHeadingDir.toShortString()));
+        }
+        if (farShoreCell != null) {
+            fluidLastShore = farShoreCell;
+            fluidSwimShore = farShoreCell;
+            npc.swimTo(farShoreCell);
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 远岸定向游泳（fix260） | fluid="
+                    + fluidName + " pos=" + feet.toShortString()
+                    + " 岸边=" + farShoreCell.toShortString());
+            return true;
+        }
+        if (farHeadingDir != null) {
+            net.minecraft.core.BlockPos leap = feet.offset(
+                    farHeadingDir.getX() * 8, 0, farHeadingDir.getZ() * 8);
+            fluidSwimShore = null;
+            npc.swimTo(leap);
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 朝向探岸分段游（fix260） | fluid="
+                    + fluidName + " pos=" + feet.toShortString()
+                    + " dir=" + farHeadingDir.toShortString()
+                    + " 目标=" + leap.toShortString());
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 【fix260】环形扩围找岸：从 12 格环起逐环外扩到 maxRadius，命中环内取
+     * 欧氏最近者即返（真岸判据同 {@link #findShoreCell}）。逐环早退把成本压
+     * 在命中环以内；全空才扫满（约 1.3 万格），调用方已做 10 秒节流。
+     */
+    private net.minecraft.core.BlockPos findFarShoreCell(net.minecraft.core.BlockPos feet,
+            int maxRadius) {
+        for (int r = 12; r <= maxRadius; r++) {
+            net.minecraft.core.BlockPos best = null;
+            double bestSq = Double.MAX_VALUE;
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
+                        continue;
+                    }
+                    for (int dy = -3; dy <= 3; dy++) {
+                        net.minecraft.core.BlockPos cand = feet.offset(dx, dy, dz);
+                        if (!PathFinder.isShoreCell(npc.level(), cand)) {
+                            continue;
+                        }
+                        // 【fix312】田岸不作远岸目标（见 isFarmBankCell）。
+                        if (isFarmBankCell(cand)) {
+                            continue;
+                        }
+                        // 【fix314】本集拉黑岸不作远岸目标（同岸游泳连败 ≥3 次）。
+                        if (fluidBadShoreFails >= 3 && cand.equals(fluidBadShore)) {
+                            continue;
+                        }
+                        double sq = feet.distSqr(cand);
+                        if (sq < bestSq) {
+                            bestSq = sq;
+                            best = cand.immutable();
+                        }
+                    }
+                }
+            }
+            if (best != null) {
+                return best;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 【fix260】远距探岸向：{@link #pickFluidEscapeDir} 的放宽程距版（8 向
+     * ×48 格找第一列可站立旱地），只用来定游泳朝向、不作挖岸方向（挖岸仍
+     * 走 10 格原臂，抵岸根后它自己会选向）。
+     */
+    private net.minecraft.core.BlockPos pickFarLandDir(net.minecraft.core.BlockPos feet) {
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        net.minecraft.core.BlockPos bestDir = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int[] d : dirs) {
+            for (int step = 1; step <= 48; step++) {
+                net.minecraft.core.BlockPos col = feet.offset(d[0] * step, 0, d[1] * step);
+                boolean land = false;
+                for (int dy = -2; dy <= 6 && !land; dy++) {
+                    net.minecraft.core.BlockPos cand = col.offset(0, dy, 0);
+                    if (PathFinder.isStandable(npc.level(), cand)
+                            && npc.level().getBlockState(cand).getFluidState().isEmpty()
+                            && !isFarmBankCell(cand)) {
+                        land = true;
+                    }
+                }
+                if (land) {
+                    if (step < bestDist) {
+                        bestDist = step;
+                        bestDir = new net.minecraft.core.BlockPos(d[0], 0, d[1]);
+                    }
+                    break;
+                }
+            }
+        }
+        return bestDir;
     }
 
     /** 流体被困记账整组清零（计数/方向/集锚/选向闩）。 */
@@ -940,6 +1449,19 @@ public final class SurvivalController {
         fluidLateralFailStreak = 0;
         fluidPillar = false;
         fluidPillarPlaced = 0;
+        fluidDigMissStreak = 0;
+        // 【fix314】垫柱连败/回执与游泳失败记账随真脱困一并清零，下一集重新计。
+        fluidPillarFailStreak = 0;
+        fluidPillarLastOk = true;
+        fluidSwimShore = null;
+        fluidSwimWasActive = false;
+        fluidBadShore = null;
+        fluidBadShoreFails = 0;
+        // 【fix260】远岸扫描缓存随真脱困一并清零，下一集重新探岸。
+        lastFarShoreScanMillis = 0L;
+        farShoreAnchor = null;
+        farShoreCell = null;
+        farHeadingDir = null;
     }
 
     /**
@@ -967,7 +1489,8 @@ public final class SurvivalController {
      * 身前全是水/空气（不在墙边）返回 null，调用方直转垫柱。
      */
     private net.minecraft.core.BlockPos pickLateralDir(net.minecraft.core.BlockPos feet) {
-        if (fluidLastShore != null) {
+        // 【fix312】上次游泳目标是田岸时不复用（田岸爬不上去，见 isFarmBankCell）。
+        if (fluidLastShore != null && !isFarmBankCell(fluidLastShore)) {
             int dx = fluidLastShore.getX() - feet.getX();
             int dz = fluidLastShore.getZ() - feet.getZ();
             if (dx != 0 || dz != 0) {
@@ -983,6 +1506,10 @@ public final class SurvivalController {
             net.minecraft.core.BlockPos cell = feet.offset(d[0], 0, d[1]);
             net.minecraft.world.level.block.state.BlockState st = npc.level().getBlockState(cell);
             if (st.isAir() || !st.getFluidState().isEmpty()) {
+                continue;
+            }
+            // 【fix312】身前是田岸时不朝田横挖（田土被守卫拒，见 isFarmBankCell）。
+            if (isFarmBankCell(cell)) {
                 continue;
             }
             float hardness = st.getDestroySpeed(npc.level(), cell);
@@ -1034,6 +1561,10 @@ public final class SurvivalController {
         if (dug || allOpen) {
             if (dug) {
                 fluidLateralFailStreak = 0;
+                // 【fix314】挖通本身就是推进：刷新 fix194 推进看门狗，防横挖
+                // 正在逐格开隧道（身体暂未位移）时被 15 秒无推进误转垫柱
+                // （166 棒生产 L1：横挖挖通 1 格后恰 15 秒转垫柱、其后全锁）。
+                fluidProgressMillis = nowMs;
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-lateral-dug | fluid="
                         + fluidName + " pos=" + feet.toShortString()
                         + " dir=" + fluidLateralDir.toShortString());
@@ -1046,6 +1577,9 @@ public final class SurvivalController {
                 fluidLateral = false;
                 fluidPillar = true;
                 fluidPillarPlaced = 0;
+                fluidPillarFailStreak = 0;
+                fluidPillarLastOk = true;
+                fluidPillarLastMillis = 0L;
                 fluidProgressMillis = nowMs;
                 LOG.info("[AIV][SURVIVAL] " + npc.npcName()
                         + " fluid-escape-pillar start | fluid=" + fluidName
@@ -1074,19 +1608,41 @@ public final class SurvivalController {
      * 【fix194】垫柱一轮（约 1.5 秒节流）：委托 SkillRunner 在脚下垫一格并上浮
      * 顶升。放成功返回 true（本 tick 已接管）；无料/无支撑返回 false——不接管，
      * 让旧臂（挖岸/挖顶）在同一 tick 的升级槽照常试，垫柱下轮再来。
+     *
+     * <p>【fix314】两处收口（166 棒生产 L1 定谳：田下水穴里垫柱 target 恰是
+     * 穴底实心块、恒失败，而旧版节流窗无条件返回 true 接管、垫柱模式又只有
+     * 真脱困才退出，挖岸臂被饿死约 20 分钟）：①节流窗回上次尝试的真实结果
+     * （fluidPillarLastOk），失败后不接管、挖岸臂照常轮转；②连续失败 3 次
+     * 退出垫柱模式并留行，模式必须有失败出口（兜底通则）——退出后推进
+     * 看门狗重置，横挖/挖岸臂重新获得窗口；若地形真适合垫柱，横挖再败后
+     * 仍会重新转入垫柱，不是一次拉黑。
      */
     private boolean fluidPillarStep(String fluidName, long nowMs) {
         if (nowMs - fluidPillarLastMillis < 1_500L) {
-            return true;
+            return fluidPillarLastOk;
         }
         fluidPillarLastMillis = nowMs;
         if (skills.placeFluidPillarStep()) {
             fluidPillarPlaced++;
+            fluidPillarFailStreak = 0;
+            fluidPillarLastOk = true;
+            fluidProgressMillis = nowMs;
             npc.swimUp();
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " fluid-escape-pillar | fluid="
                     + fluidName + " placed=" + fluidPillarPlaced
                     + " pos=" + npc.blockPosition().toShortString());
             return true;
+        }
+        fluidPillarLastOk = false;
+        fluidPillarFailStreak++;
+        if (fluidPillarFailStreak >= 3) {
+            fluidPillar = false;
+            fluidPillarFailStreak = 0;
+            fluidProgressMillis = nowMs;
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName()
+                    + " fluid-escape-pillar giveup（fix314） | fluid=" + fluidName
+                    + " pos=" + npc.blockPosition().toShortString()
+                    + " why=垫柱连续失败 3 次，退出垫柱模式放挖岸/横挖臂重进");
         }
         return false;
     }
@@ -1106,9 +1662,23 @@ public final class SurvivalController {
     }
 
     /**
+     * 【fix312】该候选是不是"自家田岸"：田是最贴水的"岸"，却爬不上去
+     * （田面比水面高约 2 格，游泳跳不上去，swim-timeout 循环）、也挖不得
+     * （fix311 守卫拦土格）。玩家做法是横游到田边以外的岸。候选格本身
+     * 或其下方支撑格是注册田土格即视为田岸——岸格本身常是田土上方的空气
+     * （如 (122,62,57) 之于田土 (122,61,57)），只查本身会漏判。
+     */
+    private boolean isFarmBankCell(net.minecraft.core.BlockPos cand) {
+        com.example.aivillager.goals.FarmMemory.bindWorld(npc.level());
+        return com.example.aivillager.goals.FarmMemory.isFarmSoilCell(npc.npcName(), cand)
+                || com.example.aivillager.goals.FarmMemory.isFarmSoilCell(npc.npcName(), cand.below());
+    }
+
+    /**
      * 选挖岸脱困的方向（第四轮修复 B）：8 个水平方向逐格外探 10 格，
      * 哪边先碰到"可站立的旱地列"（任意高度，是岸壁就行）就朝哪边挖。
      * 10 格内全是水/虚空（全淹洞穴、湖心）返回 null，改走挖头顶路线。
+     * 【fix312】田格不算陆地：某列首个可站立格是田土时沿该方向继续外探。
      */
     private net.minecraft.core.BlockPos pickFluidEscapeDir(net.minecraft.core.BlockPos feet) {
         int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
@@ -1121,7 +1691,8 @@ public final class SurvivalController {
                 for (int dy = -2; dy <= 6 && !land; dy++) {
                     net.minecraft.core.BlockPos cand = col.offset(0, dy, 0);
                     if (PathFinder.isStandable(npc.level(), cand)
-                            && npc.level().getBlockState(cand).getFluidState().isEmpty()) {
+                            && npc.level().getBlockState(cand).getFluidState().isEmpty()
+                            && !isFarmBankCell(cand)) {
                         land = true;
                     }
                 }
@@ -1203,6 +1774,10 @@ public final class SurvivalController {
         resetFluidTrap();
         fleeing = false;
         chasing = false;
+        // 【fix238】复活清掉追击中断计数，死前那只怪不带到下一条命。
+        chaseAbortFails = 0;
+        chaseAbortThreat = null;
+        chaseStartedTick = -1000;
         fleeCooldown = 0;
         npc.stopWalking();
         // 死亡后 ServerPlayer 会被摘出实体表。先清 removed 标记再重新挂回去，
@@ -1257,30 +1832,19 @@ public final class SurvivalController {
      */
     private BlockPos findBedRespawnStand(net.minecraft.server.level.ServerLevel mainLevel) {
         try {
-            BaseMemory.bindWorld(mainLevel);
-            BaseMemory.Base base = BaseMemory.base(npc.npcName());
-            if (base == null || base.bedPos() == null) {
+            // 【fix265】床账重验前置（BaseMemory.revalidateBed）：账本床格验真
+            // （含 fix174 强制加载区块，防未加载误判）、不在则扫锚点近傍现成
+            // 床重新登记、扫不到才失效账本——取代旧版「base/bedPos 为空或单次
+            // 读到非床就直接回落/清账」：116 棒定谳 farm276 一笔坏读数清账后
+            // 两 boot 无人重建、58/59 验白白回落；账本被清但床还在时，本入口
+            // 让下一次死亡当场自愈落床。无有效床→null 回落世界出生点。
+            BlockPos foot = BaseMemory.revalidateBed(mainLevel, npc.npcName());
+            if (foot == null) {
                 return null;
-            }
-            BlockPos foot = base.bedPos();
-            // 【fix174】验床前先确保区块已加载：未加载区块 getBlockState
-            // 恒读空气，死在远方（床区块不在加载范围）时会误判床已不在、
-            // 误杀账本并回落世界出生点（#37 实证，距床约 430 格）。复活是
-            // 低频事件，同步加载一个区块的代价可接受（原版复活本就会
-            // 加载复活点区块）；真被拆时加载后照样读得到、fix99 失效链不变。
-            if (!mainLevel.hasChunkAt(foot)) {
-                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床区块未加载，先加载再验床（fix174） | bed="
-                        + foot.getX() + "," + foot.getY() + "," + foot.getZ());
-                mainLevel.getChunk(foot);
             }
             net.minecraft.world.level.block.state.BlockState bedState = mainLevel.getBlockState(foot);
             if (!(bedState.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
-                LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床账本在但床已不在（被拆/被换），回落世界出生点 | bed="
-                        + foot.getX() + "," + foot.getY() + "," + foot.getZ());
-                // 【fix99】顺手失效 stale 床账本：不然账本一直记着假床位，
-                // 规划层 6.76 凭 bedPos!=null 永不重派安置，床链永久悬空。
-                // 失效后白天即可凭包里的床重走 place_bed。
-                BaseMemory.clearBed(npc.npcName());
+                // revalidate 已验真，理论不到此；保守回落，不在此清账。
                 return null;
             }
             // 床占两格：按 PART 定出另一格（账本存的是脚格，此处对头格同样成立）；两格四邻逐个试站位。
@@ -1288,31 +1852,59 @@ public final class SurvivalController {
             BlockPos other = bedState.getValue(net.minecraft.world.level.block.BedBlock.PART)
                     == net.minecraft.world.level.block.state.properties.BedPart.FOOT
                     ? foot.relative(facing) : foot.relative(facing.getOpposite());
-            for (BlockPos cell : new BlockPos[]{foot, other}) {
-                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
-                    BlockPos stand = cell.relative(dir);
-                    if (stand.equals(foot) || stand.equals(other)) {
-                        continue;
-                    }
-                    if (PathFinder.isStandable(mainLevel, stand)) {
-                        // 顺手把原版 RespawnConfig 回写一致（fix56 登记口径），防其他读者读到旧值。
-                        try {
-                            npc.setRespawnPosition(new net.minecraft.server.level.ServerPlayer.RespawnConfig(
-                                    net.minecraft.world.level.storage.LevelData.RespawnData.of(
-                                            mainLevel.dimension(), foot, 0.0F, 0.0F), false), false);
-                        } catch (Throwable ignored) {
-                            // 回写失败不影响本次复活落点。
+            // 【fix265】站位同列竖直放宽：旧版只试同层 6 格，116 棒克隆实证
+            // 新图基址下层被自家采矿掏空、同层 6 格脚下全悬空（支撑格被挖，
+            // fresh129 原行）→ #26/#27/#28 连续回落，而同列 dy=-1/-2 全有
+            // 可站格。玩家/原版复活本就落在床边任意高度可站处：按 dy 序
+            // {0,-1,+1,-2,+2,-3,+3,-4,+4} 逐层放宽、同 dy 内沿用原格序。
+            StringBuilder diag116 = new StringBuilder();
+            for (int dy : new int[]{0, -1, 1, -2, 2, -3, 3, -4, 4}) {
+                for (BlockPos cell : new BlockPos[]{foot, other}) {
+                    for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                        BlockPos stand = cell.relative(dir).offset(0, dy, 0);
+                        if (stand.equals(foot) || stand.equals(other)) {
+                            continue;
                         }
-                        return stand;
+                        // 【fix265 诊断】逐候选记账：全堵时把每格的脚/头/脚下块打全，
+                        // 免得「无可站立格」只剩结论没有现场（116 棒定谳需求）。
+                        if (dy == 0) {
+                            diag116.append(' ').append(stand.toShortString()).append('=')
+                                    .append(blockPath(mainLevel, stand)).append('/')
+                                    .append(blockPath(mainLevel, stand.above())).append('/')
+                                    .append(blockPath(mainLevel, stand.below()));
+                        }
+                        if (PathFinder.isStandable(mainLevel, stand)) {
+                            // 顺手把原版 RespawnConfig 回写一致（fix56 登记口径），防其他读者读到旧值。
+                            try {
+                                npc.setRespawnPosition(new net.minecraft.server.level.ServerPlayer.RespawnConfig(
+                                        net.minecraft.world.level.storage.LevelData.RespawnData.of(
+                                                mainLevel.dimension(), foot, 0.0F, 0.0F), false), false);
+                            } catch (Throwable ignored) {
+                                // 回写失败不影响本次复活落点。
+                            }
+                            return stand;
+                        }
                     }
                 }
             }
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 床在但床边无可站立格（被堵），回落世界出生点 | bed="
-                    + foot.getX() + "," + foot.getY() + "," + foot.getZ());
+                    + foot.getX() + "," + foot.getY() + "," + foot.getZ()
+                    + " | 候选格(脚/头/脚下):" + diag116);
             return null;
         } catch (Throwable throwable) {
             LOG.warning("[AIV][SURVIVAL] " + npc.npcName() + " 床边复活解析失败，回落世界出生点: " + throwable);
             return null;
+        }
+    }
+
+    /** 【fix265 诊断】方块路径名（验床逐格记账用）。 */
+    private static String blockPath(net.minecraft.world.level.BlockGetter level, BlockPos pos) {
+        try {
+            var key = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(
+                    level.getBlockState(pos).getBlock());
+            return key == null ? "?" : key.getPath();
+        } catch (Throwable throwable) {
+            return "err";
         }
     }
 
@@ -1452,6 +2044,10 @@ public final class SurvivalController {
                 }
                 chasing = false;
             }
+            // 【fix238】威胁没了，立即中断计数一并清掉，下次换怪重算。
+            chaseAbortFails = 0;
+            chaseAbortThreat = null;
+            chaseStartedTick = -1000;
             return false;
         }
 
@@ -1558,7 +2154,15 @@ public final class SurvivalController {
 
         // 【fix76】举着盾时不停：格挡由 defend 的举盾/放盾逻辑专门管理；
         // 吃食等其他使用态照旧停（要腾出手来攻击）。
-        if (npc.isUsingItem() && !usingShield()) {
+        // 【fix341】贴脸进食不由这里停：威胁已在攻击距离内时，把停用留给攻击支的
+        // ensureBestWeaponInHandForCombat()（fix163）——它先判主手是食物且包里有
+        // 武器才停，否则 fix163 的 isUsingItem() 前件恒假、永不点火（#172/#104
+        // 实测：进食中自卫攻击恒 0.94，战斗换武器三服 0 行）。
+        // 【fix348】攻击距离外也不停进食：追击是走路（followPath），不需腾手；
+        // 旧条件只豁免贴脸，距离外每生存 tick 停一次、同 tick eat(true) 又重起，
+        // 32 tick 进食永走不完（fresh177 16:44:22–26 8 次／4 秒、food=15 卡住实证）。
+        // 进攻击距离后 fix163 换武器停用仍在，战斗优先不变；举盾仍由格挡逻辑管。
+        if (npc.isUsingItem() && !usingShield() && !isEatingFood()) {
             npc.stopUsingItem();
         }
 
@@ -1571,6 +2175,35 @@ public final class SurvivalController {
             }
             // 超出攻击距离：走 A* 接近，正在走就不要每 0.5 秒重建路径。
             if (!npc.isFollowingPath()) {
+                // 【fix334】同一威胁连续追击超 120 秒仍未近身 → 拉黑 10 秒放行。
+                // （fix238 计数会被目标漫游＋NPC 往返跑动绕过，见字段注释。）
+                if (!fleeing && chaseAbortThreat != null && chaseAbortThreat.equals(threat.getUUID())
+                        && chaseStartedTick >= 0
+                        && npc.tickCount - chaseStartedTick > CHASE_TIMEOUT_TICKS) {
+                    chaseAbortFails = 0;
+                    chaseAbortThreat = null;
+                    chaseStartedTick = -1000;
+                    ignoreThreat(threat, "追击超时 120 秒未近身（fix334）");
+                    chasing = false;
+                    return true;
+                }
+                // 【fix238】上一次追击刚发出就立即中断（40 tick 内一步没走出去）→ 计一次失败；
+                // 连续 3 次说明这只怪根本够不着（航点跳不上去），拉黑 10 秒放行，不许原地重发。
+                // 只在非逃跑时计数：flee() 也会发路径，别把逃跑路径的中断误算进来。
+                if (!fleeing && chaseAbortThreat != null && chaseAbortThreat.equals(threat.getUUID())
+                        && npc.tickCount - chaseIssuedTick <= CHASE_ABORT_WINDOW_TICKS
+                        && chaseStartPos != null
+                        && npc.blockPosition().distSqr(chaseStartPos) < CHASE_ABORT_MOVE_SQ) {
+                    if (++chaseAbortFails >= CHASE_ABORT_FAIL_LIMIT) {
+                        chaseAbortFails = 0;
+                        chaseAbortThreat = null;
+                        ignoreThreat(threat, "追击连续立即中断×3（航点跳不上去）");
+                        chasing = false;
+                        return true;
+                    }
+                } else {
+                    chaseAbortFails = 0;
+                }
                 BlockPos goal = PathFinder.standableGoal(npc.level(), threat.blockPosition(), 3);
                 if (goal == null) {
                     // 威胁周围没有能站的地方（墙后/坑里）：拉黑 10 秒，让目标层继续干活。
@@ -1582,6 +2215,13 @@ public final class SurvivalController {
                 if (result.found()) {
                     npc.followPath(result.path(), true, null, null);
                     chasing = true;
+                    // 【fix334】换怪或进攻击距离清掉计数后，首次发追击即重算 120 秒时钟。
+                    if (chaseAbortThreat == null || !chaseAbortThreat.equals(threat.getUUID())) {
+                        chaseStartedTick = npc.tickCount;
+                    }
+                    chaseAbortThreat = threat.getUUID();
+                    chaseIssuedTick = npc.tickCount;
+                    chaseStartPos = npc.blockPosition();
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 追击 | threat=" + threat.getType()
                             + " 路径=" + result.path().size() + " 耗时=" + result.millis() + "ms");
                 } else {
@@ -1598,6 +2238,11 @@ public final class SurvivalController {
             return true;
         }
 
+        // 【fix238】走到攻击距离 = 追击成功，清掉立即中断计数。
+        chaseAbortFails = 0;
+        chaseAbortThreat = null;
+        chaseStartedTick = -1000;
+
         if (npc.tickCount < nextAttackTick) {
             // 【fix76】武器冷却间隙举盾（原版盾斗节奏：挡一下、再砍一刀）。
             raiseShield(threat);
@@ -1611,8 +2256,16 @@ public final class SurvivalController {
         // 【fix163】走战斗入口：主手是食物/非武器且包里有武器时，先中断进食再换——
         // 抢吃循环里进食永远吃不完，ensure 的进食守卫会被永久短路（#33 拿腐肉打僵尸 26 秒）。
         ensureBestWeaponInHandForCombat();
+        // 【fix341】换手后立即刷新装备属性再出手：原版 ATTACK_DAMAGE 修饰符只在实体
+        // tick 的 detectEquipmentUpdates() 里同步，换手当 tick 直接攻击读到的仍是
+        // 旧主手（食物/空手基础 1.0）→ 0.94；不刷新则 fix163 换了剑也白换（G0c
+        // 实测：进食中 28 击全为 0.94/0.00，未进食 5 击全为满伤 7.87/8.86）。
+        // 无换手时本调用是空操作（内部逐槽比对、无变化即返回），与实体 tick 同款。
+        npc.detectEquipmentUpdates();
         float damage = npc.attackTarget(threat);
         nextAttackTick = npc.tickCount + ATTACK_COOLDOWN_TICKS;
+        // 【fix341】记一笔出手时间：同 tick 随后 eat(true) 的抢吃重起要凭它压制。
+        lastMeleeAttackTick = npc.tickCount;
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 自卫攻击 | threat=" + threat.getType()
                 + " damage=" + String.format(Locale.ROOT, "%.2f", damage)
                 + " hp=" + String.format(Locale.ROOT, "%.1f", threat.getHealth()));
@@ -1808,7 +2461,25 @@ public final class SurvivalController {
             straightFleeAnchor = here;
             straightFleeAttempts = 0;
         }
-        int rotation = STRAIGHT_FLEE_ROTATIONS[straightFleeAttempts % STRAIGHT_FLEE_ROTATIONS.length];
+        // 【fix255】选档先查前方岩浆：旧版方向零危险检查，farm260 #107 实证
+        // 直线正穿岩浆池室、把人送进浆里。沿候选方向采样 2/4/6/8 格（脚高
+        // 与脚高下一格两层），命中岩浆就跳下一偏转档；全档皆浆时仍按本档
+        // 跑（站着挨打更糟），日志注明。采样只查不改世界。
+        int baseIdx = straightFleeAttempts % STRAIGHT_FLEE_ROTATIONS.length;
+        int chosenIdx = baseIdx;
+        int lavaSkips = 0;
+        boolean allLava = true;
+        for (int k = 0; k < STRAIGHT_FLEE_ROTATIONS.length; k++) {
+            int idx = (baseIdx + k) % STRAIGHT_FLEE_ROTATIONS.length;
+            double a = Math.atan2(dz, dx) + Math.toRadians(STRAIGHT_FLEE_ROTATIONS[idx]);
+            if (!straightPathLava(Math.cos(a), Math.sin(a))) {
+                chosenIdx = idx;
+                allLava = false;
+                break;
+            }
+            lavaSkips++;
+        }
+        int rotation = STRAIGHT_FLEE_ROTATIONS[chosenIdx];
         double angle = Math.atan2(dz, dx) + Math.toRadians(rotation);
         double tx = npc.getX() + Math.cos(angle) * STRAIGHT_FLEE_DISTANCE;
         double tz = npc.getZ() + Math.sin(angle) * STRAIGHT_FLEE_DISTANCE;
@@ -1819,8 +2490,27 @@ public final class SurvivalController {
         LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 逃跑兜底：直线脱离 | threat=" + threat.getType()
                 + " hp=" + String.format(Locale.ROOT, "%.1f", npc.getHealth())
                 + " 偏转=" + rotation + " 次数=" + straightFleeAttempts
+                + (lavaSkips > 0 ? " 避浆跳过=" + lavaSkips + (allLava ? "（全方向贴浆，仍按本档跑）" : "") : "")
                 + " 目标=(" + (int) tx + "," + (int) tz + ") A*明细=" + diag);
         return true;
+    }
+
+    /** 【fix255】直线脱离候选方向前方 2/4/6/8 格（脚高、脚高下一格两层）是否有岩浆。 */
+    private boolean straightPathLava(double ux, double uz) {
+        net.minecraft.core.BlockPos feet = npc.blockPosition();
+        for (int d = 2; d <= 8; d += 2) {
+            net.minecraft.core.BlockPos cell = new net.minecraft.core.BlockPos(
+                    (int) Math.floor(npc.getX() + ux * d), feet.getY(),
+                    (int) Math.floor(npc.getZ() + uz * d));
+            if (isLavaCell(cell) || isLavaCell(cell.below())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isLavaCell(net.minecraft.core.BlockPos pos) {
+        return npc.level().getBlockState(pos).is(net.minecraft.world.level.block.Blocks.LAVA);
     }
 
     /** 【fix39】落点是否贴水：本格或四邻同层有流体（逃跑落点避流体用）。 */
@@ -1970,6 +2660,16 @@ public final class SurvivalController {
         if (onlyWhenSafe && !desperate && hasEnemyWithin(FORCE_DEFEND_RANGE_SQ)) {
             return;
         }
+        // 【fix341】近战抢吃压制：刚出过手（30 tick 内）且主手已是武器时，不重起进食。
+        // 只拦战斗进食（onlyWhenSafe）：无威胁时的 eat(false) 不受影响，威胁解除
+        // 后照常吃。逃跑中（fleeing）与低血（≤35%）不压——保命的边跑边吃、绝境
+        // 抢吃优先于满伤（fix175/fix87 的口子原样保留）。主手是食物时不压：
+        // 那口还没换过武器，压了也省不下一次换手，等攻击支 fix163 先换。
+        if (onlyWhenSafe && !fleeing && npc.getHealth() > LOW_HEALTH_THRESHOLD
+                && weaponScore(npc.getMainHandItem()) > 0
+                && npc.tickCount - lastMeleeAttackTick < MELEE_EAT_SUPPRESS_TICKS) {
+            return;
+        }
         if (npc.isUsingItem()) {
             if (desperate && usingShield()) {
                 npc.stopUsingItem();
@@ -1986,6 +2686,11 @@ public final class SurvivalController {
         if (food.isEmpty() || food.get(DataComponents.FOOD) == null) {
             return;
         }
+        if (lastPickReserveGuard) {
+            LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 储备保护选食（fix259） | item="
+                    + food.getItem() + " food=" + npc.getFoodData().getFoodLevel()
+                    + " foodNutrition=" + reserveGuardNutrition());
+        }
         if (desperate) {
             LOG.info("[AIV][SURVIVAL] " + npc.npcName() + " 危险线抢吃 | food="
                     + npc.getFoodData().getFoodLevel() + " item=" + food.getItem());
@@ -1996,10 +2701,40 @@ public final class SurvivalController {
                 + food.getItem() + " food=" + npc.getFoodData().getFoodLevel() + " slot=" + slot);
     }
 
+    /** 【fix259】上一次选食是否走了储备保护支（供 eat() 打专行对账）。 */
+    private boolean lastPickReserveGuard;
+
+    /**
+     * 【fix259】问规划层：当前是否处于储备累积期。判定与阈值口径全在
+     * 规划层（reserveGuardActive），本层只消费布尔结果；发展层未启用或
+     * 查不到规划器时恒假，选食回归原口径。
+     */
+    private boolean reserveGuardActive() {
+        if (plugin instanceof com.example.aivillager.AiVillagerPlugin aiv) {
+            com.example.aivillager.progression.ProgressionPlanner planner =
+                    aiv.progression(npc.npcName());
+            return planner != null && planner.reserveGuardActive();
+        }
+        return false;
+    }
+
+    /** 【fix259】规划层口径的当前背包总营养（选食专行对账用）；查不到规划器返回 -1。 */
+    private int reserveGuardNutrition() {
+        if (plugin instanceof com.example.aivillager.AiVillagerPlugin aiv) {
+            com.example.aivillager.progression.ProgressionPlanner planner =
+                    aiv.progression(npc.npcName());
+            if (planner != null) {
+                return planner.currentFoodNutrition();
+            }
+        }
+        return -1;
+    }
+
     /**
      * 保证主手是营养价值最高的食物：先扫快捷栏，找不到就把背包里的食物和当前选中格交换。
      * 用评分而不是"第一个食物"，是因为背包里会混进僵尸掉落的腐肉，
      * 按顺序取会优先吃腐肉，食物值反而被饥饿效果压回 0。
+     * 【fix259】储备累积期非危险线时例外：改取最低分食物先吃（见 ensureFoodInHand 内注）。
      *
      * @return 食物所在快捷栏索引；没有可用食物返回 -1
      */
@@ -2009,16 +2744,39 @@ public final class SurvivalController {
         int selected = inventory.getSelectedSlot();
         int bestSlot = -1;
         int bestScore = -1;
-        // 0..35 一起扫：0..8 是快捷栏，9..35 是背包。
-        for (int slot = 0; slot < 36; slot++) {
-            int score = foodScore(inventory.getItem(slot), desperate);
-            if (score > bestScore) {
-                bestScore = score;
-                bestSlot = slot;
+        // 【fix259】储备累积期（规划层判定：下界链待推进、储备未满软靶、
+        // 入境闸未同刻满足）且非危险线时，选食反转为最低分优先：日常补食
+        // 先吃低计账食物（生土豆/生羊肉一类），熟食储备留在包里计满值——
+        // 旧口径恒吃最高分，每一口都从储备扣最贵的一份（熟牛肉一口
+        // nutrition −8），储备峰值只在入账瞬间存在、闸口恒读谷值（108 棒
+        // 定谳）。危险线（desperate）保命语义不变、不经此支，仍走下方
+        // 最高分。既有排除（腐肉非危险线 −1、留种守卫、黑名单）在
+        // foodScore 内统一生效，两支共用，此处只翻比较方向。
+        lastPickReserveGuard = !desperate && reserveGuardActive();
+        if (lastPickReserveGuard) {
+            int lowScore = Integer.MAX_VALUE;
+            for (int slot = 0; slot < 36; slot++) {
+                int score = foodScore(inventory.getItem(slot), false);
+                if (score > 0 && score < lowScore) {
+                    lowScore = score;
+                    bestSlot = slot;
+                }
             }
-        }
-        if (bestSlot < 0) {
-            return -1;
+            if (bestSlot < 0) {
+                return -1;
+            }
+        } else {
+            // 0..35 一起扫：0..8 是快捷栏，9..35 是背包。
+            for (int slot = 0; slot < 36; slot++) {
+                int score = foodScore(inventory.getItem(slot), desperate);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestSlot = slot;
+                }
+            }
+            if (bestSlot < 0) {
+                return -1;
+            }
         }
         if (bestSlot < 9) {
             // 已经在快捷栏，直接切换选中格，不移动物品。
@@ -2225,6 +2983,18 @@ public final class SurvivalController {
                     LOG.info("[AIV][SURVIVAL] " + npc.npcName()
                             + " nether-gold | 下界换上金靴 替换="
                             + (current.isEmpty() ? "空" : current.getItem().toString()));
+                    continue;
+                }
+            }
+            // 【fix261】进门金靴保护窗（与细雪/下界特例同构）：身在主世界、
+            // 正处于进门尝试窗内（目标层刚强制换上金靴）时，金靴在脚上不许
+            // 被非金靴按防御分换下——否则换上约 1 秒即被换回，D8 在传送
+            // 瞬间从未成立。窗由目标层 ensureGoldBootsWorn 刷新（60 秒），
+            // 窗外恢复纯评分。
+            if (equipmentSlot == EquipmentSlot.FEET && npc.goldBootsProtected()) {
+                boolean candidateGold = candidate.is(Items.GOLDEN_BOOTS);
+                boolean currentGold = current.is(Items.GOLDEN_BOOTS);
+                if (currentGold && !candidateGold) {
                     continue;
                 }
             }

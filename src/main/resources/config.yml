@@ -23,6 +23,16 @@ auto-ask-repeat: 1
 auto-ask-interval-ticks: 240
 
 # 自主决策循环：没有玩家说话时，NPC 也会定期自省，用同一套 JSON 意图协议自己选动作。
+# 挖掘方式（fix379）：false=瞬时挖（测试线提速口径）；true=像真人一样逐格按原版
+# 耗时挖——一次只挖一个方块，工具全程握在手里、带裂纹和挥手，挖满才碎。
+mining:
+  timed: false
+
+# 掉落物拾取（fix380）：false=只收脚边 3 格内掉落物；true=技能空档时还会主动
+# 跑去捡 12 格内的有用掉落物（土/沙/杂草等垃圾不捡，自己丢弃的永不捡回）。
+pickup:
+  detour: false
+
 autonomy:
   enabled: false
   # 同一个 NPC 两次自省之间的最小间隔（秒）。

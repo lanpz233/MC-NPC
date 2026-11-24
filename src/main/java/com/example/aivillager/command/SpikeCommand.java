@@ -64,6 +64,7 @@ public final class SpikeCommand implements CommandExecutor, TabCompleter {
             case "stress" -> stress(sender, args);
             case "say" -> say(sender, args);
             case "act" -> act(sender, args);
+            case "bedbox" -> bedbox(sender, args);
             case "brain" -> brainStatus(sender, args);
             case "llm" -> llmStatus(sender);
             case "stop" -> {
@@ -288,6 +289,65 @@ public final class SpikeCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage("[AIV] act " + action + " => " + accepted + " params=" + params);
         plugin.getLogger().info("[AIV][ACT] " + body.npcName() + " action=" + action
                 + " accepted=" + accepted + " params=" + params);
+    }
+
+    /** 【116 棒诊断】转储账本床周边方块盒＋逐候选站位判定（克隆/实验场定谳用）。 */
+    private void bedbox(CommandSender sender, String[] args) {
+        FakePlayerBody body = plugin.lastNpc();
+        if (body == null) {
+            sender.sendMessage("[AIV] 还没有伪玩家");
+            return;
+        }
+        ServerLevel level = body.level();
+        com.example.aivillager.goals.BaseMemory.bindWorld(level);
+        com.example.aivillager.goals.BaseMemory.Base base =
+                com.example.aivillager.goals.BaseMemory.base(body.npcName());
+        if (base == null || base.bedPos() == null) {
+            sender.sendMessage("[AIV] 无床账本 base=" + base);
+            return;
+        }
+        BlockPos foot = base.bedPos();
+        plugin.getLogger().info("[AIV][BEDBOX] anchor=" + base.anchor().toShortString()
+                + " bed=" + foot.toShortString() + " chest=" + base.chestPos());
+        for (int dy = 2; dy >= -1; dy--) {
+            for (int dz = -3; dz <= 3; dz++) {
+                StringBuilder row = new StringBuilder();
+                for (int dx = -3; dx <= 3; dx++) {
+                    BlockPos cell = foot.offset(dx, dy, dz);
+                    String path = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                            .getKey(level.getBlockState(cell).getBlock()).getPath();
+                    row.append(' ').append(cell.getX()).append(',').append(cell.getZ())
+                            .append('=').append(path.replace("minecraft:", ""));
+                }
+                plugin.getLogger().info("[AIV][BEDBOX] y=" + (foot.getY() + dy) + row);
+            }
+        }
+        // 逐候选站位判定（与 SurvivalController fix95 同口径）
+        var bedState = level.getBlockState(foot);
+        if (bedState.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+            var facing = bedState.getValue(net.minecraft.world.level.block.BedBlock.FACING);
+            BlockPos other = bedState.getValue(net.minecraft.world.level.block.BedBlock.PART)
+                    == net.minecraft.world.level.block.state.properties.BedPart.FOOT
+                    ? foot.relative(facing) : foot.relative(facing.getOpposite());
+            for (BlockPos cell : new BlockPos[]{foot, other}) {
+                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                    BlockPos stand = cell.relative(dir);
+                    if (stand.equals(foot) || stand.equals(other)) {
+                        continue;
+                    }
+                    boolean ok = com.example.aivillager.pathfinding.PathFinder.isStandable(level, stand);
+                    plugin.getLogger().info("[AIV][BEDBOX] cand " + stand.toShortString()
+                            + " standable=" + ok
+                            + " feet=" + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(level.getBlockState(stand).getBlock()).getPath()
+                            + " head=" + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(level.getBlockState(stand.above()).getBlock()).getPath()
+                            + " below=" + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(level.getBlockState(stand.below()).getBlock()).getPath());
+                }
+            }
+        } else {
+            plugin.getLogger().info("[AIV][BEDBOX] 床格不是床块: "
+                    + net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(bedState.getBlock()).getPath());
+        }
+        sender.sendMessage("[AIV] bedbox 已转储到日志");
     }
 
     private void brainStatus(CommandSender sender, String[] args) {
